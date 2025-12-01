@@ -1,0 +1,5 @@
+pyrogram
+tgcrypto
+yt-dlp
+python-dotenv
+psycopg2-binary
