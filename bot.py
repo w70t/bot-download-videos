@@ -251,6 +251,22 @@ def validate_platform_cookies(platform_id):
 user_errors = {}  # {error_id: {'user_id': ..., 'error': ..., 'url': ..., 'time': ..., 'status': 'pending'}}
 error_counter = 0
 
+
+def get_channel_id(env_key):
+    """يقرأ معرّف القناة من .env ويحوّله إلى رقم صحيح.
+
+    Pyrogram يرفض معرّف القناة الرقمي إذا مُرّر كنص (سلسلة أرقام) ويُظهر
+    PEER_ID_INVALID. لذا نحوّل '-1001234567890' إلى int. أما اسم المستخدم
+    (مثل @channel) فيُترك كما هو.
+    """
+    value = (os.getenv(env_key) or '').strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return value  # اسم مستخدم للقناة مثل @mychannel
+
 async def send_error_to_admin(user_id, user_name, error_message, url, error_traceback=None):
     """إرسال تنبيه لقناة سجلات الأخطاء عند حدوث خطأ للمستخدم"""
     global error_counter
@@ -269,7 +285,7 @@ async def send_error_to_admin(user_id, user_name, error_message, url, error_trac
     }
     
     # إرسال لقناة سجلات الأخطاء
-    error_channel_id = os.getenv("ERROR_LOG_CHANNEL_ID")
+    error_channel_id = get_channel_id("ERROR_LOG_CHANNEL_ID")
     
     if not error_channel_id:
         logger.warning("⚠️ ERROR_LOG_CHANNEL_ID غير موجود في .env")
@@ -326,7 +342,7 @@ async def send_error_to_admin(user_id, user_name, error_message, url, error_trac
 async def send_new_member_notification(user_id, user_name, username, join_time):
     """إرسال إشعار لقناة الأعضاء الجدد عند انضمام عضو جديد"""
     try:
-        channel_id = os.getenv('NEW_MEMBERS_CHANNEL_ID')
+        channel_id = get_channel_id('NEW_MEMBERS_CHANNEL_ID')
         
         if not channel_id:
             logger.warning("⚠️ NEW_MEMBERS_CHANNEL_ID غير موجود في .env")
@@ -520,8 +536,8 @@ async def forward_to_log_channel(client, message, sent_message, user_id, user_na
                                video_info, duration, file_size_mb):
     """تحويل الفيديو إلى قناة السجلات مع معلومات تفصيلية"""
     try:
-        channel_id = os.getenv('LOG_CHANNEL_ID')
-        
+        channel_id = get_channel_id('LOG_CHANNEL_ID')
+
         if not channel_id:
             return
         
@@ -1214,6 +1230,8 @@ async def start(client, message):
 @app.on_message(filters.text & filters.regex(r'^(🍪 Cookies|📊 التقرير اليومي|🔔 الأخطاء|💎 إعدادات الاشتراك|📁 نسخ احتياطي)$'))
 async def handle_quick_buttons(client, message):
     """معالج الأزرار السريعة"""
+    if not message.from_user:
+        return
     user_id = message.from_user.id
     
     if str(user_id) != os.getenv("ADMIN_ID"):
@@ -1235,6 +1253,8 @@ async def handle_quick_buttons(client, message):
 @app.on_message(filters.text & filters.regex(r'^💎 اشتراكي$|^💎 My Subscription$'))
 async def handle_my_subscription(client, message):
     """معالج زر حالة الاشتراك للمستخدمين"""
+    if not message.from_user:
+        return
     user_id = message.from_user.id
     lang = subdb.get_user_language(user_id)
     
@@ -1755,6 +1775,8 @@ async def cookies_back_handler(client, callback_query):
 @app.on_message(filters.document)
 async def handle_cookie_file(client, message):
     """معالج ملفات الـ cookies"""
+    if not message.from_user:
+        return
     user_id = message.from_user.id
     
     if str(user_id) != os.getenv("ADMIN_ID"):
@@ -2089,6 +2111,8 @@ async def notify_admin_contact(client, user_id, user, payment_method):
 @app.on_message(filters.photo)
 async def handle_payment_proof(client, message):
     """معالج إثبات الدفع (الصور)"""
+    if not message.from_user:
+        return
     user_id = message.from_user.id
     lang = subdb.get_user_language(user_id)
     
@@ -2156,6 +2180,8 @@ async def handle_payment_proof(client, message):
 @app.on_message(filters.video)
 async def handle_video_upload(client, message):
     """معالج الفيديوهات المرفوعة - الرد التلقائي"""
+    if not message.from_user:
+        return
     user_id = message.from_user.id
     lang = subdb.get_user_language(user_id)
     
@@ -2166,6 +2192,8 @@ async def handle_video_upload(client, message):
 @app.on_message(filters.audio | filters.voice | filters.animation | filters.sticker)
 async def handle_other_media(client, message):
     """معالج الوسائط الأخرى - الرد التلقائي"""
+    if not message.from_user:
+        return
     user_id = message.from_user.id
     lang = subdb.get_user_language(user_id)
     
@@ -2620,8 +2648,11 @@ async def handle_set_daily_limit(client, callback_query):
 @app.on_message(filters.text & ~filters.regex(r'https?://') & ~filters.regex(r'^(🍪|📊|🔔|💎|/)'))
 async def handle_admin_input(client, message):
     """معالج إدخالات الأدمن للإعدادات"""
+    # رسائل القنوات أو المجهولة ليس لها from_user
+    if not message.from_user:
+        return
     user_id = message.from_user.id
-    
+
     if str(user_id) != os.getenv("ADMIN_ID"):
         return
     
@@ -2993,6 +3024,8 @@ async def handle_language_selection(client, callback_query):
 @app.on_message(filters.text & ~filters.regex(r'^/'), group=10)
 async def handle_change_language_button(client, message):
     """معالج زر تغيير اللغة - مع أولوية أعلى"""
+    if not message.from_user:
+        return
     # Check if message is change language button in any language
     if message.text in ["🌍 تغيير اللغة", "🌍 Change Language"]:
         user_id = message.from_user.id
