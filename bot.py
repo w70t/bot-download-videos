@@ -422,11 +422,26 @@ def get_file_size_mb(file_path):
 
 
 
+def _is_youtube_cookie_issue(err):
+    """هل خطأ يوتيوب ناتج عن حجب الصيغ بسبب الكوكيز/الحماية؟"""
+    msg = str(err).lower()
+    signs = [
+        'requested format is not available',
+        'player response',
+        'sign in to confirm',
+        'this content isn',
+        'po token',
+        'no video formats',
+    ]
+    return any(s in msg for s in signs)
+
+
 async def get_video_info(url: str):
     """استخراج معلومات الفيديو"""
     try:
         # اختيار ملف cookies المطابق لمنصة الرابط (مهم للستوري الخاص)
         cookie_file = get_cookie_file_for_url(url)
+        is_youtube = any(m in url.lower() for m in PLATFORM_URL_MARKERS['youtube'])
 
         ydl_opts = {
             'quiet': True,
@@ -435,6 +450,8 @@ async def get_video_info(url: str):
             'socket_timeout': 30,  # تقليل timeout لاستجابة أسرع
             'extract_flat': False,  # نحتاج معلومات كاملة
             'no_check_certificate': True,
+            # لا تفشل استخراج المعلومات بسبب مشاكل الصيغ (مهم ليوتيوب مع الكوكيز)
+            'ignore_no_formats_error': True,
             'http_headers': {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             },
@@ -446,12 +463,22 @@ async def get_video_info(url: str):
             logger.info(f"🍪 Using cookies for video info extraction: {cookie_file}")
 
         loop = asyncio.get_event_loop()
-        
-        def extract():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+
+        def extract(use_cookies=True):
+            o = dict(ydl_opts)
+            if not use_cookies:
+                o.pop('cookiefile', None)
+            with yt_dlp.YoutubeDL(o) as ydl:
                 return ydl.extract_info(url, download=False)
-        
-        return await loop.run_in_executor(None, extract)
+
+        try:
+            return await loop.run_in_executor(None, lambda: extract(True))
+        except Exception as e:
+            # يوتيوب مع الكوكيز قد يفشل بسبب حجب الصيغ → أعد المحاولة بدون كوكيز
+            if cookie_file and is_youtube and _is_youtube_cookie_issue(e):
+                logger.warning("⚠️ فشل يوتيوب مع الكوكيز، إعادة المحاولة بدون كوكيز...")
+                return await loop.run_in_executor(None, lambda: extract(False))
+            raise
     except Exception as e:
         error_msg = str(e)
         # معالجة خاصة لأخطاء Facebook parsing
@@ -929,12 +956,25 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         # التحميل - استخدام نظام الترجمة
         await status_msg.edit_text(t('start_downloading', lang))
         
-        def download():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        is_youtube_url = any(m in url.lower() for m in PLATFORM_URL_MARKERS['youtube'])
+
+        def download(use_cookies=True):
+            o = dict(ydl_opts)
+            if not use_cookies:
+                o.pop('cookiefile', None)
+            with yt_dlp.YoutubeDL(o) as ydl:
                 info = ydl.extract_info(url, download=True)
                 return info, ydl.prepare_filename(info)
-        
-        info, file_path = await loop.run_in_executor(None, download)
+
+        try:
+            info, file_path = await loop.run_in_executor(None, lambda: download(True))
+        except Exception as dl_err:
+            # يوتيوب مع الكوكيز قد يفشل بسبب حجب الصيغ → أعد المحاولة بدون كوكيز
+            if ydl_opts.get('cookiefile') and is_youtube_url and _is_youtube_cookie_issue(dl_err):
+                logger.warning("⚠️ فشل تحميل يوتيوب مع الكوكيز، إعادة المحاولة بدون كوكيز...")
+                info, file_path = await loop.run_in_executor(None, lambda: download(False))
+            else:
+                raise
         
         # ⚠️ إذا كان تحميل صوتي، FFmpegExtractAudio يغير الامتداد إلى .mp3
         # لذلك نحتاج إلى تحديث file_path للملف الحقيقي
