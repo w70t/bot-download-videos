@@ -2711,9 +2711,38 @@ async def handle_conversation_reply(client, message):
 
 
 def _broadcast_stats_kb(bid):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 تحديث الإحصائية", callback_data=f"bcref_{bid}")]
-    ])
+    """لوحة الإحصائية: زر مراسلة عبر البوت لكل عضو صوّت (يعمل حتى بلا username) + تحديث"""
+    rows = []
+    p = broadcast_polls.get(bid)
+    if p:
+        voters = list(p['yes'].items()) + list(p['no'].items())
+        for uid, name in voters[:16]:  # حدّ معقول لتفادي ازدحام الأزرار
+            rows.append([InlineKeyboardButton(
+                f"✉️ {str(name)[:20]}",
+                callback_data=f"dm_{uid}"
+            )])
+    rows.append([InlineKeyboardButton("🔄 تحديث الإحصائية", callback_data=f"bcref_{bid}")])
+    return InlineKeyboardMarkup(rows)
+
+
+@app.on_callback_query(filters.regex(r'^dm_'))
+async def handle_dm_button(client, callback_query):
+    """مراسلة عضو عبر البوت مباشرة (للأدمن) — يعمل حتى لو لم يكن للعضو username"""
+    if str(callback_query.from_user.id) != os.getenv("ADMIN_ID"):
+        await callback_query.answer("❌ للمشرفين فقط!", show_alert=True)
+        return
+    try:
+        target = int(callback_query.data[len('dm_'):])
+    except ValueError:
+        await callback_query.answer()
+        return
+
+    # ضع الأدمن في وضع كتابة رسالة موجّهة لهذا العضو عبر البوت
+    conversation_state[callback_query.from_user.id] = target
+    await callback_query.message.reply_text(
+        "✍️ **اكتب رسالتك الآن** وسأرسلها للعضو عبر البوت:"
+    )
+    await callback_query.answer()
 
 
 def _html_escape(s):
