@@ -422,8 +422,18 @@ def get_file_size_mb(file_path):
 
 
 
-# عملاء يوتيوب يُجرَّبون بالترتيب؛ tv/mweb لا يتطلبان PO token غالباً ويعيدان الصيغ
-YT_PLAYER_CLIENTS = ['tv', 'mweb', 'web_safari', 'default']
+# عملاء يوتيوب: android_vr لا يتطلب PO token؛ نتجنّب 'tv' لأنه يبلّغ DRM زوراً بدون كوكيز
+# و'web_embedded' يسبب خطأ إعداد. formats=missing_pot يسمح باستخدام الصيغ المحجوبة بلا توكن.
+YT_PLAYER_CLIENTS = ['default', 'android_vr', 'web_safari', 'mweb']
+
+
+def _youtube_extractor_args():
+    return {'youtube': {'player_client': list(YT_PLAYER_CLIENTS), 'formats': ['missing_pot']}}
+
+
+def _is_drm_error(err):
+    """هل الفيديو محمي بـ DRM (لا يمكن تحميله إطلاقاً)؟"""
+    return 'drm' in str(err).lower()
 
 
 def _is_youtube_cookie_issue(err):
@@ -466,9 +476,9 @@ async def get_video_info(url: str):
             ydl_opts['cookiefile'] = cookie_file
             logger.info(f"🍪 Using cookies for video info extraction: {cookie_file}")
 
-        # ليوتيوب: جرّب عملاء متعددين لتفادي حجب الصيغ (PO token)
+        # ليوتيوب: جرّب عملاء متعددين + السماح بالصيغ المحجوبة لتفادي حجب الصيغ (PO token)
         if is_youtube:
-            ydl_opts['extractor_args'] = {'youtube': {'player_client': YT_PLAYER_CLIENTS}}
+            ydl_opts['extractor_args'] = _youtube_extractor_args()
 
         loop = asyncio.get_event_loop()
 
@@ -948,9 +958,9 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             ydl_opts['cookiefile'] = cookie_file
             logger.info(f"🍪 استخدام cookies للتحميل: {cookie_file}")
 
-        # ليوتيوب: جرّب عملاء متعددين لتفادي حجب الصيغ (PO token)
+        # ليوتيوب: جرّب عملاء متعددين + السماح بالصيغ المحجوبة لتفادي حجب الصيغ (PO token)
         if any(m in url.lower() for m in PLATFORM_URL_MARKERS['youtube']):
-            ydl_opts['extractor_args'] = {'youtube': {'player_client': YT_PLAYER_CLIENTS}}
+            ydl_opts['extractor_args'] = _youtube_extractor_args()
 
         # للملفات الصوتية: تحويل إلى MP3 فقط إذا لم يكن MP3 بالفعل
         if is_audio:
@@ -1212,7 +1222,9 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             cleanup_downloaded_files(file_path if 'file_path' in locals() else None)
             
             # رسائل مخصصة لأخطاء معينة
-            if 'Cannot parse data' in error_text and 'facebook' in error_text.lower():
+            if _is_drm_error(error_text):
+                await status_msg.edit_text(t('drm_protected', lang))
+            elif 'Cannot parse data' in error_text and 'facebook' in error_text.lower():
                 await status_msg.edit_text(t('facebook_unavailable', lang))
             elif 'Pinterest' in error_text and ('Connection reset' in error_text or 'Unable to download' in error_text):
                 await status_msg.edit_text(t('pinterest_unavailable', lang))
