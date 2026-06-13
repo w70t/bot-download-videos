@@ -85,10 +85,10 @@ pending_downloads = {}
 # منصات الـ cookies المدعومة
 COOKIES_PLATFORMS = {
     'facebook': {'name': 'Facebook 📘', 'file': 'cookies/facebook.txt'},
-    'instagram': {'name': 'Instagram 📷', 'file': 'cookies/instagram.txt'},
+    'instagram': {'name': 'Instagram �', 'file': 'cookies/instagram.txt'},
     'youtube': {'name': 'YouTube 📺', 'file': 'cookies/youtube.txt'},
     'twitter': {'name': 'Twitter/X 🐦', 'file': 'cookies/twitter.txt'},
-    'reddit': {'name': 'Reddit 👽', 'file': 'cookies/reddit.txt'},
+    'reddit': {'name': 'Reddit �', 'file': 'cookies/reddit.txt'},
     'snapchat': {'name': 'Snapchat 👻', 'file': 'cookies/snapchat.txt'},
     'pinterest': {'name': 'Pinterest 📌', 'file': 'cookies/pinterest.txt'},
     'tiktok': {'name': 'TikTok 🎵', 'file': 'cookies/tiktok.txt'},
