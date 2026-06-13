@@ -209,6 +209,66 @@ def set_max_duration(minutes: int):
     set_setting('max_duration_minutes', str(minutes))
 
 # ═══════════════════════════════════════════════════════════════
+# دوال الاشتراك الإجباري بالقنوات
+# ═══════════════════════════════════════════════════════════════
+
+def _ensure_forced_channels_table():
+    """ينشئ جدول قنوات الاشتراك الإجباري إن لم يكن موجوداً."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS forced_channels (
+            id SERIAL PRIMARY KEY,
+            chat_id TEXT NOT NULL UNIQUE,
+            username TEXT,
+            title TEXT,
+            url TEXT,
+            added_at TIMESTAMP DEFAULT NOW()
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def add_forced_channel(chat_id, username, title, url) -> bool:
+    """إضافة قناة اشتراك إجباري. يرجع False إذا كانت موجودة مسبقاً."""
+    _ensure_forced_channels_table()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT id FROM forced_channels WHERE chat_id = %s', (str(chat_id),))
+    if cursor.fetchone():
+        conn.close()
+        return False
+    cursor.execute('''
+        INSERT INTO forced_channels (chat_id, username, title, url)
+        VALUES (%s, %s, %s, %s)
+    ''', (str(chat_id), username, title, url))
+    conn.commit()
+    conn.close()
+    logger.info(f"✅ تمت إضافة قناة اشتراك إجباري: {title or username or chat_id}")
+    return True
+
+def get_forced_channels():
+    """قائمة قنوات الاشتراك الإجباري: (id, chat_id, username, title, url)."""
+    _ensure_forced_channels_table()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT id, chat_id, username, title, url FROM forced_channels ORDER BY id')
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+def remove_forced_channel(row_id) -> bool:
+    """حذف قناة اشتراك إجباري حسب المعرّف الداخلي."""
+    _ensure_forced_channels_table()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM forced_channels WHERE id = %s', (row_id,))
+    deleted = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return deleted > 0
+
+# ═══════════════════════════════════════════════════════════════
 # دوال الدفوعات
 # ═══════════════════════════════════════════════════════════════
 
