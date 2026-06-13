@@ -100,11 +100,17 @@ PLATFORM_URL_MARKERS = {
     'youtube': ['youtube.', 'youtu.be'],
     'facebook': ['facebook.', 'fb.watch', 'fb.com'],
     'instagram': ['instagram.', 'instagr.am'],
+    'threads': ['threads.net', 'threads.com'],
     'twitter': ['twitter.', 'x.com', 't.co'],
     'reddit': ['reddit.', 'redd.it'],
     'snapchat': ['snapchat.'],
     'pinterest': ['pinterest.', 'pin.it'],
     'tiktok': ['tiktok.'],
+}
+
+# منصات تشارك ملف cookies منصة أخرى (Threads يستخدم تسجيل دخول Instagram)
+COOKIE_SOURCE_MAP = {
+    'threads': 'instagram',
 }
 
 
@@ -129,11 +135,13 @@ def get_cookie_file_for_url(url):
     url_lower = (url or '').lower()
     for platform_key, markers in PLATFORM_URL_MARKERS.items():
         if any(marker in url_lower for marker in markers):
-            cookie = _is_valid_cookie_file(platform_key)
+            # بعض المنصات (مثل Threads) تستخدم cookies منصة أخرى (Instagram)
+            cookie_platform = COOKIE_SOURCE_MAP.get(platform_key, platform_key)
+            cookie = _is_valid_cookie_file(cookie_platform)
             if cookie:
-                logger.info(f"🍪 استخدام cookies المنصة المطابقة: {platform_key}")
+                logger.info(f"🍪 استخدام cookies المنصة المطابقة: {platform_key} (cookies: {cookie_platform})")
                 return cookie
-            logger.warning(f"⚠️ لا يوجد ملف cookies صالح للمنصة {platform_key}؛ قد يفشل تحميل المحتوى الخاص (الستوري)")
+            logger.warning(f"⚠️ لا يوجد ملف cookies صالح للمنصة {cookie_platform}؛ قد يفشل تحميل محتوى {platform_key} الخاص")
             break
     # احتياطي: ملف cookies عام
     return _is_valid_cookie_file('other')
@@ -531,6 +539,8 @@ async def forward_to_log_channel(client, message, sent_message, user_id, user_na
             platform, icon = 'YouTube', '📺'
         elif 'facebook' in url or 'fb.watch' in url:
             platform, icon = 'Facebook', '📘'
+        elif 'threads.net' in url or 'threads.com' in url:
+            platform, icon = 'Threads', '🧵'
         elif 'instagram' in url:
             platform, icon = 'Instagram', '📷'
         elif 'twitter' in url or 'x.com' in url:
