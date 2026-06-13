@@ -58,7 +58,12 @@ TRANSLATIONS = {
         'cancelled': '❌ تم الإلغاء',
         'broadcast_message_prefix': '📢 **رسالة من المطور:**',
         'direct_message_prefix': '✉️ **رسالة من المطور:**',
-        
+        'reply_button': '↩️ رد',
+        'type_your_reply': '✍️ **أرسل ردك الآن:**',
+        'member_reply_prefix': '📨 **رد من العضو {name}** (`{user_id}`)**:**',
+        'reply_sent': '✅ **تم إرسال ردك بنجاح**',
+        'reply_failed': '❌ **تعذّر إرسال الرد** (ربما حظر المستخدم البوت)',
+
         # رسائل الاشتراك المفصلة
         'subscribe_now': '💎 اشترك الآن',
         'contact_developer': '📱 تواصل مع المطور',
@@ -155,7 +160,12 @@ TRANSLATIONS = {
         'cancelled': '❌ Cancelled',
         'broadcast_message_prefix': '📢 **Message from Developer:**',
         'direct_message_prefix': '✉️ **Message from Developer:**',
-        
+        'reply_button': '↩️ Reply',
+        'type_your_reply': '✍️ **Type your reply now:**',
+        'member_reply_prefix': '📨 **Reply from {name}** (`{user_id}`)**:**',
+        'reply_sent': '✅ **Your reply was sent**',
+        'reply_failed': '❌ **Could not send the reply** (user may have blocked the bot)',
+
         # Detailed subscription messages
         'subscribe_now': '💎 Subscribe Now',
         'contact_developer': '📱 Contact Developer',
