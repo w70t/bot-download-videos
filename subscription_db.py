@@ -125,6 +125,17 @@ def deactivate_subscription(user_id: int):
     conn.close()
     logger.info(f"❌ تم إلغاء اشتراك المستخدم {user_id}")
 
+def delete_user(user_id: int):
+    """حذف مستخدم نهائياً من قاعدة البيانات (عند حظره البوت أو حذف حسابه)"""
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute('DELETE FROM users WHERE user_id = %s', (user_id,))
+
+    conn.commit()
+    conn.close()
+    logger.info(f"🗑️ تم حذف المستخدم {user_id} من قاعدة البيانات")
+
 def get_recent_users(limit: int = 50):
     """الحصول على آخر المستخدمين"""
     conn = get_connection()
