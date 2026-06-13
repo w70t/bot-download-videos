@@ -2716,8 +2716,13 @@ def _broadcast_stats_kb(bid):
     ])
 
 
+def _html_escape(s):
+    """تهريب رموز HTML لتفادي كسر التنسيق"""
+    return (str(s).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
+
+
 def _broadcast_stats_text(bid):
-    """نص الإحصائية الحيّة لاستبيان بث معيّن"""
+    """نص الإحصائية الحيّة (HTML) مع أسماء قابلة للنقر تفتح محادثة العضو"""
     p = broadcast_polls.get(bid)
     if not p:
         return "⌛ انتهت صلاحية هذه الإحصائية."
@@ -2726,25 +2731,29 @@ def _broadcast_stats_text(bid):
     total = p.get('total', 0)
     pending = max(total - len(yes) - len(no), 0)
 
+    def name_link(uid, name):
+        # اسم أزرق قابل للنقر يفتح ملف/محادثة العضو
+        return f'• <a href="tg://user?id={uid}">{_html_escape(name)}</a>'
+
     lines = [
-        "📊 **إحصائية البث المباشر**\n",
-        f"📨 وصلت إلى: **{total}**",
-        f"✅ نعم (متواجد): **{len(yes)}**",
-        f"❌ لا: **{len(no)}**",
-        f"⏳ لم يتفاعلوا بعد: **{pending}**",
+        "📊 <b>إحصائية البث المباشر</b>\n",
+        f"📨 وصلت إلى: <b>{total}</b>",
+        f"✅ نعم (متواجد): <b>{len(yes)}</b>",
+        f"❌ لا: <b>{len(no)}</b>",
+        f"⏳ لم يتفاعلوا بعد: <b>{pending}</b>",
     ]
 
     if yes:
-        lines.append("\n✅ **من قال نعم:**")
+        lines.append("\n✅ <b>من قال نعم:</b>")
         for uid, name in list(yes.items())[:15]:
-            lines.append(f"• {name} (`{uid}`)")
+            lines.append(name_link(uid, name))
         if len(yes) > 15:
             lines.append(f"… و{len(yes) - 15} غيرهم")
 
     if no:
-        lines.append("\n❌ **من قال لا:**")
+        lines.append("\n❌ <b>من قال لا:</b>")
         for uid, name in list(no.items())[:15]:
-            lines.append(f"• {name} (`{uid}`)")
+            lines.append(name_link(uid, name))
         if len(no) > 15:
             lines.append(f"… و{len(no) - 15} غيرهم")
 
@@ -2765,7 +2774,8 @@ async def _update_broadcast_stats(client, bid, force=False):
             chat_id=p['stats_chat'],
             message_id=p['stats_msg_id'],
             text=_broadcast_stats_text(bid),
-            reply_markup=_broadcast_stats_kb(bid)
+            reply_markup=_broadcast_stats_kb(bid),
+            parse_mode=enums.ParseMode.HTML
         )
     except Exception:
         pass  # MessageNotModified أو flood مؤقت — يُحدّث في الضغطة التالية
@@ -2815,6 +2825,19 @@ async def handle_broadcast_vote(client, callback_query):
         p['yes'].pop(uid, None)
         p['no'][uid] = name
         await callback_query.answer(t('vote_no_ack', lang))
+
+    # بعد الاختيار: أزِل زرّي نعم/لا وأبقِ زر الرد فقط
+    try:
+        await callback_query.edit_message_reply_markup(
+            InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    t('reply_button', lang),
+                    callback_data=f"reply_msg_{p['admin_id']}"
+                )
+            ]])
+        )
+    except Exception:
+        pass
 
     await _update_broadcast_stats(client, bid)
 
@@ -3053,7 +3076,8 @@ async def handle_admin_input(client, message):
             # رسالة الإحصائية الحيّة للأدمن (تتحدث عند كل ضغطة)
             stats_msg = await message.reply_text(
                 _broadcast_stats_text(bid),
-                reply_markup=_broadcast_stats_kb(bid)
+                reply_markup=_broadcast_stats_kb(bid),
+                parse_mode=enums.ParseMode.HTML
             )
             broadcast_polls[bid]['stats_chat'] = stats_msg.chat.id
             broadcast_polls[bid]['stats_msg_id'] = stats_msg.id
