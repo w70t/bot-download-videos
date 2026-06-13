@@ -12,6 +12,7 @@ import os
 import sys
 import glob  # للبحث عن الملفات وحذفها
 import time  # Added import os
+import subprocess  # توليد المصغّر وضبط تاريخ الفيديو عبر ffmpeg
 import logging
 import asyncio
 import yt_dlp
@@ -175,13 +176,39 @@ def _url_host(url):
     return host.lower().lstrip('.')
 
 
+def _custom_adult_domains():
+    """نطاقات إضافية حظرها الأدمن من لوحة التحكم (مفصولة بفاصلة)."""
+    raw = subdb.get_setting('adult_custom_domains', '') or ''
+    return [d.strip().lower().lstrip('.') for d in raw.split(',') if d.strip()]
+
+
+def _custom_adult_keywords():
+    """كلمات إضافية حظرها الأدمن من لوحة التحكم (مفصولة بفاصلة)."""
+    raw = subdb.get_setting('adult_custom_keywords', '') or ''
+    return [k.strip().lower() for k in raw.split(',') if k.strip()]
+
+
+def _add_to_setting_list(key, value):
+    """يضيف قيمة لقائمة إعداد مفصولة بفواصل (يتجاهل التكرار). يرجع True إن أُضيفت."""
+    value = value.strip().lower().lstrip('.')
+    if not value:
+        return False
+    raw = subdb.get_setting(key, '') or ''
+    items = [x.strip().lower() for x in raw.split(',') if x.strip()]
+    if value in items:
+        return False
+    items.append(value)
+    subdb.set_setting(key, ','.join(items))
+    return True
+
+
 def _host_is_adult(host):
     """هل المضيف ينتمي لنطاق إباحي معروف (يشمل النطاقات الفرعية)؟"""
     if not host:
         return False
     if host.startswith('www.'):
         host = host[4:]
-    for domain in ADULT_DOMAINS:
+    for domain in set(ADULT_DOMAINS) | set(_custom_adult_domains()):
         if host == domain or host.endswith('.' + domain):
             return True
     return False
@@ -192,7 +219,7 @@ def _text_has_adult_keyword(text):
     if not text:
         return False
     low = str(text).lower()
-    return any(kw in low for kw in ADULT_KEYWORDS)
+    return any(kw in low for kw in (ADULT_KEYWORDS + _custom_adult_keywords()))
 
 
 def is_adult_url(url):
@@ -207,8 +234,11 @@ def is_adult_info(info):
     """فحص بيانات الفيديو بعد الاستخراج (العنوان/الوصف/الفئات)."""
     if not info:
         return False
-    if str(info.get('age_limit') or 0) and int(info.get('age_limit') or 0) >= 18:
-        return True
+    try:
+        if int(info.get('age_limit') or 0) >= 18:
+            return True
+    except (TypeError, ValueError):
+        pass
     parts = [info.get('title'), info.get('description'), info.get('uploader')]
     parts.extend(info.get('categories') or [])
     parts.extend(info.get('tags') or [])
@@ -218,6 +248,59 @@ def is_adult_info(info):
 def adult_filter_enabled():
     """هل فلتر المحتوى الإباحي مُفعّل؟ (افتراضياً مُفعّل)."""
     return subdb.get_setting('block_adult_content', '1') == '1'
+
+
+def generate_video_thumbnail(video_path, duration=None):
+    """يولّد صورة مصغّرة (JPEG) للفيديو حتى تظهر معاينة ثابتة في تلجرام
+    بدل الإطار الأسود/المتجمّد. يرجع مسار المصغّر أو None عند الفشل."""
+    try:
+        thumb_path = os.path.splitext(video_path)[0] + '.thumb.jpg'
+        # نأخذ لقطة بعد ثانية واحدة (أو 10% من المدة للفيديوهات الأطول)
+        ss = 1.0
+        if duration and duration > 4:
+            ss = min(3.0, duration / 10.0)
+        cmd = [
+            'ffmpeg', '-y', '-ss', str(ss), '-i', video_path,
+            '-frames:v', '1', '-vf', 'scale=320:-2',
+            '-q:v', '4', thumb_path,
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
+            return thumb_path
+    except Exception as e:
+        logger.warning(f"⚠️ تعذّر توليد المصغّر: {e}")
+    return None
+
+
+def reset_media_datetime(video_path):
+    """يضبط تاريخ إنشاء الفيديو (creation_time) إلى الآن + يحدّث تاريخ الملف،
+    حتى يظهر المقطع المحفوظ بترتيب وقت التحميل في معرض الهاتف وليس بتاريخ
+    رفعه الأصلي القديم. يعتمد على ffmpeg مع -c copy (بلا إعادة ترميز)."""
+    tmp = os.path.splitext(video_path)[0] + '.fixmeta.mp4'
+    try:
+        now_iso = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+        cmd = [
+            'ffmpeg', '-y', '-i', video_path, '-map', '0', '-c', 'copy',
+            '-metadata', f'creation_time={now_iso}',
+            '-metadata:s:v', f'creation_time={now_iso}',
+            tmp,
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=900)
+        if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+            os.replace(tmp, video_path)
+    except Exception as e:
+        logger.warning(f"⚠️ تعذّر ضبط تاريخ الفيديو: {e}")
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+    # تحديث تاريخ الملف نفسه إلى الآن (مهم لمعرض أندرويد)
+    try:
+        os.utime(video_path, None)
+    except Exception:
+        pass
 
 
 def _is_valid_cookie_file(platform_key):
@@ -1039,6 +1122,9 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             'retries': 15,
             'fragment_retries': 15,
             'nocheckcertificate': True,
+            # لا تضبط تاريخ الملف على تاريخ رفع الفيديو الأصلي القديم
+            # حتى يظهر المقطع بترتيب وقت التحميل في معرض الهاتف
+            'updatetime': False,
             'http_headers': {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             },
@@ -1196,8 +1282,16 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             except:
                 pass
             
-            logger.info(f"📹 Sending video: duration={video_duration}, width={video_width}, height={video_height}")
-            
+            # ضبط تاريخ الفيديو إلى الآن حتى يظهر بترتيب وقت التحميل في المعرض
+            await loop.run_in_executor(None, lambda: reset_media_datetime(file_path))
+
+            # توليد مصغّر ثابت لمنع ظهور إطار أسود/متجمّد في تلجرام
+            thumb_path = await loop.run_in_executor(
+                None, lambda: generate_video_thumbnail(file_path, video_duration)
+            )
+
+            logger.info(f"📹 Sending video: duration={video_duration}, width={video_width}, height={video_height}, thumb={bool(thumb_path)}")
+
             # Support button on Binance
             binance_id = subdb.get_setting('binance_pay_id', '86847466')
             lang = subdb.get_user_language(user_id)
@@ -1223,6 +1317,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                     duration=video_duration,
                     width=video_width,
                     height=video_height,
+                    thumb=thumb_path,
                     supports_streaming=True,
                     reply_markup=support_keyboard,
                     progress=upload_progress_tracker
@@ -1235,8 +1330,16 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                     chat_id=message.chat.id,
                     video=file_path,
                     caption=caption,
+                    thumb=thumb_path,
                     supports_streaming=True
                 )
+            finally:
+                # حذف ملف المصغّر المؤقت بعد الرفع
+                if thumb_path and os.path.exists(thumb_path):
+                    try:
+                        os.remove(thumb_path)
+                    except Exception:
+                        pass
         
         await status_msg.delete()
         logger.info(f"✅ نجح رفع {file_size_mb:.1f}MB للمستخدم {user_id}")
@@ -2571,6 +2674,11 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
         [InlineKeyboardButton("⏱️ تحديد المدة القصوى", callback_data="sub_set_duration")],
         [InlineKeyboardButton("💰 تحديد السعر", callback_data="sub_set_price")],
         [InlineKeyboardButton(adult_label, callback_data="sub_toggle_adult")],
+        [
+            InlineKeyboardButton("➕ موقع محظور", callback_data="sub_add_domain"),
+            InlineKeyboardButton("➕ كلمة محظورة", callback_data="sub_add_keyword"),
+        ],
+        [InlineKeyboardButton("📋 القائمة المحظورة المخصصة", callback_data="sub_list_blocked")],
         [InlineKeyboardButton("👥 عرض المشتركين", callback_data="sub_view_subscribers")],
         [InlineKeyboardButton("📊 عرض آخر 50 مستخدم", callback_data="sub_recent_users")],
         [InlineKeyboardButton("💳 الدفوعات المعلقة", callback_data="sub_pending_payments")],
@@ -2618,6 +2726,55 @@ async def handle_subscription_settings(client, callback_query):
             show_alert=True
         )
         # تحديث اللوحة لإظهار الحالة الجديدة
+        await subscription_settings_panel(
+            client, callback_query.message,
+            user_id=callback_query.from_user.id, edit=True
+        )
+        return
+
+    if action == 'add_domain':
+        await callback_query.message.edit_text(
+            "➕ **إضافة موقع محظور**\n\n"
+            "أرسل اسم نطاق الموقع المراد حظره (مثال: `example.com`).\n"
+            "سيُحظر الموقع ونطاقاته الفرعية تلقائياً.",
+            reply_markup=_sub_settings_back_kb()
+        )
+        pending_downloads[callback_query.from_user.id] = {'waiting_for': 'add_adult_domain'}
+        await callback_query.answer()
+        return
+
+    if action == 'add_keyword':
+        await callback_query.message.edit_text(
+            "➕ **إضافة كلمة محظورة**\n\n"
+            "أرسل الكلمة المراد حظرها. أي رابط أو عنوان فيديو يحتوي عليها سيُمنع.\n"
+            "يمكنك إرسال أكثر من كلمة مفصولة بفواصل.",
+            reply_markup=_sub_settings_back_kb()
+        )
+        pending_downloads[callback_query.from_user.id] = {'waiting_for': 'add_adult_keyword'}
+        await callback_query.answer()
+        return
+
+    if action == 'list_blocked':
+        domains = _custom_adult_domains()
+        keywords = _custom_adult_keywords()
+        text = "📋 **القائمة المحظورة المخصصة**\n\n"
+        text += "🌐 **المواقع:**\n"
+        text += ("\n".join(f"• `{d}`" for d in domains) if domains else "— لا يوجد —") + "\n\n"
+        text += "🔤 **الكلمات:**\n"
+        text += ("\n".join(f"• `{k}`" for k in keywords) if keywords else "— لا يوجد —")
+        text += "\n\n💡 النطاقات/الكلمات المدمجة مسبقاً ({} موقع) مفعّلة دائماً.".format(len(ADULT_DOMAINS))
+        kb_rows = []
+        if domains or keywords:
+            kb_rows.append([InlineKeyboardButton("🗑️ مسح القائمة المخصصة", callback_data="sub_clear_blocked")])
+        kb_rows.append([InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")])
+        await callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb_rows))
+        await callback_query.answer()
+        return
+
+    if action == 'clear_blocked':
+        subdb.set_setting('adult_custom_domains', '')
+        subdb.set_setting('adult_custom_keywords', '')
+        await callback_query.answer("🗑️ تم مسح القائمة المخصصة", show_alert=True)
         await subscription_settings_panel(
             client, callback_query.message,
             user_id=callback_query.from_user.id, edit=True
@@ -3247,7 +3404,27 @@ async def handle_admin_input(client, message):
                 f"السعر الجديد: ${price}"
             )
             del pending_downloads[user_id]
-        
+
+        elif waiting_for == 'add_adult_domain':
+            host = _url_host(message.text.strip()) or message.text.strip()
+            added = _add_to_setting_list('adult_custom_domains', host)
+            await message.reply_text(
+                f"✅ **تم حظر الموقع:** `{host.lower().lstrip('.')}`" if added
+                else f"ℹ️ الموقع `{host.lower().lstrip('.')}` محظور مسبقاً أو غير صالح."
+            )
+            del pending_downloads[user_id]
+
+        elif waiting_for == 'add_adult_keyword':
+            words = [w.strip() for w in message.text.split(',') if w.strip()]
+            added = [w for w in words if _add_to_setting_list('adult_custom_keywords', w)]
+            if added:
+                await message.reply_text(
+                    "✅ **تمت إضافة الكلمات المحظورة:**\n" + "\n".join(f"• `{w.lower()}`" for w in added)
+                )
+            else:
+                await message.reply_text("ℹ️ لا كلمات جديدة (محظورة مسبقاً أو فارغة).")
+            del pending_downloads[user_id]
+
         elif waiting_for == 'promote_user_id':
             user_input = message.text.strip()
             
