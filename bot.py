@@ -422,6 +422,10 @@ def get_file_size_mb(file_path):
 
 
 
+# عملاء يوتيوب يُجرَّبون بالترتيب؛ tv/mweb لا يتطلبان PO token غالباً ويعيدان الصيغ
+YT_PLAYER_CLIENTS = ['tv', 'mweb', 'web_safari', 'default']
+
+
 def _is_youtube_cookie_issue(err):
     """هل خطأ يوتيوب ناتج عن حجب الصيغ بسبب الكوكيز/الحماية؟"""
     msg = str(err).lower()
@@ -461,6 +465,10 @@ async def get_video_info(url: str):
         if cookie_file:
             ydl_opts['cookiefile'] = cookie_file
             logger.info(f"🍪 Using cookies for video info extraction: {cookie_file}")
+
+        # ليوتيوب: جرّب عملاء متعددين لتفادي حجب الصيغ (PO token)
+        if is_youtube:
+            ydl_opts['extractor_args'] = {'youtube': {'player_client': YT_PLAYER_CLIENTS}}
 
         loop = asyncio.get_event_loop()
 
@@ -939,6 +947,10 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         if cookie_file:
             ydl_opts['cookiefile'] = cookie_file
             logger.info(f"🍪 استخدام cookies للتحميل: {cookie_file}")
+
+        # ليوتيوب: جرّب عملاء متعددين لتفادي حجب الصيغ (PO token)
+        if any(m in url.lower() for m in PLATFORM_URL_MARKERS['youtube']):
+            ydl_opts['extractor_args'] = {'youtube': {'player_client': YT_PLAYER_CLIENTS}}
 
         # للملفات الصوتية: تحويل إلى MP3 فقط إذا لم يكن MP3 بالفعل
         if is_audio:
