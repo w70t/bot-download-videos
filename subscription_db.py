@@ -268,6 +268,42 @@ def remove_forced_channel(row_id) -> bool:
     conn.close()
     return deleted > 0
 
+def _ensure_fsub_passed_table():
+    """جدول إقرار المستخدمين بالقنوات غير القابلة للتحقق (البوت ليس مشرفاً)."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS fsub_user_passed (
+            user_id BIGINT NOT NULL,
+            chat_id TEXT NOT NULL,
+            PRIMARY KEY (user_id, chat_id)
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def get_user_passed_channels(user_id: int):
+    """مجموعة معرّفات القنوات التي أقرّ بها المستخدم (chat_id كنصوص)."""
+    _ensure_fsub_passed_table()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT chat_id FROM fsub_user_passed WHERE user_id = %s', (user_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    return {str(r[0]) for r in rows}
+
+def mark_user_passed_channel(user_id: int, chat_id):
+    """تسجيل إقرار المستخدم باشتراكه في قناة غير قابلة للتحقق."""
+    _ensure_fsub_passed_table()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO fsub_user_passed (user_id, chat_id)
+        VALUES (%s, %s) ON CONFLICT DO NOTHING
+    ''', (user_id, str(chat_id)))
+    conn.commit()
+    conn.close()
+
 # ═══════════════════════════════════════════════════════════════
 # دوال الدفوعات
 # ═══════════════════════════════════════════════════════════════
