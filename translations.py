@@ -63,6 +63,10 @@ TRANSLATIONS = {
         'member_reply_prefix': '📨 **رد من العضو {name}** (`{user_id}`)**:**',
         'reply_sent': '✅ **تم إرسال ردك بنجاح**',
         'reply_failed': '❌ **تعذّر إرسال الرد** (ربما حظر المستخدم البوت)',
+        'btn_yes': '✅ نعم',
+        'btn_no': '❌ لا',
+        'vote_yes_ack': '✅ شكراً، تم تسجيل ردك: نعم',
+        'vote_no_ack': '❌ تم تسجيل ردك: لا',
 
         # رسائل الاشتراك المفصلة
         'subscribe_now': '💎 اشترك الآن',
@@ -165,6 +169,10 @@ TRANSLATIONS = {
         'member_reply_prefix': '📨 **Reply from {name}** (`{user_id}`)**:**',
         'reply_sent': '✅ **Your reply was sent**',
         'reply_failed': '❌ **Could not send the reply** (user may have blocked the bot)',
+        'btn_yes': '✅ Yes',
+        'btn_no': '❌ No',
+        'vote_yes_ack': '✅ Thanks, recorded: Yes',
+        'vote_no_ack': '❌ Recorded: No',
 
         # Detailed subscription messages
         'subscribe_now': '💎 Subscribe Now',
