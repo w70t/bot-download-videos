@@ -12,6 +12,7 @@ import os
 import sys
 import glob  # للبحث عن الملفات وحذفها
 import time  # Added import os
+import json  # قراءة مخرجات ffprobe
 import subprocess  # توليد المصغّر وضبط تاريخ الفيديو عبر ffmpeg
 import logging
 import asyncio
@@ -272,25 +273,73 @@ def generate_video_thumbnail(video_path, duration=None):
     return None
 
 
+def probe_video(video_path):
+    """يفحص الفيديو بـ ffprobe ويرجع (vcodec, acodec, width, height, duration).
+    القيم غير المتوفرة تكون None."""
+    try:
+        out = subprocess.run(
+            ['ffprobe', '-v', 'error',
+             '-show_entries', 'stream=codec_type,codec_name,width,height:format=duration',
+             '-of', 'json', video_path],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60
+        ).stdout.decode('utf-8', 'ignore')
+        data = json.loads(out or '{}')
+        vcodec = acodec = width = height = None
+        for s in data.get('streams', []):
+            if s.get('codec_type') == 'video' and vcodec is None:
+                vcodec = (s.get('codec_name') or '').lower()
+                width = s.get('width')
+                height = s.get('height')
+            elif s.get('codec_type') == 'audio' and acodec is None:
+                acodec = (s.get('codec_name') or '').lower()
+        duration = None
+        try:
+            duration = int(float(data.get('format', {}).get('duration')))
+        except (TypeError, ValueError):
+            pass
+        return vcodec, acodec, width, height, duration
+    except Exception as e:
+        logger.warning(f"⚠️ تعذّر فحص الفيديو بـ ffprobe: {e}")
+        return None, None, None, None, None
+
+
 def finalize_video(video_path):
-    """يجهّز الفيديو لتلجرام عبر ffmpeg (بلا إعادة ترميز، -c copy):
-    - +faststart: نقل moov atom للبداية حتى يُشغّل ويُعاين فوراً بدل تجمّد الصورة.
-    - creation_time = الآن: ليظهر المقطع المحفوظ بترتيب وقت التحميل في المعرض.
-    ثم يحدّث تاريخ الملف نفسه (مهم لمعرض أندرويد)."""
+    """يجهّز الفيديو لتلجرام لكل المنصات (وليس يوتيوب فقط) ويرجع
+    (width, height, duration) الحقيقية من الملف:
+    - يضمن ترميز H.264/AAC: ينسخ إن كان متوافقاً، وإلا يُعيد الترميز (سبب
+      تجمّد الصورة في فيسبوك/منصات أخرى تستخدم VP9/AV1).
+    - +faststart: نقل moov atom للبداية ليُعاين ويُشغّل فوراً.
+    - creation_time = الآن ليظهر المقطع بترتيب وقت التحميل في المعرض.
+    """
+    vcodec, acodec, width, height, duration = probe_video(video_path)
+
+    # هل الترميز متوافق مع مشغّل تلجرام؟ (None = غير معروف، نكتفي بالنسخ)
+    v_compatible = vcodec in ('h264', 'avc1', None)
+    a_compatible = acodec in ('aac', 'mp4a', None)
+    v_args = ['-c:v', 'copy'] if v_compatible else \
+        ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p']
+    a_args = ['-c:a', 'copy'] if a_compatible else ['-c:a', 'aac', '-b:a', '128k']
+    if not v_compatible:
+        logger.info(f"🎞️ إعادة ترميز الفيديو إلى H.264 (المصدر: {vcodec})")
+
     tmp = os.path.splitext(video_path)[0] + '.fixed.mp4'
     try:
         now_iso = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
-        cmd = [
-            'ffmpeg', '-y', '-i', video_path,
-            # ننسخ الفيديو والصوت فقط (نتجنّب فشل النسخ بسبب مسارات بيانات/ترجمة)
-            '-map', '0:v?', '-map', '0:a?',
-            '-c', 'copy', '-movflags', '+faststart',
-            '-metadata', f'creation_time={now_iso}',
-            tmp,
-        ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=900)
+        cmd = (
+            ['ffmpeg', '-y', '-i', video_path, '-map', '0:v?', '-map', '0:a?']
+            + v_args + a_args
+            + ['-movflags', '+faststart', '-metadata', f'creation_time={now_iso}', tmp]
+        )
+        # إعادة الترميز قد تستغرق وقتاً أطول من النسخ
+        timeout = 3600 if not v_compatible else 900
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout)
         if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
             os.replace(tmp, video_path)
+            # أعد الفحص بعد التحويل للحصول على الأبعاد الصحيحة
+            nv, na, nw, nh, nd = probe_video(video_path)
+            width = nw or width
+            height = nh or height
+            duration = nd or duration
     except Exception as e:
         logger.warning(f"⚠️ تعذّر تجهيز الفيديو لتلجرام: {e}")
     finally:
@@ -304,6 +353,8 @@ def finalize_video(video_path):
         os.utime(video_path, None)
     except Exception:
         pass
+
+    return width, height, duration
 
 
 def _is_valid_cookie_file(platform_key):
@@ -1282,22 +1333,18 @@ async def download_and_upload(client, message, url, quality, callback_query=None
 
 
         else:
-            # التأكد من أن جميع القيم صحيحة قبل الإرسال
-            video_duration = int(duration) if duration and duration > 0 else None
-            video_width = None
-            video_height = None
-            
-            # محاولة الحصول على width/height من info إذا كانت موجودة
-            try:
-                if info.get('width'):
-                    video_width = int(info['width'])
-                if info.get('height'):
-                    video_height = int(info['height'])
-            except:
-                pass
-            
-            # تجهيز الفيديو لتلجرام: faststart (يمنع تجمّد الصورة) + تاريخ التحميل
-            await loop.run_in_executor(None, lambda: finalize_video(file_path))
+            # تجهيز الفيديو لكل المنصات: H.264/AAC + faststart (يمنع تجمّد الصورة)
+            # + تاريخ التحميل، ويرجع الأبعاد/المدة الحقيقية من الملف نفسه
+            probed_w, probed_h, probed_dur = await loop.run_in_executor(
+                None, lambda: finalize_video(file_path)
+            )
+
+            # الأبعاد/المدة من الملف أولاً ثم من معلومات yt-dlp (مهم للمنصات
+            # التي لا توفّر أبعاداً مثل فيسبوك، فغيابها يُظهر صورة متجمّدة)
+            video_width = probed_w or (int(info['width']) if info.get('width') else None)
+            video_height = probed_h or (int(info['height']) if info.get('height') else None)
+            _dur = probed_dur or duration
+            video_duration = int(_dur) if _dur and _dur > 0 else None
 
             # توليد مصغّر ثابت لمنع ظهور إطار أسود/متجمّد في تلجرام
             thumb_path = await loop.run_in_executor(
