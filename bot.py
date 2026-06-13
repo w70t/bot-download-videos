@@ -272,24 +272,27 @@ def generate_video_thumbnail(video_path, duration=None):
     return None
 
 
-def reset_media_datetime(video_path):
-    """يضبط تاريخ إنشاء الفيديو (creation_time) إلى الآن + يحدّث تاريخ الملف،
-    حتى يظهر المقطع المحفوظ بترتيب وقت التحميل في معرض الهاتف وليس بتاريخ
-    رفعه الأصلي القديم. يعتمد على ffmpeg مع -c copy (بلا إعادة ترميز)."""
-    tmp = os.path.splitext(video_path)[0] + '.fixmeta.mp4'
+def finalize_video(video_path):
+    """يجهّز الفيديو لتلجرام عبر ffmpeg (بلا إعادة ترميز، -c copy):
+    - +faststart: نقل moov atom للبداية حتى يُشغّل ويُعاين فوراً بدل تجمّد الصورة.
+    - creation_time = الآن: ليظهر المقطع المحفوظ بترتيب وقت التحميل في المعرض.
+    ثم يحدّث تاريخ الملف نفسه (مهم لمعرض أندرويد)."""
+    tmp = os.path.splitext(video_path)[0] + '.fixed.mp4'
     try:
         now_iso = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
         cmd = [
-            'ffmpeg', '-y', '-i', video_path, '-map', '0', '-c', 'copy',
+            'ffmpeg', '-y', '-i', video_path,
+            # ننسخ الفيديو والصوت فقط (نتجنّب فشل النسخ بسبب مسارات بيانات/ترجمة)
+            '-map', '0:v?', '-map', '0:a?',
+            '-c', 'copy', '-movflags', '+faststart',
             '-metadata', f'creation_time={now_iso}',
-            '-metadata:s:v', f'creation_time={now_iso}',
             tmp,
         ]
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=900)
         if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
             os.replace(tmp, video_path)
     except Exception as e:
-        logger.warning(f"⚠️ تعذّر ضبط تاريخ الفيديو: {e}")
+        logger.warning(f"⚠️ تعذّر تجهيز الفيديو لتلجرام: {e}")
     finally:
         if os.path.exists(tmp):
             try:
@@ -1028,9 +1031,20 @@ async def download_and_upload(client, message, url, quality, callback_query=None
     
     try:
         # إعدادات التحميل
+        # نُفضّل ترميز H.264 (avc1) + صوت AAC (m4a) لأنه متوافق 100% مع مشغّل
+        # تلجرام؛ ترميز VP9/AV1 داخل MP4 يسبب تجمّد الصورة أثناء التشغيل.
+        # سلسلة احتياطية تنازلية لضمان نجاح التحميل دائماً.
         quality_formats = {
-            'best': 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
-            'medium': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
+            'best': (
+                'bestvideo[height<=1080][vcodec^=avc1]+bestaudio[ext=m4a]/'
+                'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/'
+                'best[height<=1080][ext=mp4]/best[height<=1080]/best'
+            ),
+            'medium': (
+                'bestvideo[height<=720][vcodec^=avc1]+bestaudio[ext=m4a]/'
+                'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/'
+                'best[height<=720][ext=mp4]/best[height<=720]/best'
+            ),
             'audio': 'bestaudio/best'  # النسخة الناجحة - تحميل أفضل جودة صوت
         }
         
@@ -1282,8 +1296,8 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             except:
                 pass
             
-            # ضبط تاريخ الفيديو إلى الآن حتى يظهر بترتيب وقت التحميل في المعرض
-            await loop.run_in_executor(None, lambda: reset_media_datetime(file_path))
+            # تجهيز الفيديو لتلجرام: faststart (يمنع تجمّد الصورة) + تاريخ التحميل
+            await loop.run_in_executor(None, lambda: finalize_video(file_path))
 
             # توليد مصغّر ثابت لمنع ظهور إطار أسود/متجمّد في تلجرام
             thumb_path = await loop.run_in_executor(
