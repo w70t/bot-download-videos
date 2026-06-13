@@ -19,6 +19,16 @@ import traceback
 from datetime import datetime
 from pyrogram import Client, filters, enums, StopPropagation
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from pyrogram.errors import (
+    UserIsBlocked, InputUserDeactivated, PeerIdInvalid,
+    UserDeactivated, UserDeactivatedBan, FloodWait
+)
+
+# أخطاء تعني أن المستخدم لم يعد متاحاً (حظر البوت أو حُذف حسابه) فنحذفه
+GONE_USER_ERRORS = (
+    UserIsBlocked, InputUserDeactivated, PeerIdInvalid,
+    UserDeactivated, UserDeactivatedBan,
+)
 from dotenv import load_dotenv
 import subscription_db as subdb
 from translations import t
@@ -1437,8 +1447,81 @@ async def daily_report_task():
         # إرسال التقرير
         admin_id = int(os.getenv("ADMIN_ID"))
         await send_daily_report(app, admin_id)
-        
+
         # انتظر يوم كامل
+        await asyncio.sleep(86400)
+
+
+async def probe_and_cleanup_users(client):
+    """فحص صامت لكل الأعضاء لمعرفة من بقي ومن غادر، وحذف الغائبين.
+
+    يستخدم send_chat_action (مؤشر "يكتب…") وهو فحص صامت تماماً لا يرى العضو
+    أي رسالة. إن نجح فالعضو موجود، وإن فشل بخطأ "غادر" نحذفه من قاعدة البيانات.
+    يُعيد (alive, removed, removed_ids).
+    """
+    users = subdb.get_all_users()
+    alive = 0
+    removed = 0
+    removed_ids = []
+
+    for u in users:
+        uid = u[0]
+        try:
+            # فحص صامت: مؤشر كتابة يختفي فوراً ولا يُرسل رسالة مرئية
+            await client.send_chat_action(uid, enums.ChatAction.TYPING)
+            alive += 1
+            await asyncio.sleep(0.05)  # تفادي flood
+        except FloodWait as e:
+            # انتظر المدة المطلوبة ثم اعتبره موجوداً
+            await asyncio.sleep(getattr(e, 'value', 5))
+            alive += 1
+        except GONE_USER_ERRORS:
+            # العضو حظر البوت أو حُذف حسابه → احذفه
+            try:
+                subdb.delete_user(uid)
+                removed += 1
+                removed_ids.append(uid)
+            except Exception as del_err:
+                logger.error(f"تعذّر حذف المستخدم {uid}: {del_err}")
+        except Exception as e:
+            # خطأ مؤقت/غير معروف → نُبقي العضو احتياطاً
+            logger.warning(f"فحص العضو {uid} أعطى خطأً غير حاسم: {e}")
+
+    return alive, removed, removed_ids
+
+
+async def daily_cleanup_task():
+    """مهمة يومية الساعة 3 فجراً: فحص الأعضاء وحذف الغائبين وإبلاغ الأدمن"""
+    from datetime import timedelta
+
+    while True:
+        now = datetime.now()
+        target_time = now.replace(hour=3, minute=0, second=0, microsecond=0)
+        if now > target_time:
+            target_time = target_time + timedelta(days=1)
+
+        await asyncio.sleep((target_time - now).total_seconds())
+
+        try:
+            admin_id = int(os.getenv("ADMIN_ID"))
+            total_before = len(subdb.get_all_users())
+            logger.info(f"🧹 بدء الفحص اليومي للأعضاء ({total_before})...")
+
+            alive, removed, removed_ids = await probe_and_cleanup_users(app)
+
+            await app.send_message(
+                admin_id,
+                "🧹 **الفحص اليومي للأعضاء (3 فجراً)**\n\n"
+                f"👥 قبل الفحص: **{total_before}**\n"
+                f"✅ موجودون فعلاً: **{alive}**\n"
+                f"🗑️ حُذفوا (غادروا/حظروا): **{removed}**\n"
+                f"📊 العدد الحقيقي الآن: **{alive}**"
+            )
+            logger.info(f"🧹 انتهى الفحص: {alive} موجود، {removed} محذوف")
+        except Exception as e:
+            logger.error(f"❌ خطأ في الفحص اليومي: {e}")
+
+        # انتظر يوماً كاملاً قبل الفحص التالي
         await asyncio.sleep(86400)
 
 
@@ -3076,6 +3159,7 @@ async def handle_admin_input(client, message):
 
             success_count = 0
             fail_count = 0
+            removed_count = 0
 
             for user in all_users:
                 try:
@@ -3096,7 +3180,19 @@ async def handle_admin_input(client, message):
                     )
                     success_count += 1
                     await asyncio.sleep(0.05)  # تأخير بسيط لتجنب Flood
-                except:
+                except FloodWait as e:
+                    await asyncio.sleep(getattr(e, 'value', 5))
+                    fail_count += 1
+                except GONE_USER_ERRORS:
+                    # العضو غادر/حظر البوت → احذفه من قاعدة البيانات
+                    try:
+                        subdb.delete_user(user[0])
+                        removed_count += 1
+                    except Exception:
+                        pass
+                    fail_count += 1
+                except Exception:
+                    # خطأ مؤقت/غير معروف → نُبقي العضو
                     fail_count += 1
 
             # عدد من وصلتهم الرسالة فعلاً هو الأساس لحساب "لم يتفاعلوا"
@@ -3114,14 +3210,15 @@ async def handle_admin_input(client, message):
             try:
                 await progress.edit_text(
                     f"✅ **اكتمل الإرسال!**\n\n"
-                    f"✅ النجاح: {success_count}\n"
-                    f"❌ الفشل: {fail_count}"
+                    f"✅ وصلت إلى: {success_count}\n"
+                    f"❌ فشلت: {fail_count}\n"
+                    f"🗑️ حُذف (غادروا البوت): {removed_count}"
                 )
             except Exception:
                 pass
 
             del pending_downloads[user_id]
-            logger.info(f"📢 Broadcast #{bid}: {success_count} نجح, {fail_count} فشل")
+            logger.info(f"📢 Broadcast #{bid}: {success_count} نجح, {fail_count} فشل, {removed_count} محذوف")
         
         elif waiting_for == 'direct_msg_user_id':
             user_input = message.text.strip()
@@ -3387,9 +3484,10 @@ def main():
     subdb.init_db()
     print("✅ تم إنشاء قاعدة بيانات الاشتراكات")
     
-    # بدء مهمة التقرير اليومي
+    # بدء مهمة التقرير اليومي والفحص اليومي للأعضاء (3 فجراً)
     loop = asyncio.get_event_loop()
     loop.create_task(daily_report_task())
+    loop.create_task(daily_cleanup_task())
     
     try:
         app.run()
