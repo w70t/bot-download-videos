@@ -24,7 +24,7 @@ from pyrogram import Client, filters, enums, StopPropagation
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.errors import (
     UserIsBlocked, InputUserDeactivated, PeerIdInvalid,
-    UserDeactivated, UserDeactivatedBan, FloodWait
+    UserDeactivated, UserDeactivatedBan, FloodWait, UserNotParticipant
 )
 
 # أخطاء تعني أن المستخدم لم يعد متاحاً (حظر البوت أو حُذف حسابه) فنحذفه
@@ -366,6 +366,114 @@ def _binance_support_keyboard(binance_id, lang):
     except Exception:
         button = InlineKeyboardButton(label, callback_data="binance_info")
     return InlineKeyboardMarkup([[button]])
+
+
+# ═══════════════════════════════════════════════════════════════
+# الاشتراك الإجباري بالقنوات - Forced channel subscription
+# ═══════════════════════════════════════════════════════════════
+
+def _forced_channel_target(chat_id):
+    """يحوّل chat_id المخزّن (نص) إلى صيغة مناسبة لـ Pyrogram (رقم أو @يوزر)."""
+    s = str(chat_id)
+    return int(s) if s.lstrip('-').isdigit() else s
+
+
+async def get_missing_forced_channels(client, user_id):
+    """يرجع قائمة القنوات التي لم يشترك بها المستخدم (تحقق حقيقي).
+    الأخطاء الناتجة عن عدم كون البوت مشرفاً تُتجاهل حتى لا تُقفل البوت."""
+    missing = []
+    for ch in subdb.get_forced_channels():
+        target = _forced_channel_target(ch[1])
+        try:
+            member = await client.get_chat_member(target, user_id)
+            if member.status in (enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED):
+                missing.append(ch)
+        except UserNotParticipant:
+            missing.append(ch)
+        except Exception as e:
+            logger.warning(f"⚠️ تعذّر التحقق من قناة الاشتراك الإجباري {ch[1]}: {e}")
+            continue
+    return missing
+
+
+def _forced_sub_keyboard(channels, lang):
+    """يبني أزرار الاشتراك (زر لكل قناة) + زر التحقق."""
+    rows = []
+    for idx, ch in enumerate(channels, 1):
+        username, url = ch[2], ch[4]
+        link = url or (f"https://t.me/{username}" if username else None)
+        if link:
+            rows.append([InlineKeyboardButton(t('fsub_join_btn', lang, n=idx), url=link)])
+    rows.append([InlineKeyboardButton(t('fsub_check_btn', lang), callback_data="fsub_check")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def enforce_forced_subscription(client, message, user_id, lang):
+    """يفحص الاشتراك الإجباري؛ إن كان ناقصاً يعرض شاشة الاشتراك ويُرجع True
+    (أي يجب إيقاف المعالجة). الأدمن مُعفى."""
+    if str(user_id) == os.getenv("ADMIN_ID"):
+        return False
+    missing = await get_missing_forced_channels(client, user_id)
+    if not missing:
+        return False
+    await message.reply_text(
+        t('fsub_required', lang),
+        reply_markup=_forced_sub_keyboard(missing, lang)
+    )
+    return True
+
+
+async def add_forced_channel_from_admin(client, message, user_id):
+    """يستخرج القناة من رسالة الأدمن (@username / رابط / توجيه) ويضيفها.
+    يُزيل حالة الانتظار وينهي العملية بالرد المناسب."""
+    pending_downloads.pop(user_id, None)
+    raw = (message.text or '').strip()
+    identifier = None
+    if getattr(message, 'forward_from_chat', None):
+        identifier = message.forward_from_chat.id
+    elif raw:
+        ident = raw
+        if 't.me/' in ident:
+            ident = ident.split('t.me/')[-1].split('/')[0].split('?')[0]
+            if ident.startswith('+'):
+                await message.reply_text(
+                    "⚠️ روابط الدعوة الخاصة لا تدعم التحقق التلقائي.\n"
+                    "استخدم قناة عامة بصيغة `@username`."
+                )
+                return
+        identifier = ident if str(ident).lstrip('-').isdigit() else '@' + ident.lstrip('@')
+    if not identifier:
+        await message.reply_text("❌ لم أتعرّف على القناة. أرسل `@username`.")
+        return
+    try:
+        chat = await client.get_chat(identifier)
+        username = chat.username
+        title = chat.title
+        url = f"https://t.me/{username}" if username else None
+        if not url:
+            await message.reply_text(
+                "⚠️ القناة لا تملك معرّفاً عاماً (@username).\n"
+                "أضِف معرّفاً عاماً للقناة ليعمل زر الاشتراك."
+            )
+            return
+        warn = ""
+        try:
+            me = await client.get_me()
+            bot_member = await client.get_chat_member(chat.id, me.id)
+            if bot_member.status != enums.ChatMemberStatus.ADMINISTRATOR:
+                warn = "\n\n⚠️ اجعل البوت **مشرفاً** في القناة ليعمل التحقق."
+        except Exception:
+            warn = "\n\n⚠️ أضِف البوت إلى القناة كـ **مشرف** ليعمل التحقق."
+
+        if subdb.add_forced_channel(chat.id, username, title, url):
+            await message.reply_text(f"✅ **تمت إضافة القناة:**\n{title} (@{username})" + warn)
+        else:
+            await message.reply_text("ℹ️ هذه القناة مُضافة مسبقاً.")
+    except Exception as e:
+        await message.reply_text(
+            "❌ تعذّر إضافة القناة. تأكد أن المعرّف صحيح وأن البوت "
+            f"عضو/مشرف فيها.\n\n`{str(e)[:150]}`"
+        )
 
 
 def _is_valid_cookie_file(platform_key):
@@ -2242,6 +2350,14 @@ async def handle_url(client, message):
     url = message.text.strip()
     user_id = message.from_user.id
 
+    # إن كان الأدمن في وضع إضافة قناة اشتراك إجباري وأرسل رابط t.me، عالِجه هنا
+    # (لأن معالج الروابط يلتقط أي رسالة فيها http قبل معالج إدخال الأدمن)
+    if str(user_id) == os.getenv("ADMIN_ID"):
+        _pend = pending_downloads.get(user_id)
+        if isinstance(_pend, dict) and _pend.get('waiting_for') == 'add_forced_channel':
+            await add_forced_channel_from_admin(client, message, user_id)
+            return
+
     # Get user language FIRST
     lang = subdb.get_user_language(user_id)
 
@@ -2249,6 +2365,10 @@ async def handle_url(client, message):
     if adult_filter_enabled() and is_adult_url(url):
         logger.info(f"🔞 Blocked adult URL from user {user_id}: {_url_host(url)}")
         await message.reply_text(t('adult_blocked', lang))
+        return
+
+    # 📢 الاشتراك الإجباري بالقنوات قبل أي تحميل (تحقق حقيقي)
+    if await enforce_forced_subscription(client, message, user_id, lang):
         return
 
     # Check rate limiting
@@ -2490,6 +2610,26 @@ async def handle_binance_info_copy(client, callback_query):
     )
 
 
+@app.on_callback_query(filters.regex(r'^fsub_check$'))
+async def handle_fsub_check(client, callback_query):
+    """تحقق حقيقي من الاشتراك الإجباري؛ عند النجاح يحذف الرسالة ويعرض الشكر."""
+    user_id = callback_query.from_user.id
+    lang = subdb.get_user_language(user_id)
+
+    missing = await get_missing_forced_channels(client, user_id)
+    if missing:
+        await callback_query.answer(t('fsub_not_yet', lang), show_alert=True)
+        return
+
+    # نجح التحقق: احذف رسالة الاشتراك كاملة وأظهر رسالة الشكر
+    try:
+        await callback_query.message.delete()
+    except Exception:
+        pass
+    await client.send_message(user_id, t('fsub_thanks', lang))
+    await callback_query.answer()
+
+
 @app.on_callback_query(filters.regex(r'^back_to_subscription$'))
 async def handle_back_to_subscription(client, callback_query):
     """معالج الرجوع لشاشة الاشتراك"""
@@ -2723,6 +2863,34 @@ def _sub_settings_back_kb():
     ])
 
 
+async def show_forced_sub_panel(client, callback_query):
+    """لوحة إدارة الاشتراك الإجباري: القنوات + إحصائيات الأعضاء + حذف/إضافة."""
+    channels = subdb.get_forced_channels()
+    text = "📢 **الاشتراك الإجباري بالقنوات**\n\n"
+    rows = []
+    if not channels:
+        text += "لا توجد قنوات حالياً.\nأضف قناة ليُطلب من الأعضاء الاشتراك بها قبل التحميل."
+    else:
+        text += f"عدد القنوات: {len(channels)}\n\n"
+        for ch in channels:
+            row_id, chat_id, username, title = ch[0], ch[1], ch[2], ch[3]
+            name = title or (f"@{username}" if username else str(chat_id))
+            # عدد المشتركين الحقيقي من تلجرام
+            count = "?"
+            try:
+                chat = await client.get_chat(_forced_channel_target(chat_id))
+                count = getattr(chat, 'members_count', None) or "?"
+            except Exception:
+                pass
+            text += f"• {name} — 👥 {count} مشترك\n"
+            rows.append([InlineKeyboardButton(f"🗑️ حذف: {name[:25]}", callback_data=f"sub_fsubdel_{row_id}")])
+
+    rows.append([InlineKeyboardButton("➕ إضافة قناة", callback_data="sub_fsub_add")])
+    rows.append([InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")])
+    await callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(rows))
+    await callback_query.answer()
+
+
 async def subscription_settings_panel(client, message, user_id=None, edit=False):
     """لوحة إعدادات الاشتراك للأدمن.
 
@@ -2753,6 +2921,7 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
             InlineKeyboardButton("➕ كلمة محظورة", callback_data="sub_add_keyword"),
         ],
         [InlineKeyboardButton("📋 القائمة المحظورة المخصصة", callback_data="sub_list_blocked")],
+        [InlineKeyboardButton("📢 الاشتراك الإجباري", callback_data="sub_fsub")],
         [InlineKeyboardButton("👥 عرض المشتركين", callback_data="sub_view_subscribers")],
         [InlineKeyboardButton("📊 عرض آخر 50 مستخدم", callback_data="sub_recent_users")],
         [InlineKeyboardButton("💳 الدفوعات المعلقة", callback_data="sub_pending_payments")],
@@ -2789,7 +2958,7 @@ async def handle_subscription_settings(client, callback_query):
         await callback_query.answer("❌ للمشرفين فقط!", show_alert=True)
         return
     
-    action = callback_query.data.replace('sub_', '')
+    action = callback_query.data[len('sub_'):]  # إزالة البادئة فقط (لا كل التكرارات)
 
     if action == 'toggle_adult':
         new_state = '0' if adult_filter_enabled() else '1'
@@ -2853,6 +3022,32 @@ async def handle_subscription_settings(client, callback_query):
             client, callback_query.message,
             user_id=callback_query.from_user.id, edit=True
         )
+        return
+
+    if action == 'fsub':
+        await show_forced_sub_panel(client, callback_query)
+        return
+
+    if action == 'fsub_add':
+        await callback_query.message.edit_text(
+            "➕ **إضافة قناة اشتراك إجباري**\n\n"
+            "أرسل معرّف القناة العامة بصيغة `@username`،\n"
+            "أو رابط القناة، أو وجّه لي رسالة منها.\n\n"
+            "⚠️ **مهم:** اجعل البوت **مشرفاً** في القناة ليعمل التحقق.",
+            reply_markup=_sub_settings_back_kb()
+        )
+        pending_downloads[callback_query.from_user.id] = {'waiting_for': 'add_forced_channel'}
+        await callback_query.answer()
+        return
+
+    if action.startswith('fsubdel_'):
+        try:
+            row_id = int(action.replace('fsubdel_', ''))
+            subdb.remove_forced_channel(row_id)
+            await callback_query.answer("🗑️ تم حذف القناة", show_alert=True)
+        except Exception:
+            await callback_query.answer("❌ تعذّر الحذف", show_alert=True)
+        await show_forced_sub_panel(client, callback_query)
         return
 
     if action == 'set_duration':
@@ -3498,6 +3693,9 @@ async def handle_admin_input(client, message):
             else:
                 await message.reply_text("ℹ️ لا كلمات جديدة (محظورة مسبقاً أو فارغة).")
             del pending_downloads[user_id]
+
+        elif waiting_for == 'add_forced_channel':
+            await add_forced_channel_from_admin(client, message, user_id)
 
         elif waiting_for == 'promote_user_id':
             user_input = message.text.strip()
