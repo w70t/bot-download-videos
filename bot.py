@@ -17,7 +17,7 @@ import asyncio
 import yt_dlp
 import traceback
 from datetime import datetime
-from pyrogram import Client, filters, enums
+from pyrogram import Client, filters, enums, StopPropagation
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from dotenv import load_dotenv
 import subscription_db as subdb
@@ -81,6 +81,10 @@ queue_manager = DownloadQueueManager(cooldown_seconds=10)
 
 # تخزين الروابط
 pending_downloads = {}
+
+# حالة المحادثة بين الأدمن والأعضاء عبر زر الرد
+# {user_id: target_user_id} أي أن user_id ينتظر كتابة رد ليُرسَل إلى target_user_id
+conversation_state = {}
 
 # منصات الـ cookies المدعومة
 COOKIES_PLATFORMS = {
@@ -2582,7 +2586,8 @@ async def handle_duration_actions(client, callback_query):
         )
     
     elif action == 'back_to_sub_settings':
-        # العودة لشاشة إعدادات الاشتراك (مرّر معرّف الأدمن الحقيقي وعدّل الرسالة)
+        # إلغاء أي إدخال معلّق ثم العودة لشاشة إعدادات الاشتراك
+        pending_downloads.pop(user_id, None)
         await subscription_settings_panel(
             client, callback_query.message,
             user_id=callback_query.from_user.id, edit=True
@@ -2605,17 +2610,19 @@ async def handle_message_type(client, callback_query):
         await callback_query.message.edit_text(
             "📢 **إرسال رسالة لجميع المستخدمين**\n\n"
             "أرسل الرسالة التي تريد إرسالها لجميع مستخدمي البوت\n\n"
-            f"⚠️ سيتم إرسالها لـ **{subdb.get_user_stats()['total']}** مستخدم"
+            f"⚠️ سيتم إرسالها لـ **{subdb.get_user_stats()['total']}** مستخدم",
+            reply_markup=_sub_settings_back_kb()
         )
         pending_downloads[user_id] = {'waiting_for': 'broadcast_message'}
-    
+
     elif action == 'direct_user':
         await callback_query.message.edit_text(
             "👤 **إرسال رسالة لمستخدم محدد**\n\n"
             "أرسل **User ID** أو **Username** للمستخدم المراد مراسلته\n\n"
             "**أمثلة:**\n"
             "• `123456789` (User ID)\n"
-            "• `@username` (Username)"
+            "• `@username` (Username)",
+            reply_markup=_sub_settings_back_kb()
         )
         pending_downloads[user_id] = {'waiting_for': 'direct_msg_user_id'}
     
@@ -2623,8 +2630,78 @@ async def handle_message_type(client, callback_query):
         await callback_query.message.edit_text("❌ **تم الإلغاء**")
         if user_id in pending_downloads:
             del pending_downloads[user_id]
-    
+
     await callback_query.answer()
+
+
+@app.on_callback_query(filters.regex(r'^reply_msg_'))
+async def handle_reply_button(client, callback_query):
+    """زر الرد: يضع الضاغط في حالة انتظار كتابة رد ليُرسَل للطرف الآخر"""
+    clicker_id = callback_query.from_user.id
+    try:
+        target_id = int(callback_query.data.replace('reply_msg_', ''))
+    except (ValueError, TypeError):
+        await callback_query.answer()
+        return
+
+    # تسجيل أن هذا المستخدم سيكتب رداً موجّهاً إلى target_id
+    conversation_state[clicker_id] = target_id
+
+    lang = subdb.get_user_language(clicker_id)
+    await callback_query.message.reply_text(t('type_your_reply', lang))
+    await callback_query.answer()
+
+
+@app.on_message(
+    filters.text & ~filters.regex(r'^/') & ~filters.regex(r'https?://'),
+    group=-2
+)
+async def handle_conversation_reply(client, message):
+    """معالج عالي الأولوية لتمرير الردود بين الأدمن والأعضاء عبر البوت.
+
+    إذا كان المرسل ضغط زر "رد" مسبقاً، نمرّر رسالته للطرف الآخر مع زر رد جديد،
+    ثم نوقف انتشار الرسالة لبقية المعالجات.
+    """
+    if not message.from_user:
+        return
+
+    sender_id = message.from_user.id
+    if sender_id not in conversation_state:
+        return  # ليس في وضع رد؛ اترك المعالجات الأخرى تعمل
+
+    target_id = conversation_state.pop(sender_id)
+    reply_text = message.text.strip()
+    admin_id = os.getenv("ADMIN_ID")
+    sender_is_admin = (str(sender_id) == admin_id)
+
+    target_lang = subdb.get_user_language(target_id)
+
+    if sender_is_admin:
+        # المطور يرد على عضو → نص "رسالة من المطور"
+        body = f"{t('direct_message_prefix', target_lang)}\n\n{reply_text}"
+    else:
+        # عضو يرد على المطور → نعرض اسمه ومعرّفه
+        sender_name = message.from_user.first_name or "عضو"
+        body = (f"{t('member_reply_prefix', target_lang, name=sender_name, user_id=sender_id)}"
+                f"\n\n{reply_text}")
+
+    # زر رد للطرف الآخر ليرد على المرسل الحالي
+    reply_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            t('reply_button', target_lang),
+            callback_data=f"reply_msg_{sender_id}"
+        )
+    ]])
+
+    sender_lang = subdb.get_user_language(sender_id)
+    try:
+        await client.send_message(chat_id=target_id, text=body, reply_markup=reply_kb)
+        await message.reply_text(t('reply_sent', sender_lang))
+    except Exception as e:
+        logger.error(f"❌ فشل تمرير الرد من {sender_id} إلى {target_id}: {e}")
+        await message.reply_text(t('reply_failed', sender_lang))
+
+    raise StopPropagation
 
 
 @app.on_callback_query(filters.regex(r'^set_daily_limit_'))
@@ -2871,7 +2948,8 @@ async def handle_admin_input(client, message):
                 f"👤 **سيتم الإرسال إلى:**\n\n"
                 f"الاسم: {target_user[2]}\n"
                 f"ID: `{target_user[0]}`\n\n"
-                f"**أرسل الرسالة الآن:**"
+                f"**أرسل الرسالة الآن:**",
+                reply_markup=_sub_settings_back_kb()
             )
         
         elif waiting_for == 'direct_msg_text':
@@ -2882,12 +2960,21 @@ async def handle_admin_input(client, message):
             try:
                 # Get user's preferred language
                 user_lang = subdb.get_user_language(target_user_id)
-                
+
+                # زر يتيح للعضو الرد على المطور عبر البوت
+                reply_kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        t('reply_button', user_lang),
+                        callback_data=f"reply_msg_{user_id}"
+                    )
+                ]])
+
                 await client.send_message(
                     chat_id=target_user_id,
-                    text=f"{t('direct_message_prefix', user_lang)}\n\n{msg_text}"
+                    text=f"{t('direct_message_prefix', user_lang)}\n\n{msg_text}",
+                    reply_markup=reply_kb
                 )
-                
+
                 await message.reply_text(
                     f"✅ **تم الإرسال بنجاح!**\n\n"
                     f"👤 إلى: {target_user_name}\n"
