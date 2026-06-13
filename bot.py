@@ -95,6 +95,49 @@ COOKIES_PLATFORMS = {
     'other': {'name': 'أخرى 🌐', 'file': 'cookies/other.txt'},
 }
 
+# ربط أجزاء الرابط بالمنصة المناسبة لاختيار ملف الـ cookies الصحيح
+PLATFORM_URL_MARKERS = {
+    'youtube': ['youtube.', 'youtu.be'],
+    'facebook': ['facebook.', 'fb.watch', 'fb.com'],
+    'instagram': ['instagram.', 'instagr.am'],
+    'twitter': ['twitter.', 'x.com', 't.co'],
+    'reddit': ['reddit.', 'redd.it'],
+    'snapchat': ['snapchat.'],
+    'pinterest': ['pinterest.', 'pin.it'],
+    'tiktok': ['tiktok.'],
+}
+
+
+def _is_valid_cookie_file(platform_key):
+    """يتحقق أن ملف الـ cookies الخاص بالمنصة موجود وليس فارغاً"""
+    data = COOKIES_PLATFORMS.get(platform_key)
+    if not data:
+        return None
+    path = data['file']
+    if os.path.exists(path) and os.path.getsize(path) > 100:
+        return path
+    return None
+
+
+def get_cookie_file_for_url(url):
+    """يختار ملف الـ cookies المطابق لمنصة الرابط.
+
+    الستوري في فيسبوك وإنستغرام يتطلب تسجيل دخول، لذا يجب استخدام cookies
+    نفس المنصة تحديداً وليس أي ملف cookies متوفر. عند عدم توفر ملف المنصة
+    نرجع إلى ملف 'other' إن كان صالحاً.
+    """
+    url_lower = (url or '').lower()
+    for platform_key, markers in PLATFORM_URL_MARKERS.items():
+        if any(marker in url_lower for marker in markers):
+            cookie = _is_valid_cookie_file(platform_key)
+            if cookie:
+                logger.info(f"🍪 استخدام cookies المنصة المطابقة: {platform_key}")
+                return cookie
+            logger.warning(f"⚠️ لا يوجد ملف cookies صالح للمنصة {platform_key}؛ قد يفشل تحميل المحتوى الخاص (الستوري)")
+            break
+    # احتياطي: ملف cookies عام
+    return _is_valid_cookie_file('other')
+
 # نظام تتبع الأخطاء
 user_errors = {}  # {error_id: {'user_id': ..., 'error': ..., 'url': ..., 'time': ..., 'status': 'pending'}}
 error_counter = 0
@@ -237,22 +280,9 @@ def get_file_size_mb(file_path):
 async def get_video_info(url: str):
     """استخراج معلومات الفيديو"""
     try:
-        # إضافة cookies إذا كانت موجودة وصالحة (ليست فارغة)
-        cookies_files = []
-        for platform, data in COOKIES_PLATFORMS.items():
-            if os.path.exists(data['file']):
-                # التحقق من أن الملف ليس فارغاً وأن حجمه أكبر من 100 بايت
-                file_size = os.path.getsize(data['file'])
-                if file_size > 100:  # ملف صالح يجب أن يكون أكبر من 100 بايت
-                    cookies_files.append(data['file'])
-                    logger.info(f"✅ Cookie file loaded: {platform} ({file_size} bytes)")
-                else:
-                    logger.warning(f"⚠️ Skipping empty/invalid cookie file: {platform} ({file_size} bytes)")
-                    if platform == 'facebook' and file_size == 0:
-                        logger.error(f"❌ Facebook cookie file is completely empty! Facebook downloads will fail.")
-                        logger.info(f"💡 Please update {data['file']} with valid Facebook cookies")
-        
-        
+        # اختيار ملف cookies المطابق لمنصة الرابط (مهم للستوري الخاص)
+        cookie_file = get_cookie_file_for_url(url)
+
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
@@ -260,19 +290,16 @@ async def get_video_info(url: str):
             'socket_timeout': 30,  # تقليل timeout لاستجابة أسرع
             'extract_flat': False,  # نحتاج معلومات كاملة
             'no_check_certificate': True,
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            },
         }
-        
-        # استخدام cookies للتعرف على الفيديو
-        if cookies_files:
-            ydl_opts['cookiefile'] = cookies_files[0]
-            logger.info(f"🍪 Using cookies for video info extraction")
-        
-        # إضافة extractor_args لـ Facebook
-        ydl_opts['extractor_args'] = {
-            'facebook': {'cookie_file': cookies_files[0] if cookies_files else None},
-            'instagram': {'cookie_file': cookies_files[0] if cookies_files else None},
-        }
-        
+
+        # استخدام cookies المنصة للتعرف على الفيديو (يشمل الستوري الذي يتطلب تسجيل دخول)
+        if cookie_file:
+            ydl_opts['cookiefile'] = cookie_file
+            logger.info(f"🍪 Using cookies for video info extraction: {cookie_file}")
+
         loop = asyncio.get_event_loop()
         
         def extract():
@@ -733,32 +760,12 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             },
         }
         
-        # إضافة cookies إذا كانت متوفرة وصالحة (ليست فارغة)
-        cookies_files = []
-        for platform, data in COOKIES_PLATFORMS.items():
-            if os.path.exists(data['file']):
-                # التحقق من أن الملف ليس فارغاً وأن حجمه أكبر من 100 بايت
-                file_size = os.path.getsize(data['file'])
-                if file_size > 100:  # ملف صالح يجب أن يكون أكبر من 100 بايت
-                    cookies_files.append(data['file'])
-        
-        if cookies_files:
-            ydl_opts['cookiefile'] = cookies_files[0]
-        
-        # تحسينات لجميع منصات التواصل الاجتماعي
-        ydl_opts['extractor_args'] = {
-            'facebook': {'cookie_file': cookies_files[0] if cookies_files else None},
-            'instagram': {'cookie_file': cookies_files[0] if cookies_files else None},
-            'youtube': {'cookie_file': cookies_files[0] if cookies_files else None},
-            'twitter': {'cookie_file': cookies_files[0] if cookies_files else None},
-            'tiktok': {'cookie_file': cookies_files[0] if cookies_files else None},
-            'snapchat': {'cookie_file': cookies_files[0] if cookies_files else None},
-            'pinterest': {
-                'cookie_file': cookies_files[0] if cookies_files else None,
-                'api_only': False,
-            },
-        }
-        
+        # اختيار ملف cookies المطابق لمنصة الرابط (ضروري لستوري فيسبوك/إنستغرام)
+        cookie_file = get_cookie_file_for_url(url)
+        if cookie_file:
+            ydl_opts['cookiefile'] = cookie_file
+            logger.info(f"🍪 استخدام cookies للتحميل: {cookie_file}")
+
         # للملفات الصوتية: تحويل إلى MP3 فقط إذا لم يكن MP3 بالفعل
         if is_audio:
             # تحويل إلى MP3 بجودة عالية (192kbps) - سريع جداً!
