@@ -357,6 +357,17 @@ def finalize_video(video_path):
     return width, height, duration
 
 
+def _binance_support_keyboard(binance_id, lang):
+    """زر واحد لدعم المطور يَنسخ معرّف Binance تلقائياً عند الضغط (إن كان
+    إصدار Pyrogram يدعم copy_text)، وإلا يعرض المعرّف في تنبيه لنسخه يدوياً."""
+    label = t('support_dev_binance', lang)
+    try:
+        button = InlineKeyboardButton(label, copy_text=str(binance_id))
+    except Exception:
+        button = InlineKeyboardButton(label, callback_data="binance_info")
+    return InlineKeyboardMarkup([[button]])
+
+
 def _is_valid_cookie_file(platform_key):
     """يتحقق أن ملف الـ cookies الخاص بالمنصة موجود وليس فارغاً"""
     data = COOKIES_PLATFORMS.get(platform_key)
@@ -1353,19 +1364,10 @@ async def download_and_upload(client, message, url, quality, callback_query=None
 
             logger.info(f"📹 Sending video: duration={video_duration}, width={video_width}, height={video_height}, thumb={bool(thumb_path)}")
 
-            # Support button on Binance
+            # زر واحد لدعم المطور: يَنسخ معرّف Binance عند الضغط
             binance_id = subdb.get_setting('binance_pay_id', '86847466')
             lang = subdb.get_user_language(user_id)
-            support_keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    t('support_dev_binance', lang), 
-                    url=f"https://app.binance.com/qr/dplkda88dd4d4e86847466"
-                )],
-                [InlineKeyboardButton(
-                    t('binance_pay_id', lang, binance_id=binance_id),
-                    callback_data="binance_info"
-                )]
-            ])
+            support_keyboard = _binance_support_keyboard(binance_id, lang)
             
             # Create upload progress tracker instance with event loop
             upload_progress_tracker = UploadProgress(status_msg, user_id, loop)
@@ -2473,6 +2475,17 @@ async def handle_binance_id_info(client, callback_query):
     await callback_query.answer(
         f"💵 Binance Pay ID: {binance_id}\n\n"
         f"يمكنك دعم المطور عبر إرسال أي مبلغ!",
+        show_alert=True
+    )
+
+
+@app.on_callback_query(filters.regex(r'^binance_info$'))
+async def handle_binance_info_copy(client, callback_query):
+    """زر دعم المطور (احتياطي لإصدارات Pyrogram التي لا تدعم النسخ التلقائي):
+    يعرض المعرّف في تنبيه لنسخه."""
+    binance_id = subdb.get_setting('binance_pay_id', '86847466')
+    await callback_query.answer(
+        f"✅ تم النسخ\nPay ID: {binance_id}",
         show_alert=True
     )
 
