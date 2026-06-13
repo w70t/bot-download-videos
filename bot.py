@@ -86,6 +86,12 @@ pending_downloads = {}
 # {user_id: target_user_id} أي أن user_id ينتظر كتابة رد ليُرسَل إلى target_user_id
 conversation_state = {}
 
+# استبيانات البث الجماعي مع إحصائية حيّة
+# {broadcast_id: {'admin_id', 'total', 'yes': {uid:name}, 'no': {uid:name},
+#                 'stats_chat', 'stats_msg_id', 'last_edit'}}
+broadcast_polls = {}
+broadcast_counter = 0
+
 # منصات الـ cookies المدعومة
 COOKIES_PLATFORMS = {
     'facebook': {'name': 'Facebook 📘', 'file': 'cookies/facebook.txt'},
@@ -2704,6 +2710,115 @@ async def handle_conversation_reply(client, message):
     raise StopPropagation
 
 
+def _broadcast_stats_kb(bid):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 تحديث الإحصائية", callback_data=f"bcref_{bid}")]
+    ])
+
+
+def _broadcast_stats_text(bid):
+    """نص الإحصائية الحيّة لاستبيان بث معيّن"""
+    p = broadcast_polls.get(bid)
+    if not p:
+        return "⌛ انتهت صلاحية هذه الإحصائية."
+
+    yes, no = p['yes'], p['no']
+    total = p.get('total', 0)
+    pending = max(total - len(yes) - len(no), 0)
+
+    lines = [
+        "📊 **إحصائية البث المباشر**\n",
+        f"📨 وصلت إلى: **{total}**",
+        f"✅ نعم (متواجد): **{len(yes)}**",
+        f"❌ لا: **{len(no)}**",
+        f"⏳ لم يتفاعلوا بعد: **{pending}**",
+    ]
+
+    if yes:
+        lines.append("\n✅ **من قال نعم:**")
+        for uid, name in list(yes.items())[:15]:
+            lines.append(f"• {name} (`{uid}`)")
+        if len(yes) > 15:
+            lines.append(f"… و{len(yes) - 15} غيرهم")
+
+    if no:
+        lines.append("\n❌ **من قال لا:**")
+        for uid, name in list(no.items())[:15]:
+            lines.append(f"• {name} (`{uid}`)")
+        if len(no) > 15:
+            lines.append(f"… و{len(no) - 15} غيرهم")
+
+    return "\n".join(lines)
+
+
+async def _update_broadcast_stats(client, bid, force=False):
+    """تحديث رسالة الإحصائية للأدمن مع تقييد بسيط لتفادي flood"""
+    p = broadcast_polls.get(bid)
+    if not p or not p.get('stats_msg_id'):
+        return
+    now = time.time()
+    if not force and (now - p.get('last_edit', 0) < 1.0):
+        return
+    p['last_edit'] = now
+    try:
+        await client.edit_message_text(
+            chat_id=p['stats_chat'],
+            message_id=p['stats_msg_id'],
+            text=_broadcast_stats_text(bid),
+            reply_markup=_broadcast_stats_kb(bid)
+        )
+    except Exception:
+        pass  # MessageNotModified أو flood مؤقت — يُحدّث في الضغطة التالية
+
+
+@app.on_callback_query(filters.regex(r'^bc(yes|no|ref)_'))
+async def handle_broadcast_vote(client, callback_query):
+    """تسجيل تفاعل العضو (نعم/لا) وتحديث الإحصائية الحيّة للأدمن"""
+    data = callback_query.data
+    if data.startswith('bcyes_'):
+        kind, bid_str = 'yes', data[len('bcyes_'):]
+    elif data.startswith('bcno_'):
+        kind, bid_str = 'no', data[len('bcno_'):]
+    elif data.startswith('bcref_'):
+        kind, bid_str = 'ref', data[len('bcref_'):]
+    else:
+        await callback_query.answer()
+        return
+
+    try:
+        bid = int(bid_str)
+    except ValueError:
+        await callback_query.answer()
+        return
+
+    p = broadcast_polls.get(bid)
+    if not p:
+        await callback_query.answer("⌛ انتهت صلاحية هذا الاستبيان")
+        return
+
+    uid = callback_query.from_user.id
+    lang = subdb.get_user_language(uid)
+
+    # زر التحديث اليدوي (للأدمن)
+    if kind == 'ref':
+        if str(uid) == os.getenv("ADMIN_ID"):
+            await _update_broadcast_stats(client, bid, force=True)
+        await callback_query.answer("🔄 تم التحديث")
+        return
+
+    name = callback_query.from_user.first_name or "مستخدم"
+    if kind == 'yes':
+        p['no'].pop(uid, None)
+        p['yes'][uid] = name
+        await callback_query.answer(t('vote_yes_ack', lang))
+    else:
+        p['yes'].pop(uid, None)
+        p['no'][uid] = name
+        await callback_query.answer(t('vote_no_ack', lang))
+
+    await _update_broadcast_stats(client, bid)
+
+
 @app.on_callback_query(filters.regex(r'^set_daily_limit_'))
 async def handle_set_daily_limit(client, callback_query):
     """معالج اختيار الحد اليومي السريع"""
@@ -2883,41 +2998,77 @@ async def handle_admin_input(client, message):
             del pending_downloads[user_id]
         
         elif waiting_for == 'broadcast_message':
+            global broadcast_counter
             broadcast_text = message.text.strip()
-            
+
             # الحصول على جميع المستخدمين
             all_users = subdb.get_all_users()
-            
-            await message.reply_text(
+
+            # إنشاء استبيان بث جديد بإحصائية حيّة
+            broadcast_counter += 1
+            bid = broadcast_counter
+            broadcast_polls[bid] = {
+                'admin_id': user_id,
+                'total': len(all_users),
+                'yes': {},
+                'no': {},
+                'stats_chat': None,
+                'stats_msg_id': None,
+                'last_edit': 0,
+            }
+
+            progress = await message.reply_text(
                 f"📤 **جاري الإرسال...**\n\n"
                 f"سيتم إرسال الرسالة لـ {len(all_users)} مستخدم"
             )
-            
+
             success_count = 0
             fail_count = 0
-            
+
             for user in all_users:
                 try:
                     # Get each user's preferred language
                     user_lang = subdb.get_user_language(user[0])
-                    
+
+                    # أزرار: نعم / لا + رد للمطور
+                    kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton(t('btn_yes', user_lang), callback_data=f"bcyes_{bid}"),
+                         InlineKeyboardButton(t('btn_no', user_lang), callback_data=f"bcno_{bid}")],
+                        [InlineKeyboardButton(t('reply_button', user_lang), callback_data=f"reply_msg_{user_id}")],
+                    ])
+
                     await client.send_message(
                         chat_id=user[0],  # user_id
-                        text=f"{t('broadcast_message_prefix', user_lang)}\n\n{broadcast_text}"
+                        text=f"{t('broadcast_message_prefix', user_lang)}\n\n{broadcast_text}",
+                        reply_markup=kb
                     )
                     success_count += 1
                     await asyncio.sleep(0.05)  # تأخير بسيط لتجنب Flood
                 except:
                     fail_count += 1
-            
-            await message.reply_text(
-                f"✅ **اكتمل الإرسال!**\n\n"
-                f"✅ النجاح: {success_count}\n"
-                f"❌ الفشل: {fail_count}"
+
+            # عدد من وصلتهم الرسالة فعلاً هو الأساس لحساب "لم يتفاعلوا"
+            broadcast_polls[bid]['total'] = success_count
+
+            # رسالة الإحصائية الحيّة للأدمن (تتحدث عند كل ضغطة)
+            stats_msg = await message.reply_text(
+                _broadcast_stats_text(bid),
+                reply_markup=_broadcast_stats_kb(bid)
             )
-            
+            broadcast_polls[bid]['stats_chat'] = stats_msg.chat.id
+            broadcast_polls[bid]['stats_msg_id'] = stats_msg.id
+
+            try:
+                await progress.edit_text(
+                    f"✅ **اكتمل الإرسال!**\n\n"
+                    f"✅ النجاح: {success_count}\n"
+                    f"❌ الفشل: {fail_count}"
+                )
+            except Exception:
+                pass
+
             del pending_downloads[user_id]
-            logger.info(f"📢 Broadcast: {success_count} نجح, {fail_count} فشل")
+            logger.info(f"📢 Broadcast #{bid}: {success_count} نجح, {fail_count} فشل")
         
         elif waiting_for == 'direct_msg_user_id':
             user_input = message.text.strip()
