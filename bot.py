@@ -17,6 +17,7 @@ import asyncio
 import yt_dlp
 import traceback
 from datetime import datetime
+from urllib.parse import urlparse
 from pyrogram import Client, filters, enums, StopPropagation
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.errors import (
@@ -132,6 +133,91 @@ PLATFORM_URL_MARKERS = {
 COOKIE_SOURCE_MAP = {
     'threads': 'instagram',
 }
+
+# ═══════════════════════════════════════════════════════════════
+# فلتر المحتوى الإباحي (حظر قبل التحميل) - Adult content filter
+# الطريقة: قائمة نطاقات معروفة + كلمات مفتاحية في الرابط والعنوان.
+# يوقف المحتوى قبل أي تحميل (بلا تكلفة) ويمكن للأدمن تشغيله/إيقافه.
+# ═══════════════════════════════════════════════════════════════
+ADULT_DOMAINS = {
+    'pornhub.com', 'xvideos.com', 'xvideos2.com', 'xnxx.com', 'xhamster.com',
+    'xhamster.desi', 'redtube.com', 'youporn.com', 'tube8.com', 'spankbang.com',
+    'youjizz.com', 'beeg.com', 'tnaflix.com', 'drtuber.com', 'sunporno.com',
+    'eporner.com', 'txxx.com', 'hclips.com', 'upornia.com', 'hotmovs.com',
+    'vjav.com', 'porntrex.com', 'motherless.com', 'porn.com', 'pornhd.com',
+    'porntube.com', 'pornone.com', 'porngo.com', 'porntrex.com', 'fapality.com',
+    'brazzers.com', 'realitykings.com', 'bangbros.com', 'naughtyamerica.com',
+    'onlyfans.com', 'fansly.com', 'manyvids.com', 'clips4sale.com',
+    'chaturbate.com', 'cam4.com', 'myfreecams.com', 'stripchat.com',
+    'bongacams.com', 'livejasmin.com', 'camsoda.com', 'streamate.com',
+    'redgifs.com', 'gifs.com', 'rule34video.com', 'rule34.xxx',
+    'hanime.tv', 'hentaihaven.xxx', 'nhentai.net', 'hentai.tv', 'fakings.com',
+    'xmoviesforyou.com', 'fux.com', 'keezmovies.com', 'extremetube.com',
+    'gotporn.com', 'pornhat.com', 'analdin.com', 'hdzog.com', 'thothub.tv',
+}
+
+# كلمات مفتاحية صريحة (عربي + إنجليزي). تُفحص في النطاق ومسار الرابط والعنوان.
+ADULT_KEYWORDS = [
+    'porn', 'xxx', 'xnxx', 'sexvideo', 'sex-video', 'nsfw', 'hentai',
+    'camgirl', 'camslut', 'fuck', 'blowjob', 'creampie', 'cumshot',
+    'milf', 'hardcore', 'bigtits', 'pussy', 'anal', 'escort',
+    'سكس', 'اباحي', 'إباحي', 'اباحية', 'إباحية', 'نيك', 'خلاعة', 'عاهرة',
+    'شرموطة', 'متناكة', 'سحاق', 'لواط',
+]
+
+
+def _url_host(url):
+    """يستخرج اسم المضيف (host) من الرابط بصيغة صغيرة."""
+    try:
+        host = urlparse(url if '://' in url else 'http://' + url).hostname or ''
+    except Exception:
+        host = ''
+    return host.lower().lstrip('.')
+
+
+def _host_is_adult(host):
+    """هل المضيف ينتمي لنطاق إباحي معروف (يشمل النطاقات الفرعية)؟"""
+    if not host:
+        return False
+    if host.startswith('www.'):
+        host = host[4:]
+    for domain in ADULT_DOMAINS:
+        if host == domain or host.endswith('.' + domain):
+            return True
+    return False
+
+
+def _text_has_adult_keyword(text):
+    """هل النص يحتوي على كلمة مفتاحية إباحية صريحة؟"""
+    if not text:
+        return False
+    low = str(text).lower()
+    return any(kw in low for kw in ADULT_KEYWORDS)
+
+
+def is_adult_url(url):
+    """فحص الرابط قبل الاستخراج: النطاق أولاً، ثم كلمات في مسار الرابط."""
+    host = _url_host(url)
+    if _host_is_adult(host):
+        return True
+    return _text_has_adult_keyword(url)
+
+
+def is_adult_info(info):
+    """فحص بيانات الفيديو بعد الاستخراج (العنوان/الوصف/الفئات)."""
+    if not info:
+        return False
+    if str(info.get('age_limit') or 0) and int(info.get('age_limit') or 0) >= 18:
+        return True
+    parts = [info.get('title'), info.get('description'), info.get('uploader')]
+    parts.extend(info.get('categories') or [])
+    parts.extend(info.get('tags') or [])
+    return any(_text_has_adult_keyword(p) for p in parts)
+
+
+def adult_filter_enabled():
+    """هل فلتر المحتوى الإباحي مُفعّل؟ (افتراضياً مُفعّل)."""
+    return subdb.get_setting('block_adult_content', '1') == '1'
 
 
 def _is_valid_cookie_file(platform_key):
@@ -716,11 +802,17 @@ async def process_download_from_queue(task: DownloadTask):
             await send_error_to_admin(user_id, user_name, "Failed to extract video info", url)
             await status.edit_text(t('invalid_url', lang))
             return
-        
+
+        # 🔞 حظر المحتوى الإباحي بعد الاستخراج (مسار قائمة الانتظار)
+        if adult_filter_enabled() and is_adult_info(info):
+            logger.info(f"🔞 Blocked adult content (queue) from user {user_id}: {info.get('title')}")
+            await status.edit_text(t('adult_blocked', lang))
+            return
+
         title = info.get('title', 'Video')[:50]
         duration = info.get('duration', 0)
         duration_str = f"{int(duration)//60}:{int(duration)%60:02d}" if duration else "0:00"
-        
+
         # Add or update user info
         username = message.from_user.username
         first_name = message.from_user.first_name
@@ -1983,10 +2075,16 @@ async def handle_url(client, message):
     
     url = message.text.strip()
     user_id = message.from_user.id
-    
+
     # Get user language FIRST
     lang = subdb.get_user_language(user_id)
-    
+
+    # 🔞 حظر المحتوى الإباحي قبل أي معالجة (فحص النطاق/الرابط)
+    if adult_filter_enabled() and is_adult_url(url):
+        logger.info(f"🔞 Blocked adult URL from user {user_id}: {_url_host(url)}")
+        await message.reply_text(t('adult_blocked', lang))
+        return
+
     # Check rate limiting
     is_limited, seconds_remaining = queue_manager.is_rate_limited(user_id)
     if is_limited:
@@ -2046,7 +2144,13 @@ async def handle_url(client, message):
         await send_error_to_admin(user_id, user_name, str(e), url)
         await status.edit_text(t('error_occurred', lang, error=str(e)[:100]))
         return
-    
+
+    # 🔞 حظر المحتوى الإباحي بعد الاستخراج (فحص العنوان/الوصف/الفئات/الفئة العمرية)
+    if adult_filter_enabled() and is_adult_info(info):
+        logger.info(f"🔞 Blocked adult content from user {user_id}: {info.get('title')}")
+        await status.edit_text(t('adult_blocked', lang))
+        return
+
     title = info.get('title', 'Video')[:50]
     duration = info.get('duration', 0)
     duration_str = f"{int(duration)//60}:{int(duration)%60:02d}" if duration else "0:00"
@@ -2460,10 +2564,13 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
     price = subdb.get_setting('subscription_price', '10')
     duration_days = subdb.get_setting('subscription_duration_days', '30')
     stats = subdb.get_user_stats()
-    
+    adult_on = adult_filter_enabled()
+    adult_label = f"🔞 حظر المحتوى الإباحي: {'✅ مُفعّل' if adult_on else '❌ متوقف'}"
+
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("⏱️ تحديد المدة القصوى", callback_data="sub_set_duration")],
         [InlineKeyboardButton("💰 تحديد السعر", callback_data="sub_set_price")],
+        [InlineKeyboardButton(adult_label, callback_data="sub_toggle_adult")],
         [InlineKeyboardButton("👥 عرض المشتركين", callback_data="sub_view_subscribers")],
         [InlineKeyboardButton("📊 عرض آخر 50 مستخدم", callback_data="sub_recent_users")],
         [InlineKeyboardButton("💳 الدفوعات المعلقة", callback_data="sub_pending_payments")],
@@ -2473,12 +2580,13 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
         [InlineKeyboardButton("❌ إلغاء ترقية", callback_data="sub_demote_user")],
         [InlineKeyboardButton("📢 إرسال رسالة جماعية", callback_data="sub_broadcast")]
     ])
-    
+
     text = (
         f"💎 **إعدادات الاشتراك**\n\n"
         f"⏱️ **الحد الأقصى للمجاني:** {max_duration} دقيقة\n"
         f"💰 **سعر الاشتراك:** ${price}\n"
-        f"📅 **مدة الاشتراك:** {duration_days} يوم\n\n"
+        f"📅 **مدة الاشتراك:** {duration_days} يوم\n"
+        f"🔞 **حظر المحتوى الإباحي:** {'مُفعّل ✅' if adult_on else 'متوقف ❌'}\n\n"
         f"📊 **الإحصائيات:**\n"
         f"• المجموع: {stats['total']} عضو\n"
         f"• المشتركون: {stats['subscribed']} 💎\n"
@@ -2500,7 +2608,22 @@ async def handle_subscription_settings(client, callback_query):
         return
     
     action = callback_query.data.replace('sub_', '')
-    
+
+    if action == 'toggle_adult':
+        new_state = '0' if adult_filter_enabled() else '1'
+        subdb.set_setting('block_adult_content', new_state)
+        await callback_query.answer(
+            "🔞 تم تفعيل حظر المحتوى الإباحي" if new_state == '1'
+            else "🔞 تم إيقاف حظر المحتوى الإباحي",
+            show_alert=True
+        )
+        # تحديث اللوحة لإظهار الحالة الجديدة
+        await subscription_settings_panel(
+            client, callback_query.message,
+            user_id=callback_query.from_user.id, edit=True
+        )
+        return
+
     if action == 'set_duration':
         max_duration = subdb.get_max_duration()
         daily_limit = subdb.get_daily_limit()
