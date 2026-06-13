@@ -2278,14 +2278,27 @@ async def handle_reject_payment(client, callback_query):
         await callback_query.answer("❌ تم رفض الدفعة", show_alert=True)
 
 
-async def subscription_settings_panel(client, message):
-    """لوحة إعدادات الاشتراك للأدمن"""
-    user_id = message.from_user.id
-    
+# زر الرجوع الموحّد لكل شاشات إعدادات الاشتراك
+def _sub_settings_back_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")]
+    ])
+
+
+async def subscription_settings_panel(client, message, user_id=None, edit=False):
+    """لوحة إعدادات الاشتراك للأدمن.
+
+    user_id: معرّف الأدمن الفعلي (مهم عند الاستدعاء من زر رجوع لأن
+    message.from_user حينها هو البوت وليس الأدمن).
+    edit: True لتعديل الرسالة الحالية بدل إرسال رسالة جديدة.
+    """
+    if user_id is None:
+        user_id = message.from_user.id if message.from_user else None
+
     if str(user_id) != os.getenv("ADMIN_ID"):
         await message.reply_text("❌ هذا الأمر للمشرفين فقط!")
         return
-    
+
     max_duration = subdb.get_max_duration()
     price = subdb.get_setting('subscription_price', '10')
     duration_days = subdb.get_setting('subscription_duration_days', '30')
@@ -2315,8 +2328,11 @@ async def subscription_settings_panel(client, message):
         f"• العاديون: {stats['free']} 🆓\n\n"
         f"**اختر الإعداد:**"
     )
-    
-    await message.reply_text(text, reply_markup=keyboard)
+
+    if edit:
+        await message.edit_text(text, reply_markup=keyboard)
+    else:
+        await message.reply_text(text, reply_markup=keyboard)
 
 
 @app.on_callback_query(filters.regex(r'^sub_'))
@@ -2353,7 +2369,8 @@ async def handle_subscription_settings(client, callback_query):
         await callback_query.message.edit_text(
             "💰 **تحديد سعر الاشتراك**\n\n"
             "أرسل السعر بالدولار (مثلاً: 10)\n\n"
-            "⚠️ القيمة الحالية: $" + subdb.get_setting('subscription_price', '10')
+            "⚠️ القيمة الحالية: $" + subdb.get_setting('subscription_price', '10'),
+            reply_markup=_sub_settings_back_kb()
         )
         pending_downloads[callback_query.from_user.id] = {'waiting_for': 'subscription_price'}
         
@@ -2361,7 +2378,10 @@ async def handle_subscription_settings(client, callback_query):
         subscribers = subdb.get_all_subscribers()
         
         if not subscribers:
-            await callback_query.message.edit_text("📝 **لا يوجد مشتركون حالياً**")
+            await callback_query.message.edit_text(
+                "📝 **لا يوجد مشتركون حالياً**",
+                reply_markup=_sub_settings_back_kb()
+            )
             return
         
         text = "👥 **قائمة المشتركين**\n\n"
@@ -2387,14 +2407,17 @@ async def handle_subscription_settings(client, callback_query):
             text += f"   🆔 `{user_id}` | ⏳ {days_str}\n\n"
         
         text += f"\n📊 **إجمالي المشتركين:** {len(subscribers)}"
-        
-        await callback_query.message.edit_text(text)
+
+        await callback_query.message.edit_text(text, reply_markup=_sub_settings_back_kb())
         
     elif action == 'pending_payments':
         payments = subdb.get_pending_payments()
         
         if not payments:
-            await callback_query.message.edit_text("✅ **لا توجد دفوعات معلقة**")
+            await callback_query.message.edit_text(
+                "✅ **لا توجد دفوعات معلقة**",
+                reply_markup=_sub_settings_back_kb()
+            )
             return
         
         text = "💳 **الدفوعات المعلقة**\n\n"
@@ -2410,8 +2433,8 @@ async def handle_subscription_settings(client, callback_query):
             text += f"💰 ${amount} | 💳 {method}\n\n"
         
         text += f"\n📊 **إجمالي المعلقة:** {len(payments)}"
-        
-        await callback_query.message.edit_text(text)
+
+        await callback_query.message.edit_text(text, reply_markup=_sub_settings_back_kb())
     
     elif action == 'member_stats':
         stats = subdb.get_user_stats()
@@ -2437,8 +2460,8 @@ async def handle_subscription_settings(client, callback_query):
                     count += 1
                     if count >= 10:  # أول 10 مشتركين
                         break
-        
-        await callback_query.message.edit_text(text)
+
+        await callback_query.message.edit_text(text, reply_markup=_sub_settings_back_kb())
     
     elif action == 'recent_users':
         users = subdb.get_recent_users(50)
@@ -2461,14 +2484,15 @@ async def handle_subscription_settings(client, callback_query):
         text += f"\n📊 **إجمالي المستخدمين:** {len(users)}\n\n"
         text += "💡 **لمراسلة أي مستخدم:**\n"
         text += "استخدم زر 'رسالة خاصة' وأرسل ID المستخدم"
-        
-        await callback_query.message.edit_text(text)
+
+        await callback_query.message.edit_text(text, reply_markup=_sub_settings_back_kb())
     
     elif action == 'promote_user':
         await callback_query.message.edit_text(
             "✏️ **ترقية عضو يدوياً**\n\n"
             "أرسل User ID أو Username للعضو المراد ترقيته\n\n"
-            "مثال: `123456789` أو `@username`"
+            "مثال: `123456789` أو `@username`",
+            reply_markup=_sub_settings_back_kb()
         )
         pending_downloads[callback_query.from_user.id] = {'waiting_for': 'promote_user_id'}
     
@@ -2476,7 +2500,8 @@ async def handle_subscription_settings(client, callback_query):
         await callback_query.message.edit_text(
             "❌ **إلغاء ترقية عضو**\n\n"
             "أرسل User ID أو Username للعضو المراد إلغاء ترقيته\n\n"
-            "مثال: `123456789` أو `@username`"
+            "مثال: `123456789` أو `@username`",
+            reply_markup=_sub_settings_back_kb()
         )
         pending_downloads[callback_query.from_user.id] = {'waiting_for': 'demote_user_id'}
     
@@ -2484,7 +2509,8 @@ async def handle_subscription_settings(client, callback_query):
         await callback_query.message.edit_text(
             "🔍 **بحث عن عضو**\n\n"
             "أرسل User ID أو Username للبحث عنه\n\n"
-            "مثال: `123456789` أو `@username`"
+            "مثال: `123456789` أو `@username`",
+            reply_markup=_sub_settings_back_kb()
         )
         pending_downloads[callback_query.from_user.id] = {'waiting_for': 'search_user_id'}
     
@@ -2493,7 +2519,7 @@ async def handle_subscription_settings(client, callback_query):
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("📧 إرسال لجميع المستخدمين", callback_data="msg_broadcast_all")],
             [InlineKeyboardButton("👤 إرسال لمستخدم محدد", callback_data="msg_direct_user")],
-            [InlineKeyboardButton("❌ إلغاء", callback_data="msg_cancel")]
+            [InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")]
         ])
         
         stats = subdb.get_user_stats()
@@ -2556,8 +2582,11 @@ async def handle_duration_actions(client, callback_query):
         )
     
     elif action == 'back_to_sub_settings':
-        # العودة لشاشة إعدادات الاشتراك
-        await subscription_settings_panel(client, callback_query.message)
+        # العودة لشاشة إعدادات الاشتراك (مرّر معرّف الأدمن الحقيقي وعدّل الرسالة)
+        await subscription_settings_panel(
+            client, callback_query.message,
+            user_id=callback_query.from_user.id, edit=True
+        )
     
     await callback_query.answer()
 
