@@ -67,6 +67,7 @@ TRANSLATIONS = {
         'btn_no': '❌ لا',
         'vote_yes_ack': '✅ شكراً، تم تسجيل ردك: نعم',
         'vote_no_ack': '❌ تم تسجيل ردك: لا',
+        'drm_protected': '🔒 **هذا الفيديو محمي بحقوق النشر (DRM)**\n\nلا يمكن تحميله — هذه حماية من المنصة نفسها ولا يمكن تجاوزها (مثل الأفلام والأغاني الرسمية المدفوعة). جرّب رابطاً آخر.',
 
         # رسائل الاشتراك المفصلة
         'subscribe_now': '💎 اشترك الآن',
@@ -173,6 +174,7 @@ TRANSLATIONS = {
         'btn_no': '❌ No',
         'vote_yes_ack': '✅ Thanks, recorded: Yes',
         'vote_no_ack': '❌ Recorded: No',
+        'drm_protected': '🔒 **This video is DRM protected**\n\nIt cannot be downloaded — this protection comes from the platform itself and cannot be bypassed (e.g. paid movies and official music). Try another link.',
 
         # Detailed subscription messages
         'subscribe_now': '💎 Subscribe Now',
