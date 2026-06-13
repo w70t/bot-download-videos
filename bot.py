@@ -95,6 +95,158 @@ COOKIES_PLATFORMS = {
     'other': {'name': 'أخرى 🌐', 'file': 'cookies/other.txt'},
 }
 
+# ربط أجزاء الرابط بالمنصة المناسبة لاختيار ملف الـ cookies الصحيح
+PLATFORM_URL_MARKERS = {
+    'youtube': ['youtube.', 'youtu.be'],
+    'facebook': ['facebook.', 'fb.watch', 'fb.com'],
+    'instagram': ['instagram.', 'instagr.am'],
+    'threads': ['threads.net', 'threads.com'],
+    'twitter': ['twitter.', 'x.com', 't.co'],
+    'reddit': ['reddit.', 'redd.it'],
+    'snapchat': ['snapchat.'],
+    'pinterest': ['pinterest.', 'pin.it'],
+    'tiktok': ['tiktok.'],
+}
+
+# منصات تشارك ملف cookies منصة أخرى (Threads يستخدم تسجيل دخول Instagram)
+COOKIE_SOURCE_MAP = {
+    'threads': 'instagram',
+}
+
+
+def _is_valid_cookie_file(platform_key):
+    """يتحقق أن ملف الـ cookies الخاص بالمنصة موجود وليس فارغاً"""
+    data = COOKIES_PLATFORMS.get(platform_key)
+    if not data:
+        return None
+    path = data['file']
+    if os.path.exists(path) and os.path.getsize(path) > 100:
+        return path
+    return None
+
+
+def get_cookie_file_for_url(url):
+    """يختار ملف الـ cookies المطابق لمنصة الرابط.
+
+    الستوري في فيسبوك وإنستغرام يتطلب تسجيل دخول، لذا يجب استخدام cookies
+    نفس المنصة تحديداً وليس أي ملف cookies متوفر. عند عدم توفر ملف المنصة
+    نرجع إلى ملف 'other' إن كان صالحاً.
+    """
+    url_lower = (url or '').lower()
+    for platform_key, markers in PLATFORM_URL_MARKERS.items():
+        if any(marker in url_lower for marker in markers):
+            # بعض المنصات (مثل Threads) تستخدم cookies منصة أخرى (Instagram)
+            cookie_platform = COOKIE_SOURCE_MAP.get(platform_key, platform_key)
+            cookie = _is_valid_cookie_file(cookie_platform)
+            if cookie:
+                logger.info(f"🍪 استخدام cookies المنصة المطابقة: {platform_key} (cookies: {cookie_platform})")
+                return cookie
+            logger.warning(f"⚠️ لا يوجد ملف cookies صالح للمنصة {cookie_platform}؛ قد يفشل تحميل محتوى {platform_key} الخاص")
+            break
+    # احتياطي: ملف cookies عام
+    return _is_valid_cookie_file('other')
+
+
+# نطاقات كل منصة وأسماء كوكيز تسجيل الدخول الأساسية للتحقق الحقيقي
+PLATFORM_COOKIE_INFO = {
+    'facebook':  {'domains': ['facebook.com'],                'auth_cookies': ['c_user', 'xs']},
+    'instagram': {'domains': ['instagram.com'],               'auth_cookies': ['sessionid', 'ds_user_id']},
+    'youtube':   {'domains': ['youtube.com', 'google.com'],   'auth_cookies': ['SID', 'SAPISID']},
+    'twitter':   {'domains': ['twitter.com', 'x.com'],        'auth_cookies': ['auth_token', 'ct0']},
+    'reddit':    {'domains': ['reddit.com'],                  'auth_cookies': ['reddit_session']},
+    'snapchat':  {'domains': ['snapchat.com'],                'auth_cookies': []},
+    'pinterest': {'domains': ['pinterest.com'],               'auth_cookies': ['_pinterest_sess']},
+    'tiktok':    {'domains': ['tiktok.com'],                  'auth_cookies': ['sessionid']},
+    'other':     {'domains': [],                              'auth_cookies': []},
+}
+
+
+def _parse_netscape_cookies(path):
+    """يقرأ ملف cookies بصيغة Netscape ويعيد قائمة بالكوكيز (domain/name/expiry)."""
+    cookies = []
+    try:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                # أسطر #HttpOnly_ هي كوكيز حقيقية وليست تعليقات
+                if line.startswith('#HttpOnly_'):
+                    line = line[len('#HttpOnly_'):]
+                elif line.startswith('#'):
+                    continue
+                parts = line.split('\t')
+                if len(parts) != 7:
+                    continue
+                domain, _flag, _cpath, _secure, expiry, name, _value = parts
+                cookies.append({'domain': domain, 'expiry': expiry, 'name': name})
+    except Exception as e:
+        logger.error(f"خطأ في قراءة ملف الكوكيز {path}: {e}")
+    return cookies
+
+
+def validate_platform_cookies(platform_id):
+    """تحقق حقيقي من صلاحية كوكيز منصة معينة.
+
+    يفحص: وجود الملف، صيغته، أن الكوكيز تخص نطاق المنصة فعلاً،
+    وجود كوكيز تسجيل الدخول الأساسية، وأنها غير منتهية الصلاحية.
+    يعيد dict فيه ok وسبب وتفاصيل.
+    """
+    data = COOKIES_PLATFORMS.get(platform_id)
+    if not data:
+        return {'ok': False, 'reason': 'unknown_platform'}
+
+    path = data['file']
+    if not os.path.exists(path) or os.path.getsize(path) <= 100:
+        return {'ok': False, 'reason': 'empty'}
+
+    cookies = _parse_netscape_cookies(path)
+    if not cookies:
+        return {'ok': False, 'reason': 'unparseable'}
+
+    info = PLATFORM_COOKIE_INFO.get(platform_id, {})
+    domains = info.get('domains', [])
+    auth_names = info.get('auth_cookies', [])
+
+    # كوكيز تخص نطاق المنصة فقط
+    if domains:
+        platform_cookies = [c for c in cookies if any(d in c['domain'] for d in domains)]
+    else:
+        platform_cookies = cookies
+
+    if domains and not platform_cookies:
+        found = sorted({c['domain'].lstrip('.') for c in cookies})[:5]
+        return {'ok': False, 'reason': 'wrong_platform', 'found_domains': found}
+
+    names = {c['name'] for c in platform_cookies}
+
+    # كوكيز تسجيل الدخول الأساسية
+    missing_auth = [a for a in auth_names if a not in names]
+    if auth_names and missing_auth:
+        return {'ok': False, 'reason': 'not_logged_in', 'missing': missing_auth,
+                'cookie_count': len(platform_cookies)}
+
+    # فحص انتهاء الصلاحية لكوكيز تسجيل الدخول (أو كلها إن لم تكن هناك كوكيز محددة)
+    now = time.time()
+    check_list = ([c for c in platform_cookies if c['name'] in auth_names]
+                  if auth_names else platform_cookies)
+    expired = []
+    for c in check_list:
+        try:
+            exp = float(c['expiry'])
+        except (ValueError, TypeError):
+            continue
+        if exp != 0 and exp < now:
+            expired.append(c['name'])
+
+    if expired and (not auth_names or len(expired) == len(check_list)):
+        return {'ok': False, 'reason': 'expired', 'expired': expired,
+                'cookie_count': len(platform_cookies)}
+
+    return {'ok': True, 'cookie_count': len(platform_cookies),
+            'has_auth': bool(auth_names) and not missing_auth,
+            'expired': expired}
+
 # نظام تتبع الأخطاء
 user_errors = {}  # {error_id: {'user_id': ..., 'error': ..., 'url': ..., 'time': ..., 'status': 'pending'}}
 error_counter = 0
@@ -237,22 +389,9 @@ def get_file_size_mb(file_path):
 async def get_video_info(url: str):
     """استخراج معلومات الفيديو"""
     try:
-        # إضافة cookies إذا كانت موجودة وصالحة (ليست فارغة)
-        cookies_files = []
-        for platform, data in COOKIES_PLATFORMS.items():
-            if os.path.exists(data['file']):
-                # التحقق من أن الملف ليس فارغاً وأن حجمه أكبر من 100 بايت
-                file_size = os.path.getsize(data['file'])
-                if file_size > 100:  # ملف صالح يجب أن يكون أكبر من 100 بايت
-                    cookies_files.append(data['file'])
-                    logger.info(f"✅ Cookie file loaded: {platform} ({file_size} bytes)")
-                else:
-                    logger.warning(f"⚠️ Skipping empty/invalid cookie file: {platform} ({file_size} bytes)")
-                    if platform == 'facebook' and file_size == 0:
-                        logger.error(f"❌ Facebook cookie file is completely empty! Facebook downloads will fail.")
-                        logger.info(f"💡 Please update {data['file']} with valid Facebook cookies")
-        
-        
+        # اختيار ملف cookies المطابق لمنصة الرابط (مهم للستوري الخاص)
+        cookie_file = get_cookie_file_for_url(url)
+
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
@@ -260,19 +399,16 @@ async def get_video_info(url: str):
             'socket_timeout': 30,  # تقليل timeout لاستجابة أسرع
             'extract_flat': False,  # نحتاج معلومات كاملة
             'no_check_certificate': True,
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            },
         }
-        
-        # استخدام cookies للتعرف على الفيديو
-        if cookies_files:
-            ydl_opts['cookiefile'] = cookies_files[0]
-            logger.info(f"🍪 Using cookies for video info extraction")
-        
-        # إضافة extractor_args لـ Facebook
-        ydl_opts['extractor_args'] = {
-            'facebook': {'cookie_file': cookies_files[0] if cookies_files else None},
-            'instagram': {'cookie_file': cookies_files[0] if cookies_files else None},
-        }
-        
+
+        # استخدام cookies المنصة للتعرف على الفيديو (يشمل الستوري الذي يتطلب تسجيل دخول)
+        if cookie_file:
+            ydl_opts['cookiefile'] = cookie_file
+            logger.info(f"🍪 Using cookies for video info extraction: {cookie_file}")
+
         loop = asyncio.get_event_loop()
         
         def extract():
@@ -403,6 +539,8 @@ async def forward_to_log_channel(client, message, sent_message, user_id, user_na
             platform, icon = 'YouTube', '📺'
         elif 'facebook' in url or 'fb.watch' in url:
             platform, icon = 'Facebook', '📘'
+        elif 'threads.net' in url or 'threads.com' in url:
+            platform, icon = 'Threads', '🧵'
         elif 'instagram' in url:
             platform, icon = 'Instagram', '📷'
         elif 'twitter' in url or 'x.com' in url:
@@ -733,32 +871,12 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             },
         }
         
-        # إضافة cookies إذا كانت متوفرة وصالحة (ليست فارغة)
-        cookies_files = []
-        for platform, data in COOKIES_PLATFORMS.items():
-            if os.path.exists(data['file']):
-                # التحقق من أن الملف ليس فارغاً وأن حجمه أكبر من 100 بايت
-                file_size = os.path.getsize(data['file'])
-                if file_size > 100:  # ملف صالح يجب أن يكون أكبر من 100 بايت
-                    cookies_files.append(data['file'])
-        
-        if cookies_files:
-            ydl_opts['cookiefile'] = cookies_files[0]
-        
-        # تحسينات لجميع منصات التواصل الاجتماعي
-        ydl_opts['extractor_args'] = {
-            'facebook': {'cookie_file': cookies_files[0] if cookies_files else None},
-            'instagram': {'cookie_file': cookies_files[0] if cookies_files else None},
-            'youtube': {'cookie_file': cookies_files[0] if cookies_files else None},
-            'twitter': {'cookie_file': cookies_files[0] if cookies_files else None},
-            'tiktok': {'cookie_file': cookies_files[0] if cookies_files else None},
-            'snapchat': {'cookie_file': cookies_files[0] if cookies_files else None},
-            'pinterest': {
-                'cookie_file': cookies_files[0] if cookies_files else None,
-                'api_only': False,
-            },
-        }
-        
+        # اختيار ملف cookies المطابق لمنصة الرابط (ضروري لستوري فيسبوك/إنستغرام)
+        cookie_file = get_cookie_file_for_url(url)
+        if cookie_file:
+            ydl_opts['cookiefile'] = cookie_file
+            logger.info(f"🍪 استخدام cookies للتحميل: {cookie_file}")
+
         # للملفات الصوتية: تحويل إلى MP3 فقط إذا لم يكن MP3 بالفعل
         if is_audio:
             # تحويل إلى MP3 بجودة عالية (192kbps) - سريع جداً!
@@ -1546,107 +1664,66 @@ async def test_cookie_handler(client, callback_query):
         await callback_query.answer("❌ لا توجد cookies لهذه المنصة!", show_alert=True)
         return
     
-    await callback_query.answer("⏳ جاري الاختبار...")
-    
-    # روابط اختبار محدّثة ومضمونة (فيديوهات عامة ومتاحة)
-    test_urls = {
-        # YouTube - مضمون 100%
-        'youtube': 'https://www.youtube.com/watch?v=jNQXAC9IVRw',  # أول فيديو على YouTube
-        
-        # Instagram - يحتاج cookies، نستخدم YouTube كبديل آمن
-        'instagram': 'https://www.youtube.com/watch?v=jNQXAC9IVRw',
-        
-        # Twitter/X - نستخدم YouTube كبديل آمن
-        'twitter': 'https://www.youtube.com/watch?v=jNQXAC9IVRw',
-        
-        # Facebook - نستخدم YouTube كبديل آمن
-        'facebook': 'https://www.youtube.com/watch?v=jNQXAC9IVRw',
-        
-        # TikTok - نستخدم YouTube كبديل آمن
-        'tiktok': 'https://www.youtube.com/watch?v=jNQXAC9IVRw',
-        
-        # Threads - نستخدم YouTube كبديل آمن
-        'threads': 'https://www.youtube.com/watch?v=jNQXAC9IVRw',
-        
-        # Pinterest - نستخدم YouTube كبديل آمن
-        'pinterest': 'https://www.youtube.com/watch?v=jNQXAC9IVRw',
-        
-        # Snapchat - نستخدم YouTube كبديل آمن
-        'snapchat': 'https://www.youtube.com/watch?v=jNQXAC9IVRw',
-        
-        # افتراضي
-        'other': 'https://www.youtube.com/watch?v=jNQXAC9IVRw',
-    }
-    
-    try:
-        test_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'cookiefile': platform['file'],
-            'skip_download': True,
-            'no_check_certificate': True,
-            'socket_timeout': 30,
-        }
-        
-        with yt_dlp.YoutubeDL(test_opts) as ydl:
-            # محاولة extract_info على رابط اختباري
-            test_url = test_urls.get(platform_id, test_urls['youtube'])
-            info = ydl.extract_info(test_url, download=False)
-            
-            # الحصول على معلومات الفيديو للتأكد من نجاح الاختبار
-            video_title = info.get('title', 'فيديو')
-            video_duration = info.get('duration', 0)
-            duration_str = f"{int(video_duration)//60}:{int(video_duration)%60:02d}" if video_duration else "غير معروف"
-        
+    await callback_query.answer("⏳ جاري الفحص...")
+
+    # فحص حقيقي لمحتوى ملف الكوكيز الخاص بهذه المنصة تحديداً
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, validate_platform_cookies, platform_id)
+
+    header = (
+        f"🍪 **المنصة:** {platform['name']}\n"
+        f"📂 **الملف:** {platform['file']}\n"
+    )
+
+    if result.get('ok'):
+        count = result.get('cookie_count', 0)
+        if result.get('has_auth'):
+            auth_line = "🔐 **تسجيل الدخول:** ✅ كوكيز الجلسة موجودة\n"
+        else:
+            auth_line = "🔐 **تسجيل الدخول:** ℹ️ لا توجد كوكيز جلسة معروفة لهذه المنصة\n"
+        warn = ""
+        if result.get('expired'):
+            warn = (f"\n⚠️ بعض الكوكيز الثانوية منتهية: "
+                    f"{', '.join(result['expired'][:5])}")
         await callback_query.message.edit_text(
-            f"✅ **Cookies تعمل بنجاح!**\n\n"
-            f"🍪 **المنصة:** {platform['name']}\n"
-            f"📂 **الملف:** {platform['file']}\n"
-            f"🎬 **اختبار على:** {video_title[:50]}...\n"
-            f"⏱️ **المدة:** {duration_str}\n"
-            f"📊 **الحالة:** ✅ صالحة ومضمونة"
+            f"✅ **الكوكيز صالحة!**\n\n"
+            f"{header}"
+            f"📊 **عدد الكوكيز للمنصة:** {count}\n"
+            f"{auth_line}"
+            f"📊 **الحالة:** ✅ جاهزة للاستخدام (بما فيها الستوري){warn}"
         )
-    except Exception as e:
-        error_msg = str(e)
-        # تبسيط رسالة الخطأ
-        if "Unsupported URL" in error_msg:
-            error_msg = "الرابط غير مدعوم - جرب رفع الـ cookies مرة أخرى"
-        elif "Video unavailable" in error_msg:
-            error_msg = "الفيديو غير متاح - لكن الـ cookies تعمل!"
-        else:
-            error_msg = error_msg[:150]
-        
-        # تنظيف رسالة الخطأ من ANSI codes
-        import re
-        error_msg = re.sub(r'\x1b\[[0-9;]*m', '', error_msg)
-        
-        # إذا كان الخطأ عن رابط غير مدعوم، نعتبر الـ cookies صالحة
-        if "Unsupported URL" in str(e):
-            await callback_query.message.edit_text(
-                f"✅ **Cookies محفوظة!**\n\n"
-                f"🍪 **المنصة:** {platform['name']}\n"
-                f"📂 **الملف:** {platform['file']}\n\n"
-                f"ℹ️ لا يمكن اختبار هذه المنصة حالياً،\n"
-                f"لكن الملف محفوظ ويعمل عند التحميل."
-            )
-        # إذا كان الخطأ "No video could be found"
-        elif "No video" in error_msg or "no video" in error_msg.lower():
-            await callback_query.message.edit_text(
-                f"⚠️ **تنبيه**\n\n"
-                f"🍪 **المنصة:** {platform['name']}\n"
-                f"📂 **الملف:** {platform['file']}\n\n"
-                f"ℹ️ **الملاحظة:**\n"
-                f"لا يوجد فيديو في الرابط التجريبي.\n"
-                f"قد يكون الرابط يحتوي على صورة أو نص فقط.\n\n"
-                f"✅ **الـ Cookies محفوظة** ويمكن استخدامها مع روابط تحتوي على فيديوهات."
-            )
-        else:
-            await callback_query.message.edit_text(
-                f"⚠️ **تحذير**\n\n"
-                f"🍪 **المنصة:** {platform['name']}\n"
-                f"⚠️ **الملاحظة:**\n{error_msg}\n\n"
-                f"الملف محفوظ، جرب التحميل للتأكد."
-            )
+        return
+
+    reason = result.get('reason')
+    if reason == 'empty':
+        body = "❌ الملف فارغ أو حجمه صغير جداً. أعد رفع ملف كوكيز صحيح."
+    elif reason == 'unparseable':
+        body = ("❌ تعذّر قراءة الملف — الصيغة غير صحيحة.\n"
+                "تأكد أنه بصيغة **Netscape** (txt) المصدّرة من إضافة Get cookies.txt.")
+    elif reason == 'wrong_platform':
+        found = '، '.join(result.get('found_domains', [])) or 'غير معروف'
+        body = (f"❌ هذا الملف لا يحتوي كوكيز **{platform['name']}**!\n"
+                f"النطاقات الموجودة في الملف: {found}\n"
+                f"يبدو أنك رفعت كوكيز منصة أخرى بالخطأ.")
+    elif reason == 'not_logged_in':
+        missing = '، '.join(result.get('missing', []))
+        body = (f"❌ الكوكيز لا تتضمن تسجيل دخول!\n"
+                f"كوكيز الجلسة الناقصة: `{missing}`\n"
+                f"سجّل الدخول للحساب في المتصفح ثم صدّر الكوكيز من جديد.\n"
+                f"⚠️ بدون تسجيل الدخول لن يعمل تحميل الستوري والمحتوى الخاص.")
+    elif reason == 'expired':
+        expired = '، '.join(result.get('expired', [])[:5])
+        body = (f"❌ كوكيز تسجيل الدخول **منتهية الصلاحية**!\n"
+                f"المنتهية: `{expired}`\n"
+                f"سجّل الدخول مجدداً في المتصفح وصدّر كوكيز جديدة.")
+    else:
+        body = "❌ تعذّر التحقق من الكوكيز."
+
+    await callback_query.message.edit_text(
+        f"⚠️ **الكوكيز غير صالحة**\n\n"
+        f"{header}\n"
+        f"{body}"
+    )
 
 
 @app.on_callback_query(filters.regex(r'^cookies_back$'))
