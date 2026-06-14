@@ -13,6 +13,7 @@ import sys
 import glob  # للبحث عن الملفات وحذفها
 import time  # Added import os
 import json  # قراءة مخرجات ffprobe
+import html  # تأمين النصوص داخل رسائل HTML للقناة
 import uuid  # مجلد مؤقت فريد لكل عملية تحميل
 import shutil  # حذف مجلد التحميل المؤقت بالكامل
 import socket  # التحقق من عناوين IP للروابط (حماية SSRF)
@@ -817,12 +818,12 @@ async def send_new_member_notification(user_id, user_name, username, join_time):
             logger.info(f"💡 تأكد من إضافة البوت كمدير في القناة")
             return
         
-        # Format username
-        username_text = f"@{username}" if username else "⚠️ لا يوجد يوزر"
-        
-        # User link (blue clickable name)
-        user_link = f'<a href="tg://user?id={user_id}">{user_name}</a>'
-        
+        # Format username (مؤمّن من رموز HTML)
+        username_text = f"@{html.escape(str(username))}" if username else "⚠️ لا يوجد يوزر"
+
+        # User link (blue clickable name) - مع تأمين الاسم
+        user_link = f'<a href="tg://user?id={user_id}">{html.escape(str(user_name or "مستخدم"))}</a>'
+
         # Message text
         notification = f"""━━━━━━━━━━━━━━━━━━━━━━
 🎉 عضو جديد انضم للبوت!
@@ -1052,14 +1053,14 @@ async def forward_to_log_channel(client, message, sent_message, user_id, user_na
             return
         
         # Format username
-        username_text = f"@{username}" if username else "⚠️ لا يوجد يوزر"
-        
-        # User link (blue clickable name)
-        user_link = f'<a href="tg://user?id={user_id}">{user_name}</a>'
-        
-        # Video title (مختصر حتى لا يتجاوز حد وصف تيليجرام 1024 حرفاً)
-        title = video_info.get('title', 'فيديو') if video_info else 'فيديو'
-        title = title[:200]
+        username_text = f"@{html.escape(str(username))}" if username else "⚠️ لا يوجد يوزر"
+
+        # User link (blue clickable name) - مع تأمين الاسم من رموز HTML
+        user_link = f'<a href="tg://user?id={user_id}">{html.escape(str(user_name or "مستخدم"))}</a>'
+
+        # Video title كاملاً (بحد آمن) ومؤمّن من رموز HTML
+        title = (video_info.get('title') if video_info else None) or 'فيديو'
+        title = html.escape(title[:300])
         
         # Platform detection
         if 'youtube' in url or 'youtu.be' in url:
@@ -1102,10 +1103,10 @@ async def forward_to_log_channel(client, message, sent_message, user_id, user_na
 ╚═ ID: <code>{user_id}</code>
 
 🔗 المصدر: {icon} {platform}
-📎 {url}
+📎 {html.escape(url)}
 
 🎞️ العنوان
-{title}
+<code>{title}</code>
 
 📊 تفاصيل الفيديو
 ├─ 📹 المدة: {duration_text}
@@ -1531,7 +1532,8 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         # معلومات الملف
         file_size_mb = get_file_size_mb(file_path)
         duration = info.get('duration', 0)
-        title = info.get('title', 'فيديو')[:50]
+        # العنوان كاملاً (مع إزالة ` حتى لا يكسر تنسيق النسخ) بحد آمن للوصف
+        title = (info.get('title') or 'فيديو').replace('`', "'")[:300]
         
         logger.info(f"📊 حجم الملف النهائي: {file_size_mb:.2f} MB")
 
@@ -1556,8 +1558,9 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                            progress_bar='▱▱▱▱▱▱▱▱▱▱')
         await status_msg.edit_text(initial_progress)
         
+        # العنوان داخل تنسيق monospace (`...`) = يُنسخ بالضغط عليه في تيليجرام
         caption = (
-            f"🎬 **{title}**\n\n"
+            f"🎬 `{title}`\n\n"
             f"📊 {file_size_mb:.1f} MB\n"
             f"⏱️ {int(duration)//60}:{int(duration)%60:02d}\n"
             f"👤 {user_name}"
