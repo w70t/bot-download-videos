@@ -11,6 +11,7 @@ import logging
 from datetime import datetime
 from dotenv import load_dotenv
 import psycopg2
+from psycopg2 import sql
 from psycopg2.extras import RealDictCursor
 
 load_dotenv()
@@ -41,7 +42,8 @@ def create_sql_backup():
         
         # إعداد بيئة التنفيذ مع كلمة المرور
         env = os.environ.copy()
-        env['PGPASSWORD'] = POSTGRES_CONFIG['password']
+        if POSTGRES_CONFIG['password']:
+            env['PGPASSWORD'] = POSTGRES_CONFIG['password']
         
         # بناء أمر pg_dump
         cmd = [
@@ -101,33 +103,36 @@ def create_json_backup():
         
         # الاتصال بقاعدة البيانات
         conn = psycopg2.connect(**POSTGRES_CONFIG)
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        
-        backup_data = {
-            'backup_date': datetime.now().isoformat(),
-            'database': POSTGRES_CONFIG['database'],
-            'tables': {}
-        }
-        
-        # قائمة الجداول المطلوب نسخها
-        tables = ['users', 'payments', 'settings', 'daily_downloads']
-        
-        for table_name in tables:
-            try:
-                # استخراج بيانات الجدول
-                cursor.execute(f'SELECT * FROM {table_name}')
-                rows = cursor.fetchall()
-                
-                # تحويل إلى قائمة من القواميس
-                backup_data['tables'][table_name] = [dict(row) for row in rows]
-                
-                logger.info(f"✅ تم نسخ جدول {table_name}: {len(rows)} صف")
-                
-            except Exception as table_error:
-                logger.warning(f"⚠️ خطأ في نسخ جدول {table_name}: {table_error}")
-                backup_data['tables'][table_name] = []
-        
-        conn.close()
+        try:
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+
+            backup_data = {
+                'backup_date': datetime.now().isoformat(),
+                'database': POSTGRES_CONFIG['database'],
+                'tables': {}
+            }
+
+            # قائمة الجداول المطلوب نسخها
+            tables = ['users', 'payments', 'settings', 'daily_downloads']
+
+            for table_name in tables:
+                try:
+                    # استخراج بيانات الجدول - استخدام sql.Identifier لتفادي أي حقن
+                    cursor.execute(
+                        sql.SQL('SELECT * FROM {}').format(sql.Identifier(table_name))
+                    )
+                    rows = cursor.fetchall()
+
+                    # تحويل إلى قائمة من القواميس
+                    backup_data['tables'][table_name] = [dict(row) for row in rows]
+
+                    logger.info(f"✅ تم نسخ جدول {table_name}: {len(rows)} صف")
+
+                except Exception as table_error:
+                    logger.warning(f"⚠️ خطأ في نسخ جدول {table_name}: {table_error}")
+                    backup_data['tables'][table_name] = []
+        finally:
+            conn.close()
         
         # حفظ البيانات كملف JSON
         with open(backup_path, 'w', encoding='utf-8') as f:

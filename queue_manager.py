@@ -58,7 +58,12 @@ class DownloadQueueManager:
         
         # Track queue processor tasks: {user_id: Task}
         self.processor_tasks: Dict[int, asyncio.Task] = {}
-        
+
+        # Guards the (enqueue + start-processor) and (processor-exit) critical
+        # sections so a task can never be stranded between an empty-check and
+        # the processor actually shutting down.
+        self._lock = asyncio.Lock()
+
         logger.info("✅ Queue Manager initialized with %d second cooldown", cooldown_seconds)
     
     def is_rate_limited(self, user_id: int) -> tuple[bool, float]:
@@ -138,26 +143,29 @@ class DownloadQueueManager:
         Returns:
             Position in queue (1-based)
         """
-        # Create queue if doesn't exist
-        if user_id not in self.user_queues:
-            self.user_queues[user_id] = asyncio.Queue()
-        
-        # Add to queue
-        await self.user_queues[user_id].put(task)
-        queue_size = self.user_queues[user_id].qsize()
-        
-        # Update last request time
-        self.user_last_request[user_id] = time.time()
-        
-        logger.info(f"📋 Added task to user {user_id} queue (position: {queue_size})")
-        
-        # Start processor if not already running
-        if user_id not in self.processor_tasks or self.processor_tasks[user_id].done():
-            self.processor_tasks[user_id] = asyncio.create_task(
-                self._process_user_queue(user_id, process_func)
-            )
-            logger.info(f"🚀 Started queue processor for user {user_id}")
-        
+        async with self._lock:
+            # Create queue if doesn't exist
+            if user_id not in self.user_queues:
+                self.user_queues[user_id] = asyncio.Queue()
+
+            # Add to queue
+            await self.user_queues[user_id].put(task)
+            queue_size = self.user_queues[user_id].qsize()
+
+            # Update last request time
+            self.user_last_request[user_id] = time.time()
+
+            logger.info(f"📋 Added task to user {user_id} queue (position: {queue_size})")
+
+            # Start processor if not already running. Holding the lock guarantees
+            # we don't race with a processor that is shutting down on an empty queue.
+            existing = self.processor_tasks.get(user_id)
+            if existing is None or existing.done():
+                self.processor_tasks[user_id] = asyncio.create_task(
+                    self._process_user_queue(user_id, process_func)
+                )
+                logger.info(f"🚀 Started queue processor for user {user_id}")
+
         return queue_size
     
     async def _process_user_queue(self, user_id: int, process_func: Callable):
@@ -179,9 +187,13 @@ class DownloadQueueManager:
                         timeout=1.0
                     )
                 except asyncio.TimeoutError:
-                    # Queue is empty, check if we should stop
-                    if self.user_queues[user_id].empty():
-                        break
+                    # Queue looks empty; decide to stop while holding the lock so
+                    # add_to_queue can't enqueue + see us "still running" and skip
+                    # starting a new processor (which would strand the task).
+                    async with self._lock:
+                        if self.user_queues[user_id].empty():
+                            self.processor_tasks.pop(user_id, None)
+                            break
                     continue
                 
                 # Mark user as processing
@@ -237,12 +249,13 @@ class DownloadQueueManager:
         Args:
             user_id: User's Telegram ID
         """
-        if user_id in self.user_queues:
-            while not self.user_queues[user_id].empty():
-                try:
-                    self.user_queues[user_id].get_nowait()
-                    self.user_queues[user_id].task_done()
-                except asyncio.QueueEmpty:
-                    break
-            
-            logger.info(f"🗑️ Cleared queue for user {user_id}")
+        async with self._lock:
+            if user_id in self.user_queues:
+                while not self.user_queues[user_id].empty():
+                    try:
+                        self.user_queues[user_id].get_nowait()
+                        self.user_queues[user_id].task_done()
+                    except asyncio.QueueEmpty:
+                        break
+
+                logger.info(f"🗑️ Cleared queue for user {user_id}")

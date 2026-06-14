@@ -80,17 +80,29 @@ def create_tables():
     ''')
     print("✅ جدول daily_downloads")
     
-    # إضافة الإعدادات الافتراضية
+    # إضافة الإعدادات الافتراضية (قيم عامة فقط)
     cursor.execute('''
-        INSERT INTO settings (key, value) VALUES 
+        INSERT INTO settings (key, value) VALUES
         ('max_duration_minutes', '60'),
         ('daily_download_limit', '6'),
         ('subscription_price', '10'),
-        ('subscription_duration_days', '30'),
-        ('binance_pay_id', '86847466'),
-        ('telegram_support', 'wahab161')
+        ('subscription_duration_days', '30')
         ON CONFLICT (key) DO NOTHING
     ''')
+
+    # القيم التجارية (معرّف Binance ومعرّف الدعم) تُقرأ من متغيرات البيئة بدل
+    # كتابتها داخل الكود؛ تُضاف فقط إذا كانت مُعرّفة في .env
+    business_defaults = {
+        'binance_pay_id': os.getenv('BINANCE_PAY_ID', '').strip(),
+        'telegram_support': os.getenv('SUPPORT_USERNAME', '').strip().lstrip('@'),
+    }
+    for key, value in business_defaults.items():
+        if value:
+            cursor.execute(
+                "INSERT INTO settings (key, value) VALUES (%s, %s) "
+                "ON CONFLICT (key) DO NOTHING",
+                (key, value)
+            )
     print("✅ الإعدادات الافتراضية")
     
     # إنشاء indexes للأداء

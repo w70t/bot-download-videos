@@ -13,6 +13,10 @@ import sys
 import glob  # للبحث عن الملفات وحذفها
 import time  # Added import os
 import json  # قراءة مخرجات ffprobe
+import uuid  # مجلد مؤقت فريد لكل عملية تحميل
+import shutil  # حذف مجلد التحميل المؤقت بالكامل
+import socket  # التحقق من عناوين IP للروابط (حماية SSRF)
+import ipaddress  # كشف العناوين الداخلية/الخاصة
 import subprocess  # توليد المصغّر وضبط تاريخ الفيديو عبر ffmpeg
 import logging
 import asyncio
@@ -65,6 +69,10 @@ API_ID = os.getenv("PYROGRAM_API_ID")
 API_HASH = os.getenv("PYROGRAM_API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
+# التحقق من شهادة TLS عند التحميل: مُعطّل افتراضياً (كثير من مواقع الفيديو
+# تفشل عبر yt-dlp مع التحقق الصارم). يمكن تفعيله بضبط YTDLP_VERIFY_TLS=1
+_YTDLP_NO_CHECK_CERT = os.getenv("YTDLP_VERIFY_TLS", "0") != "1"
+
 if not API_ID or not API_HASH or not BOT_TOKEN:
     print("=" * 60)
     print("❌ المتغيرات البيئية ناقصة!")
@@ -88,6 +96,62 @@ app = Client(
     api_hash=API_HASH,
     bot_token=BOT_TOKEN
 )
+
+# ═══════════════════════════════════════════════════════════════
+# مساعدات الصلاحيات والأمان - Auth & security helpers
+# ═══════════════════════════════════════════════════════════════
+
+def get_admin_id():
+    """يرجع معرّف الأدمن كنص (أو None إن لم يكن مضبوطاً)."""
+    return os.getenv("ADMIN_ID")
+
+
+def is_admin(user_id) -> bool:
+    """نقطة تحقق واحدة من صلاحية الأدمن. تفشل بأمان إذا لم يُضبط ADMIN_ID."""
+    admin_id = os.getenv("ADMIN_ID")
+    return bool(admin_id) and str(user_id) == str(admin_id)
+
+
+def _is_private_host(host: str) -> bool:
+    """هل المضيف عنوان داخلي/خاص/loopback أو غير قابل للحل؟ (حماية SSRF)
+    يرجع True لمنع التحميل (أي العنوان غير آمن)."""
+    if not host:
+        return True
+    host = host.strip().strip('[]').lower()
+    # احجب أسماء المضيف المحلية الواضحة
+    if host in ('localhost', 'localhost.localdomain') or host.endswith('.local') \
+            or host.endswith('.internal'):
+        return True
+    # حل اسم المضيف إلى عناوين IP وافحص كل عنوان
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        # تعذّر الحل → اعتبره غير آمن
+        return True
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr.split('%')[0])
+        except ValueError:
+            return True
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return True
+    return False
+
+
+def is_safe_url(url: str) -> bool:
+    """يتحقق أن الرابط http/https ولا يشير إلى عنوان داخلي (حماية SSRF)."""
+    try:
+        parsed = urlparse(url if '://' in url else 'http://' + url)
+    except Exception:
+        return False
+    if parsed.scheme not in ('http', 'https'):
+        return False
+    if _is_private_host(parsed.hostname or ''):
+        return False
+    return True
+
 
 # Initialize Queue Manager
 queue_manager = DownloadQueueManager(cooldown_seconds=10)
@@ -435,7 +499,7 @@ async def enforce_forced_subscription(client, message, user_id, lang):
     (أي يجب إيقاف المعالجة). الأدمن مُعفى، ويُحترم زر التفعيل/الإيقاف."""
     if not forced_sub_enabled():
         return False
-    if str(user_id) == os.getenv("ADMIN_ID"):
+    if is_admin(user_id):
         return False
     missing = await get_missing_forced_channels(client, user_id)
     if not missing:
@@ -830,6 +894,10 @@ def _is_youtube_cookie_issue(err):
 async def get_video_info(url: str):
     """استخراج معلومات الفيديو"""
     try:
+        # حماية SSRF: ارفض الروابط غير http/https أو التي تشير لعنوان داخلي
+        if not is_safe_url(url):
+            logger.warning(f"🚫 رابط غير آمن أو داخلي مرفوض: {url[:100]}")
+            return None
         # اختيار ملف cookies المطابق لمنصة الرابط (مهم للستوري الخاص)
         cookie_file = get_cookie_file_for_url(url)
         is_youtube = any(m in url.lower() for m in PLATFORM_URL_MARKERS['youtube'])
@@ -840,7 +908,7 @@ async def get_video_info(url: str):
             'skip_download': True,
             'socket_timeout': 30,  # تقليل timeout لاستجابة أسرع
             'extract_flat': False,  # نحتاج معلومات كاملة
-            'no_check_certificate': True,
+            'nocheckcertificate': _YTDLP_NO_CHECK_CERT,
             # لا تفشل استخراج المعلومات بسبب مشاكل الصيغ (مهم ليوتيوب مع الكوكيز)
             'ignore_no_formats_error': True,
             'http_headers': {
@@ -1124,7 +1192,7 @@ async def process_download_from_queue(task: DownloadTask):
                         t('daily_limit_exceeded', lang, limit=daily_limit, count=daily_count),
                         reply_markup=InlineKeyboardMarkup([
                             [InlineKeyboardButton(t('subscribe_now', lang), callback_data="pay_binance")],
-                            [InlineKeyboardButton(t('contact_developer', lang), url=f"https://t.me/{subdb.get_setting('telegram_support', 'wahab161')}")]
+                            [InlineKeyboardButton(t('contact_developer', lang), url=f"https://t.me/{subdb.get_setting('telegram_support', os.getenv('SUPPORT_USERNAME', ''))}")]
                         ])
                     )
                     return
@@ -1157,7 +1225,7 @@ async def process_download_from_queue(task: DownloadTask):
         # Notify user of error
         try:
             await message.reply_text(t('error_occurred', lang, error=str(e)[:100]))
-        except:
+        except Exception:
             pass
 
 
@@ -1218,6 +1286,19 @@ def cleanup_downloaded_files(file_path=None):
         logger.error(f"❌ خطأ في cleanup_downloaded_files: {e}")
 
 
+def cleanup_download_dir(dl_dir):
+    """حذف مجلد التحميل المؤقت الخاص بعملية واحدة (آمن مع التزامن).
+    لا يلمس ملفات أو مجلدات تحميلات أخرى."""
+    if not dl_dir:
+        return
+    try:
+        if os.path.isdir(dl_dir):
+            shutil.rmtree(dl_dir, ignore_errors=True)
+            logger.info(f"🗑️ تم حذف مجلد التحميل المؤقت: {dl_dir}")
+    except Exception as e:
+        logger.error(f"❌ خطأ في حذف مجلد التحميل {dl_dir}: {e}")
+
+
 async def download_and_upload(client, message, url, quality, callback_query=None):
     """تحميل ورفع الفيديو"""
     # الحصول على معلومات المستخدم من callback_query إذا كان موجوداً
@@ -1233,8 +1314,13 @@ async def download_and_upload(client, message, url, quality, callback_query=None
     # Get user language
     lang = subdb.get_user_language(user_id)
     status_msg = await message.reply_text(t('processing', lang))
-    
+
+    # مجلد تحميل مؤقت فريد لكل عملية: يمنع تضارب الأسماء وحذف ملفات تحميلات
+    # متزامنة لمستخدمين آخرين (كان الحذف سابقاً يمسح كل الملفات في المجلد).
+    dl_dir = os.path.join('videos', uuid.uuid4().hex)
+
     try:
+        os.makedirs(dl_dir, exist_ok=True)
         # إعدادات التحميل
         # نُفضّل ترميز H.264 (avc1) + صوت AAC (m4a) لأنه متوافق 100% مع مشغّل
         # تلجرام؛ ترميز VP9/AV1 داخل MP4 يسبب تجمّد الصورة أثناء التشغيل.
@@ -1332,7 +1418,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         
         ydl_opts = {
             'format': quality_formats.get(quality, 'best'),
-            'outtmpl': '%(title)s.%(ext)s',
+            'outtmpl': os.path.join(dl_dir, '%(title)s.%(ext)s'),
             'progress_hooks': [download_progress_hook],
             'postprocessor_hooks': [postprocessor_hook],  # تتبع مرحلة المعالجة
             'quiet': True,
@@ -1340,7 +1426,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             'merge_output_format': 'mp4',
             'retries': 15,
             'fragment_retries': 15,
-            'nocheckcertificate': True,
+            'nocheckcertificate': _YTDLP_NO_CHECK_CERT,
             # لا تضبط تاريخ الملف على تاريخ رفع الفيديو الأصلي القديم
             # حتى يظهر المقطع بترتيب وقت التحميل في معرض الهاتف
             'updatetime': False,
@@ -1416,7 +1502,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                 logger.info("🔍 البحث عن ملفات صوتية تم تحميلها...")
                 audio_files = []
                 for ext in ['*.mp3', '*.m4a', '*.opus', '*.ogg']:
-                    audio_files.extend(glob.glob(ext))
+                    audio_files.extend(glob.glob(os.path.join(dl_dir, ext)))
                 
                 if audio_files:
                     # استخدام أحدث ملف (آخر ملف تم تعديله)
@@ -1508,7 +1594,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             logger.info(f"📹 Sending video: duration={video_duration}, width={video_width}, height={video_height}, thumb={bool(thumb_path)}")
 
             # زر واحد لدعم المطور: يَنسخ معرّف Binance عند الضغط
-            binance_id = subdb.get_setting('binance_pay_id', '86847466')
+            binance_id = subdb.get_setting('binance_pay_id', os.getenv('BINANCE_PAY_ID', ''))
             lang = subdb.get_user_language(user_id)
             support_keyboard = _binance_support_keyboard(binance_id, lang)
             
@@ -1567,9 +1653,9 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         except Exception as log_error:
             logger.error(f"⚠️ خطأ في إرسال للقناة: {log_error}")
         
-        # حذف جميع الملفات المحملة من كل المجلدات
-        cleanup_downloaded_files(file_path)
-        
+        # تنظيف مجلد التحميل المؤقت (يتم أيضاً في finally كضمان)
+        cleanup_download_dir(dl_dir)
+
         # زيادة عداد التحميلات اليومية للمستخدمين غير المشتركين
         if not subdb.is_user_subscribed(user_id):
             subdb.increment_download_count(user_id)
@@ -1596,9 +1682,8 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             # الفيديو تم رفعه بنجاح، فقط نحذف الرسالة والملفات
             try:
                 await status_msg.delete()
-                cleanup_downloaded_files(file_path if 'file_path' in locals() else None)
                 logger.info(f"✅ نجح رفع {file_size_mb:.1f}MB للمستخدم {user_id} (تم تجاهل خطأ metadata)")
-            except:
+            except Exception:
                 pass
         else:
             # خطأ حقيقي - إرسال تنبيه للأدمن
@@ -1618,10 +1703,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             
             # Get user language for error messages
             lang = subdb.get_user_language(user_id)
-            
-            # حذف الملفات المحملة حتى في حالة الخطأ
-            cleanup_downloaded_files(file_path if 'file_path' in locals() else None)
-            
+
             # رسائل مخصصة لأخطاء معينة
             if _is_drm_error(error_text):
                 await status_msg.edit_text(t('drm_protected', lang))
@@ -1633,6 +1715,10 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                 # تقصير رسالة الخطأ
                 short_error = error_text.split('\n')[0][:100]
                 await status_msg.edit_text(t('generic_error', lang, error=short_error))
+
+    finally:
+        # ضمان حذف مجلد التحميل المؤقت في كل الحالات (نجاح أو فشل)
+        cleanup_download_dir(dl_dir)
 
 
 
@@ -1719,7 +1805,7 @@ async def handle_quick_buttons(client, message):
         return
     user_id = message.from_user.id
     
-    if str(user_id) != os.getenv("ADMIN_ID"):
+    if not is_admin(user_id):
         return
     
     if message.text == "🍪 Cookies":
@@ -1851,7 +1937,7 @@ async def show_errors(client, message):
 @app.on_callback_query(filters.regex(r'^resolve_'))
 async def handle_resolve_error(client, callback_query):
     """معالج زر تم الإصلاح"""
-    if str(callback_query.from_user.id) != os.getenv("ADMIN_ID"):
+    if not is_admin(callback_query.from_user.id):
         await callback_query.answer("❌ للمشرفين فقط!", show_alert=True)
         return
     
@@ -2069,7 +2155,7 @@ async def send_database_backup(client, message):
                 f"❌ **حدث خطأ أثناء إنشاء النسخة الاحتياطية!**\n\n"
                 f"**الخطأ:** `{str(e)[:200]}`"
             )
-        except:
+        except Exception:
             pass
 
 
@@ -2078,7 +2164,7 @@ async def cookies_panel(client, message):
     """لوحة إدارة الـ cookies (للأدمن فقط)"""
     user_id = message.from_user.id
     
-    if str(user_id) != os.getenv("ADMIN_ID"):
+    if not is_admin(user_id):
         await message.reply_text("❌ هذا الأمر للمشرفين فقط!")
         return
     
@@ -2106,7 +2192,7 @@ async def cookies_platform_handler(client, callback_query):
     """معالج اختيار المنصة"""
     user_id = callback_query.from_user.id
     
-    if str(user_id) != os.getenv("ADMIN_ID"):
+    if not is_admin(user_id):
         await callback_query.answer("❌ للمشرفين فقط!", show_alert=True)
         return
     
@@ -2152,7 +2238,7 @@ async def cookies_status_handler(client, callback_query):
     """معالج عرض حالة جميع الـ Cookies"""
     user_id = callback_query.from_user.id
     
-    if str(user_id) != os.getenv("ADMIN_ID"):
+    if not is_admin(user_id):
         await callback_query.answer("❌ للمشرفين فقط!", show_alert=True)
         return
     
@@ -2204,7 +2290,7 @@ async def add_cookie_handler(client, callback_query):
     """طلب إضافة cookies"""
     user_id = callback_query.from_user.id
     
-    if str(user_id) != os.getenv("ADMIN_ID"):
+    if not is_admin(user_id):
         await callback_query.answer("❌ للمشرفين فقط!", show_alert=True)
         return
     
@@ -2231,7 +2317,7 @@ async def test_cookie_handler(client, callback_query):
     """اختبار cookies"""
     user_id = callback_query.from_user.id
     
-    if str(user_id) != os.getenv("ADMIN_ID"):
+    if not is_admin(user_id):
         await callback_query.answer("❌ للمشرفين فقط!", show_alert=True)
         return
     
@@ -2309,7 +2395,7 @@ async def cookies_back_handler(client, callback_query):
     """العودة لقائمة المنصات"""
     user_id = callback_query.from_user.id
     
-    if str(user_id) != os.getenv("ADMIN_ID"):
+    if not is_admin(user_id):
         return
     
     keyboard = []
@@ -2337,7 +2423,7 @@ async def handle_cookie_file(client, message):
         return
     user_id = message.from_user.id
     
-    if str(user_id) != os.getenv("ADMIN_ID"):
+    if not is_admin(user_id):
         return
     
     if user_id not in waiting_for_cookies:
@@ -2387,7 +2473,7 @@ async def handle_url(client, message):
 
     # إن كان الأدمن في وضع إضافة قناة اشتراك إجباري وأرسل رابط t.me، عالِجه هنا
     # (لأن معالج الروابط يلتقط أي رسالة فيها http قبل معالج إدخال الأدمن)
-    if str(user_id) == os.getenv("ADMIN_ID"):
+    if is_admin(user_id):
         _pend = pending_downloads.get(user_id)
         if isinstance(_pend, dict) and _pend.get('waiting_for') == 'add_forced_channel':
             await add_forced_channel_from_admin(client, message, user_id)
@@ -2400,6 +2486,12 @@ async def handle_url(client, message):
     if adult_filter_enabled() and is_adult_url(url):
         logger.info(f"🔞 Blocked adult URL from user {user_id}: {_url_host(url)}")
         await message.reply_text(t('adult_blocked', lang))
+        return
+
+    # 🚫 حماية SSRF: ارفض الروابط الداخلية/غير http(s) قبل تمريرها لـ yt-dlp
+    if not is_safe_url(url):
+        logger.warning(f"🚫 Blocked unsafe/internal URL from user {user_id}: {url[:100]}")
+        await message.reply_text(t('invalid_url', lang))
         return
 
     # 📢 الاشتراك الإجباري بالقنوات قبل أي تحميل (تحقق حقيقي)
@@ -2498,7 +2590,7 @@ async def handle_url(client, message):
                     t('daily_limit_exceeded', lang, limit=daily_limit, count=daily_count),
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton(t('subscribe_now', lang), callback_data="pay_binance")],
-                        [InlineKeyboardButton(t('contact_developer', lang), url=f"https://t.me/{subdb.get_setting('telegram_support', 'wahab161')}")]
+                        [InlineKeyboardButton(t('contact_developer', lang), url=f"https://t.me/{subdb.get_setting('telegram_support', os.getenv('SUPPORT_USERNAME', ''))}")]
                     ])
                 )
                 return
@@ -2554,8 +2646,8 @@ async def handle_quality(client, callback_query):
 async def show_subscription_screen(client, message, user_id, title, duration, max_minutes):
     """عرض شاشة الاشتراك للمستخدمين غير المشتركين"""
     duration_minutes = int(duration) // 60
-    telegram_support = subdb.get_setting('telegram_support', 'wahab161')
-    binance_id = subdb.get_setting('binance_pay_id', '86847466')
+    telegram_support = subdb.get_setting('telegram_support', os.getenv('SUPPORT_USERNAME', ''))
+    binance_id = subdb.get_setting('binance_pay_id', os.getenv('BINANCE_PAY_ID', ''))
     
     # Get user language
     lang = subdb.get_user_language(user_id)
@@ -2587,8 +2679,8 @@ async def handle_payment_method(client, callback_query):
     # Get user language
     lang = subdb.get_user_language(user_id)
     
-    binance_id = subdb.get_setting('binance_pay_id', '86847466')
-    telegram_support = subdb.get_setting('telegram_support', 'wahab161')
+    binance_id = subdb.get_setting('binance_pay_id', os.getenv('BINANCE_PAY_ID', ''))
+    telegram_support = subdb.get_setting('telegram_support', os.getenv('SUPPORT_USERNAME', ''))
     price = subdb.get_setting('subscription_price', '10')
     
     if payment_method == 'binance':
@@ -2626,7 +2718,7 @@ async def handle_payment_method(client, callback_query):
 @app.on_callback_query(filters.regex(r'^binance_id_info$'))
 async def handle_binance_id_info(client, callback_query):
     """معالج زر معلومات Binance ID"""
-    binance_id = subdb.get_setting('binance_pay_id', '86847466')
+    binance_id = subdb.get_setting('binance_pay_id', os.getenv('BINANCE_PAY_ID', ''))
     await callback_query.answer(
         f"💵 Binance Pay ID: {binance_id}\n\n"
         f"يمكنك دعم المطور عبر إرسال أي مبلغ!",
@@ -2638,7 +2730,7 @@ async def handle_binance_id_info(client, callback_query):
 async def handle_binance_info_copy(client, callback_query):
     """زر دعم المطور (احتياطي لإصدارات Pyrogram التي لا تدعم النسخ التلقائي):
     يعرض المعرّف في تنبيه لنسخه."""
-    binance_id = subdb.get_setting('binance_pay_id', '86847466')
+    binance_id = subdb.get_setting('binance_pay_id', os.getenv('BINANCE_PAY_ID', ''))
     await callback_query.answer(
         f"✅ تم النسخ\nPay ID: {binance_id}",
         show_alert=True
@@ -2674,7 +2766,7 @@ async def handle_back_to_subscription(client, callback_query):
     # Get user language
     lang = subdb.get_user_language(user_id)
     
-    telegram_support = subdb.get_setting('telegram_support', 'wahab161')
+    telegram_support = subdb.get_setting('telegram_support', os.getenv('SUPPORT_USERNAME', ''))
     
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(t('binance_pay', lang), callback_data="pay_binance")],
@@ -2818,7 +2910,7 @@ async def handle_other_media(client, message):
 @app.on_callback_query(filters.regex(r'^approve_payment_'))
 async def handle_approve_payment(client, callback_query):
     """معالج قبول الدفع من الأدمن"""
-    if str(callback_query.from_user.id) != os.getenv("ADMIN_ID"):
+    if not is_admin(callback_query.from_user.id):
         await callback_query.answer("❌ للمشرفين فقط!", show_alert=True)
         return
     
@@ -2842,7 +2934,7 @@ async def handle_approve_payment(client, callback_query):
                     chat_id=user_id,
                     text=t('subscription_activated', user_lang)
                 )
-            except:
+            except Exception:
                 pass
         
         await callback_query.message.edit_caption(
@@ -2857,7 +2949,7 @@ async def handle_approve_payment(client, callback_query):
 @app.on_callback_query(filters.regex(r'^reject_payment_'))
 async def handle_reject_payment(client, callback_query):
     """معالج رفض الدفع من الأدمن"""
-    if str(callback_query.from_user.id) != os.getenv("ADMIN_ID"):
+    if not is_admin(callback_query.from_user.id):
         await callback_query.answer("❌ للمشرفين فقط!", show_alert=True)
         return
     
@@ -2873,7 +2965,7 @@ async def handle_reject_payment(client, callback_query):
         
         # إرسال إشعار للمستخدم
         try:
-            telegram_support = subdb.get_setting('telegram_support', 'wahab161')
+            telegram_support = subdb.get_setting('telegram_support', os.getenv('SUPPORT_USERNAME', ''))
             await client.send_message(
                 chat_id=user_id,
                 text=(
@@ -2882,7 +2974,7 @@ async def handle_reject_payment(client, callback_query):
                     f"تواصل مع المطور: @{telegram_support}"
                 )
             )
-        except:
+        except Exception:
             pass
         
         await callback_query.message.edit_caption(
@@ -2948,7 +3040,7 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
     if user_id is None:
         user_id = message.from_user.id if message.from_user else None
 
-    if str(user_id) != os.getenv("ADMIN_ID"):
+    if not is_admin(user_id):
         await message.reply_text("❌ هذا الأمر للمشرفين فقط!")
         return
 
@@ -3001,7 +3093,7 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
 @app.on_callback_query(filters.regex(r'^sub_'))
 async def handle_subscription_settings(client, callback_query):
     """معالج إعدادات الاشتراك"""
-    if str(callback_query.from_user.id) != os.getenv("ADMIN_ID"):
+    if not is_admin(callback_query.from_user.id):
         await callback_query.answer("❌ للمشرفين فقط!", show_alert=True)
         return
     
@@ -3305,7 +3397,7 @@ async def handle_subscription_settings(client, callback_query):
 @app.on_callback_query(filters.regex(r'^(change_time_limit|change_daily_limit|back_to_sub_settings)$'))
 async def handle_duration_actions(client, callback_query):
     """معالج إعدادات المدة والحد اليومي"""
-    if str(callback_query.from_user.id) != os.getenv("ADMIN_ID"):
+    if not is_admin(callback_query.from_user.id):
         await callback_query.answer("❌ للمشرفين فقط!", show_alert=True)
         return
     
@@ -3362,7 +3454,7 @@ async def handle_duration_actions(client, callback_query):
 @app.on_callback_query(filters.regex(r'^msg_'))
 async def handle_message_type(client, callback_query):
     """معالج اختيار نوع الرسالة"""
-    if str(callback_query.from_user.id) != os.getenv("ADMIN_ID"):
+    if not is_admin(callback_query.from_user.id):
         await callback_query.answer("❌ للمشرفين فقط!", show_alert=True)
         return
     
@@ -3485,7 +3577,7 @@ def _broadcast_stats_kb(bid):
 @app.on_callback_query(filters.regex(r'^dm_'))
 async def handle_dm_button(client, callback_query):
     """مراسلة عضو عبر البوت مباشرة (للأدمن) — يعمل حتى لو لم يكن للعضو username"""
-    if str(callback_query.from_user.id) != os.getenv("ADMIN_ID"):
+    if not is_admin(callback_query.from_user.id):
         await callback_query.answer("❌ للمشرفين فقط!", show_alert=True)
         return
     try:
@@ -3597,7 +3689,7 @@ async def handle_broadcast_vote(client, callback_query):
 
     # زر التحديث اليدوي (للأدمن)
     if kind == 'ref':
-        if str(uid) == os.getenv("ADMIN_ID"):
+        if is_admin(uid):
             await _update_broadcast_stats(client, bid, force=True)
         await callback_query.answer("🔄 تم التحديث")
         return
@@ -3631,7 +3723,7 @@ async def handle_broadcast_vote(client, callback_query):
 @app.on_callback_query(filters.regex(r'^set_daily_limit_'))
 async def handle_set_daily_limit(client, callback_query):
     """معالج اختيار الحد اليومي السريع"""
-    if str(callback_query.from_user.id) != os.getenv("ADMIN_ID"):
+    if not is_admin(callback_query.from_user.id):
         await callback_query.answer("❌ للمشرفين فقط!", show_alert=True)
         return
     
@@ -3683,7 +3775,7 @@ async def handle_admin_input(client, message):
         return
     user_id = message.from_user.id
 
-    if str(user_id) != os.getenv("ADMIN_ID"):
+    if not is_admin(user_id):
         return
     
     if user_id not in pending_downloads:
@@ -3824,7 +3916,7 @@ async def handle_admin_input(client, message):
                     text=t('subscription_upgraded', user_lang, days=days)
                 )
                 logger.info(f"✅ تمت ترقية {target_user_id} لمدة {days} يوم")
-            except:
+            except Exception:
                 logger.warning(f"لم يتمكن من إرسال إشعار الترقية للمستخدم {target_user_id}")
             
             del pending_downloads[user_id]
@@ -4071,7 +4163,7 @@ async def handle_admin_input(client, message):
                     chat_id=target_user_id,
                     text=t('subscription_deactivated', user_lang)
                 )
-            except:
+            except Exception:
                 pass
             
             await message.reply_text(
