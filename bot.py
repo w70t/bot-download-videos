@@ -1057,8 +1057,9 @@ async def forward_to_log_channel(client, message, sent_message, user_id, user_na
         # User link (blue clickable name)
         user_link = f'<a href="tg://user?id={user_id}">{user_name}</a>'
         
-        # Video title
+        # Video title (مختصر حتى لا يتجاوز حد وصف تيليجرام 1024 حرفاً)
         title = video_info.get('title', 'فيديو') if video_info else 'فيديو'
+        title = title[:200]
         
         # Platform detection
         if 'youtube' in url or 'youtu.be' in url:
@@ -1115,21 +1116,31 @@ async def forward_to_log_channel(client, message, sent_message, user_id, user_na
 🕐 {date_text}
 ━━━━━━━━━━━━━━━━━━━━━━"""
         
-        # 1. تحويل الفيديو (forward)
-        await client.forward_messages(
-            chat_id=channel_id,
-            from_chat_id=sent_message.chat.id,
-            message_ids=sent_message.id
-        )
-        
-        # 2. إرسال معلومات المستخدم كرسالة منفصلة تحت الفيديو
-        await client.send_message(
-            chat_id=channel_id,
-            text=caption,
-            parse_mode=enums.ParseMode.HTML
-        )
-        
-        logger.info(f"✅ تم تحويل الفيديو والمعلومات إلى القناة")
+        # نسخ الفيديو إلى القناة مع كل التفاصيل كوصف في رسالة واحدة مرتبة
+        # (copy_message يستخدم نفس file_id فلا يعيد رفع الفيديو = فوري)
+        try:
+            await client.copy_message(
+                chat_id=channel_id,
+                from_chat_id=sent_message.chat.id,
+                message_id=sent_message.id,
+                caption=caption,
+                parse_mode=enums.ParseMode.HTML
+            )
+        except Exception as copy_err:
+            # احتياطياً عند فشل النسخ: حوّل الفيديو ثم أرسل التفاصيل تحته
+            logger.warning(f"⚠️ تعذّر نسخ الفيديو للقناة، استخدام التحويل: {copy_err}")
+            await client.forward_messages(
+                chat_id=channel_id,
+                from_chat_id=sent_message.chat.id,
+                message_ids=sent_message.id
+            )
+            await client.send_message(
+                chat_id=channel_id,
+                text=caption,
+                parse_mode=enums.ParseMode.HTML
+            )
+
+        logger.info(f"✅ تم إرسال الفيديو والمعلومات إلى القناة في رسالة واحدة")
         
     except Exception as e:
         logger.error(f"❌ خطأ في تحويل الفيديو إلى القناة: {str(e)}")
