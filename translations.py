@@ -244,14 +244,19 @@ def t(key, lang='ar', **kwargs):
     Returns:
         Translated and formatted text
     """
-    text = TRANSLATIONS.get(lang, TRANSLATIONS['ar']).get(key, key)
-    
+    # ارجع للعربية إن لم تتوفر اللغة، ثم للمفتاح نفسه إن لم تتوفر الترجمة
+    lang_map = TRANSLATIONS.get(lang, TRANSLATIONS['ar'])
+    text = lang_map.get(key)
+    if text is None:
+        text = TRANSLATIONS['ar'].get(key, key)
+
     if kwargs:
         try:
             return text.format(**kwargs)
-        except KeyError:
+        except (KeyError, IndexError, ValueError):
+            # وسيط ناقص أو قالب تنسيق غير صالح → أعد النص كما هو بدل الانهيار
             return text
-    
+
     return text
 
 def get_available_languages():
