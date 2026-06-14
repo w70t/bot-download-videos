@@ -378,37 +378,39 @@ def _forced_channel_target(chat_id):
     return int(s) if s.lstrip('-').isdigit() else s
 
 
-async def evaluate_forced_sub(client, user_id, acknowledge=False):
-    """يقيّم القنوات الناقصة للمستخدم مع اكتشاف صلاحية البوت تلقائياً:
-    - قناة يستطيع البوت رؤية أعضائها (مشرف) → تحقق حقيقي من العضوية.
-    - قناة لا يستطيع (البوت ليس مشرفاً = قناة مُعلِن) → تُعتبر مكتملة فقط إذا
-      أقرّ بها المستخدم سابقاً. عند acknowledge=True نسجّل الإقرار (ضغط «تحقق»).
-    """
-    missing = []
-    passed_ack = subdb.get_user_passed_channels(user_id) if not acknowledge else set()
-    for ch in subdb.get_forced_channels():
-        chat_id = str(ch[1])
-        target = _forced_channel_target(chat_id)
-        try:
-            member = await client.get_chat_member(target, user_id)
-            # البوت يستطيع التحقق → نفرض العضوية الحقيقية
-            if member.status in (enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED):
-                missing.append(ch)
-        except UserNotParticipant:
-            # البوت يستطيع التحقق والمستخدم ليس عضواً
-            missing.append(ch)
-        except Exception:
-            # البوت لا يستطيع التحقق (ليس مشرفاً) → قناة إعلانية
-            if acknowledge:
-                subdb.mark_user_passed_channel(user_id, chat_id)
-            elif chat_id not in passed_ack:
-                missing.append(ch)
-    return missing
+async def _channel_is_verifiable(client, chat_id):
+    """هل يستطيع البوت التحقق من أعضاء هذه القناة؟ (أي أنه مشرف فيها)."""
+    try:
+        me = await client.get_me()
+        m = await client.get_chat_member(_forced_channel_target(chat_id), me.id)
+        return m.status in (enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER)
+    except Exception:
+        return False
 
 
 async def get_missing_forced_channels(client, user_id):
-    """القنوات الناقصة للمستخدم (دون تسجيل إقرار)."""
-    return await evaluate_forced_sub(client, user_id, acknowledge=False)
+    """القنوات التي لم يشترك بها المستخدم فعلياً — تحقق حقيقي فقط.
+
+    التحقق من العضوية في تلجرام يتطلب أن يكون البوت مشرفاً في القناة. لذلك:
+    - قناة البوت مشرف فيها → تحقق حقيقي (يُمنع من ليس عضواً).
+    - قناة لا يستطيع البوت التحقق منها (ليس مشرفاً) → تُتجاهَل ولا تُفرض،
+      بدلاً من تمرير المستخدم تمريراً وهمياً (هذا كان سبب الخطأ السابق).
+    """
+    missing = []
+    for ch in subdb.get_forced_channels():
+        target = _forced_channel_target(ch[1])
+        try:
+            member = await client.get_chat_member(target, user_id)
+            if member.status in (enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED):
+                missing.append(ch)
+        except UserNotParticipant:
+            missing.append(ch)
+        except Exception as e:
+            # البوت ليس مشرفاً → لا يمكن التحقق → نتجاهل القناة (بلا تمرير وهمي)
+            logger.warning(f"⚠️ تخطّي قناة اشتراك إجباري {ch[1]} (البوت ليس مشرفاً؟): {e}")
+            continue
+    return missing
+
 
 
 def _forced_sub_keyboard(channels, lang):
@@ -497,9 +499,10 @@ async def add_forced_channel_from_admin(client, message, user_id):
     except Exception:
         verifiable = False
 
-    note = ("🔎 البوت يمكنه رؤية الأعضاء → **تحقق حقيقي** من الاشتراك."
+    note = ("✅ البوت مشرف هنا → **تحقق حقيقي** من اشتراك الأعضاء."
             if verifiable else
-            "📣 البوت ليس مشرفاً هنا → يظهر الزر للإعلان ويُحتسب عند ضغط «تحقق».")
+            "⚠️ البوت **ليس مشرفاً** هنا، ولا يمكن التحقق من الاشتراك (قيد تلجرام).\n"
+            "هذه القناة **لن تُفرض** حتى تجعل البوت مشرفاً فيها.")
 
     if subdb.add_forced_channel(chat_id, username, title, url):
         label = title or (f"@{username}" if username else url)
@@ -2648,9 +2651,8 @@ async def handle_fsub_check(client, callback_query):
     user_id = callback_query.from_user.id
     lang = subdb.get_user_language(user_id)
 
-    # عند الضغط على «تحقق»: نُقرّ بالقنوات الإعلانية (غير القابلة للتحقق) ونتحقق
-    # فعلياً من القنوات التي يكون البوت مشرفاً فيها.
-    missing = await evaluate_forced_sub(client, user_id, acknowledge=True)
+    # تحقق حقيقي من العضوية في القنوات (التي يكون البوت مشرفاً فيها)
+    missing = await get_missing_forced_channels(client, user_id)
     if missing:
         await callback_query.answer(t('fsub_not_yet', lang), show_alert=True)
         return
@@ -2910,19 +2912,25 @@ async def show_forced_sub_panel(client, callback_query):
     if not channels:
         text += "لا توجد قنوات حالياً.\nأضف قناة/قروب ليُطلب من الأعضاء الاشتراك قبل التحميل."
     else:
-        text += f"عدد القنوات: {len(channels)}\n\n"
+        text += (
+            f"عدد القنوات: {len(channels)}\n"
+            "✅ = البوت مشرف (تحقق حقيقي) | ⚠️ = ليس مشرفاً (لا يُفرض)\n\n"
+        )
         for ch in channels:
             row_id, chat_id, username, title = ch[0], ch[1], ch[2], ch[3]
             name = title or (f"@{username}" if username else str(chat_id))
-            # عدد المشتركين الحقيقي من تلجرام (إن أمكن الوصول)
+            # عدد المشتركين الحقيقي + حالة صلاحية البوت (هل التحقق فعّال؟)
             count = "?"
             try:
                 chat = await client.get_chat(_forced_channel_target(chat_id))
                 count = getattr(chat, 'members_count', None) or "?"
             except Exception:
                 pass
-            text += f"• {name} — 👥 {count} مشترك\n"
+            verifiable = await _channel_is_verifiable(client, chat_id)
+            status = "✅" if verifiable else "⚠️"
+            text += f"{status} {name} — 👥 {count} مشترك\n"
             rows.append([InlineKeyboardButton(f"🗑️ حذف: {name[:25]}", callback_data=f"sub_fsubdel_{row_id}")])
+        text += "\n⚠️ القنوات التي ليس البوت مشرفاً فيها لا يمكن التحقق منها (قيد تلجرام) فلا تُفرض. اجعل البوت مشرفاً ليعمل التحقق."
 
     rows.append([InlineKeyboardButton("➕ إضافة قناة/قروب", callback_data="sub_fsub_add")])
     rows.append([InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")])
