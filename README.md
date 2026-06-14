@@ -398,6 +398,153 @@ sudo systemctl status telegram-bot
 
 ---
 
+## 🖥️ تشغيل البوت وإدارته 24/7 (Raspberry Pi / Linux)
+
+> هذا القسم مرجع سريع لكل الأوامر حتى لا تنساها. الأمثلة تفترض أن المستخدم
+> `abdalwahab` والمجلد `~/bot7` (أي `/home/abdalwahab/bot7`). عدّل الاسم/المسار
+> إن كانا مختلفين عندك.
+
+### ▶️ التشغيل اليدوي (للتجربة فقط)
+
+```bash
+cd ~/bot7
+python3 bot.py
+```
+
+يعمل البوت طالما النافذة مفتوحة، ويتوقف عند إغلاقها أو إطفاء الجهاز. للتشغيل
+الدائم استخدم خدمة systemd بالأسفل. ⬇️
+
+---
+
+### 🔁 التشغيل 24/7 + الإقلاع التلقائي بعد إطفاء الجهاز (systemd) — المُوصى به
+
+هذه الطريقة تجعل البوت:
+- يعمل في الخلفية **24 ساعة**.
+- **يعيد تشغيل نفسه تلقائياً** إذا تعطّل (Crash).
+- **يبدأ تلقائياً** بعد إعادة تشغيل/انقطاع كهرباء الجهاز.
+
+**1) أنشئ ملف الخدمة (مرة واحدة فقط):**
+
+```bash
+sudo nano /etc/systemd/system/bot7.service
+```
+
+**2) الصق هذا المحتوى** (عدّل `User` و `WorkingDirectory` إن لزم):
+
+```ini
+[Unit]
+Description=Telegram Download Bot (bot7)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=abdalwahab
+WorkingDirectory=/home/abdalwahab/bot7
+ExecStart=/usr/bin/python3 /home/abdalwahab/bot7/bot.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/abdalwahab/bot7/bot.log
+StandardError=append:/home/abdalwahab/bot7/bot.log
+
+[Install]
+WantedBy=multi-user.target
+```
+
+احفظ بـ `Ctrl+O` ثم `Enter`، واخرج بـ `Ctrl+X`.
+
+**3) فعّل الخدمة وشغّلها (مرة واحدة):**
+
+```bash
+sudo systemctl daemon-reload          # إعادة قراءة ملفات الخدمات
+sudo systemctl enable bot7            # تشغيل تلقائي عند إقلاع الجهاز
+sudo systemctl start bot7             # تشغيل البوت الآن
+```
+
+تم! ✅ البوت الآن يعمل 24/7 وسيعود تلقائياً بعد أي إطفاء أو تعطّل.
+
+---
+
+### 🎛️ أوامر التحكم اليومية
+
+| الإجراء | الأمر |
+|---------|-------|
+| ▶️ تشغيل | `sudo systemctl start bot7` |
+| ⏹️ إيقاف | `sudo systemctl stop bot7` |
+| 🔄 إعادة تشغيل | `sudo systemctl restart bot7` |
+| 📊 الحالة | `sudo systemctl status bot7` |
+| 🚫 إلغاء التشغيل التلقائي | `sudo systemctl disable bot7` |
+| ✅ تفعيل التشغيل التلقائي | `sudo systemctl enable bot7` |
+
+**عرض السجلات (Logs) لمتابعة الأخطاء:**
+
+```bash
+# آخر السجلات لحظة بلحظة (اخرج بـ Ctrl+C)
+journalctl -u bot7 -f
+
+# أو من ملف السجل المباشر
+tail -f ~/bot7/bot.log
+```
+
+---
+
+### ⬆️ تحديث كود البوت (سحب آخر نسخة من GitHub)
+
+```bash
+cd ~/bot7
+git fetch origin
+git checkout main && git pull origin main   # أو اسم الفرع الذي تستخدمه
+sudo systemctl restart bot7                  # أعد التشغيل لتطبيق التحديث
+```
+
+> لتحديث ملفات محددة فقط من فرع معيّن:
+> ```bash
+> cd ~/bot7
+> git fetch origin <اسم-الفرع>
+> git checkout origin/<اسم-الفرع> -- bot.py subscription_db.py translations.py
+> sudo systemctl restart bot7
+> ```
+
+---
+
+### 📦 تحديث المكتبات (مهم — خصوصاً yt-dlp)
+
+مكتبة **yt-dlp** تحتاج تحديثاً دورياً لأن المنصات (يوتيوب/فيسبوك...) تغيّر أنظمتها
+باستمرار. إذا فشل التحميل فجأة، أول حل هو تحديثها:
+
+```bash
+cd ~/bot7
+
+# تحديث yt-dlp فقط (الأكثر أهمية)
+python3 -m pip install -U yt-dlp
+
+# أو تحديث كل المكتبات من ملف المتطلبات
+python3 -m pip install -U -r requirements.txt
+
+sudo systemctl restart bot7   # أعد التشغيل بعد التحديث
+```
+
+> إن كنت تستخدم بيئة افتراضية (venv) فعّلها أولاً: `source venv/bin/activate`.
+
+**التأكد من إصدار ffmpeg** (مطلوب للدمج والمعاينة وحذف التجمّد):
+
+```bash
+ffmpeg -version        # إن لم يكن مثبتاً: sudo apt install -y ffmpeg
+```
+
+---
+
+### 🆘 حل سريع للمشاكل الشائعة
+
+| المشكلة | الحل |
+|---------|------|
+| فشل التحميل من منصة | `python3 -m pip install -U yt-dlp` ثم `sudo systemctl restart bot7` |
+| البوت لا يردّ | `sudo systemctl status bot7` ثم راجع `journalctl -u bot7 -f` |
+| تعديل المتغيّرات (التوكن/الأدمن) | عدّل ملف `.env` ثم `sudo systemctl restart bot7` |
+| البوت لا يبدأ بعد الإقلاع | `sudo systemctl enable bot7` |
+
+---
+
 ## 📜 الترخيص
 
 هذا المشروع مرخص تحت رخصة MIT - انظر ملف [LICENSE](LICENSE) للتفاصيل.
