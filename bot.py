@@ -1278,6 +1278,7 @@ async def process_download_from_queue(task: DownloadTask):
                             t('daily_limit_exceeded', lang, limit=daily_limit, count=daily_count),
                             reply_markup=InlineKeyboardMarkup([
                                 [InlineKeyboardButton(t('subscribe_now', lang), callback_data="pay_binance")],
+                                [_invite_button(lang)],
                                 [InlineKeyboardButton(t('contact_developer', lang), url=f"https://t.me/{subdb.get_setting('telegram_support', os.getenv('SUPPORT_USERNAME', ''))}")]
                             ])
                         )
@@ -2042,30 +2043,41 @@ async def _show_history(client, message):
     await message.reply_text("\n".join(lines))
 
 
-async def _show_invite(client, message):
-    """يعرض رابط الدعوة وإحصاءاتها للمستخدم."""
-    user_id = message.from_user.id
-    lang = subdb.get_user_language(user_id)
+async def _build_invite_text(client, user_id, lang):
+    """يبني نص رابط الدعوة وإحصاءاته (أو None إذا تعذّر جلب اسم البوت)."""
     uname = await _get_bot_username(client)
     if not uname:
-        await message.reply_text(t('error_occurred', lang, error="bot username unavailable"))
-        return
+        return None
     link = f"https://t.me/{uname}?start=ref_{user_id}"
     count = subdb.get_referral_count(user_id)
     balance = subdb.get_bonus_downloads(user_id)
-    await message.reply_text(
-        t('invite_info', lang, link=link, bonus=REFERRAL_BONUS, count=count, balance=balance)
-    )
+    return t('invite_info', lang, link=link, bonus=REFERRAL_BONUS,
+             count=count, balance=balance)
+
+
+def _invite_button(lang):
+    """زر الدعوة الذي يظهر عند انتهاء الحد اليومي."""
+    return InlineKeyboardButton(t('btn_invite', lang), callback_data="show_invite")
+
+
+@app.on_callback_query(filters.regex(r'^show_invite$'))
+async def handle_show_invite(client, callback_query):
+    """يعرض رابط الدعوة عند الضغط على زر 'ادعُ أصدقاءك'."""
+    await callback_query.answer()
+    user_id = callback_query.from_user.id
+    lang = subdb.get_user_language(user_id)
+    text = await _build_invite_text(client, user_id, lang)
+    if text:
+        await callback_query.message.reply_text(text)
+    else:
+        await callback_query.message.reply_text(
+            t('error_occurred', lang, error="bot username unavailable")
+        )
 
 
 @app.on_message(filters.command("history"))
 async def cmd_history(client, message):
     await _show_history(client, message)
-
-
-@app.on_message(filters.command("invite"))
-async def cmd_invite(client, message):
-    await _show_invite(client, message)
 
 
 @app.on_message(filters.command("dlstats"))
@@ -2087,15 +2099,10 @@ async def cmd_dlstats(client, message):
     )
 
 
-@app.on_message(filters.text & filters.regex(
-    r'^(📥 تحميلاتي|📥 My Downloads|🎁 ادعُ أصدقاءك|🎁 Invite Friends)$'))
+@app.on_message(filters.text & filters.regex(r'^(📥 تحميلاتي|📥 My Downloads)$'))
 async def handle_feature_buttons(client, message):
-    """أزرار 'تحميلاتي' و'ادعُ أصدقاءك' (عربي/إنجليزي)."""
-    text = (message.text or '').strip()
-    if text in ('📥 تحميلاتي', '📥 My Downloads'):
-        await _show_history(client, message)
-    else:
-        await _show_invite(client, message)
+    """زر 'تحميلاتي' (عربي/إنجليزي)."""
+    await _show_history(client, message)
 
 
 @app.on_message(filters.command("start"))
@@ -2158,13 +2165,13 @@ async def start(client, message):
             # مشترك - عرض زر الاشتراك + تحميلاتي/الدعوة + تغيير اللغة
             keyboard = ReplyKeyboardMarkup([
                 [KeyboardButton(t('btn_my_subscription', lang))],
-                [KeyboardButton(t('btn_my_downloads', lang)), KeyboardButton(t('btn_invite', lang))],
+                [KeyboardButton(t('btn_my_downloads', lang))],
                 [KeyboardButton(t('btn_change_language', lang))]
             ], resize_keyboard=True)
         else:
             # غير مشترك - تحميلاتي/الدعوة + تغيير اللغة
             keyboard = ReplyKeyboardMarkup([
-                [KeyboardButton(t('btn_my_downloads', lang)), KeyboardButton(t('btn_invite', lang))],
+                [KeyboardButton(t('btn_my_downloads', lang))],
                 [KeyboardButton(t('btn_change_language', lang))]
             ], resize_keyboard=True)
     
@@ -4617,7 +4624,7 @@ async def handle_language_selection(client, callback_query):
     else:
         from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton
         keyboard = ReplyKeyboardMarkup([
-            [KeyboardButton(t('btn_my_downloads', lang)), KeyboardButton(t('btn_invite', lang))],
+            [KeyboardButton(t('btn_my_downloads', lang))],
             [KeyboardButton(t('btn_change_language', lang))]
         ], resize_keyboard=True)
 
