@@ -2115,10 +2115,19 @@ async def cmd_dlstats(client, message):
     )
 
 
-@app.on_message(filters.text & filters.regex(r'^(📥 تحميلاتي|📥 My Downloads)$'))
+@app.on_message(filters.text & filters.regex(
+    r'^(📥 تحميلاتي|📥 My Downloads|🎁 ادعُ أصدقاءك|🎁 Invite Friends)$'))
 async def handle_feature_buttons(client, message):
-    """زر 'تحميلاتي' (عربي/إنجليزي)."""
-    await _show_history(client, message)
+    """أزرار 'تحميلاتي' و'ادعُ أصدقاءك' (عربي/إنجليزي)."""
+    text = (message.text or '').strip()
+    if text in ('📥 تحميلاتي', '📥 My Downloads'):
+        await _show_history(client, message)
+    else:
+        lang = subdb.get_user_language(message.from_user.id)
+        txt = await _build_invite_text(client, message.from_user.id, lang)
+        await message.reply_text(
+            txt or t('error_occurred', lang, error="bot username unavailable")
+        )
 
 
 @app.on_message(filters.command("start"))
@@ -2181,13 +2190,13 @@ async def start(client, message):
             # مشترك - عرض زر الاشتراك + تحميلاتي/الدعوة + تغيير اللغة
             keyboard = ReplyKeyboardMarkup([
                 [KeyboardButton(t('btn_my_subscription', lang))],
-                [KeyboardButton(t('btn_my_downloads', lang))],
+                [KeyboardButton(t('btn_my_downloads', lang)), KeyboardButton(t('btn_invite', lang))],
                 [KeyboardButton(t('btn_change_language', lang))]
             ], resize_keyboard=True)
         else:
             # غير مشترك - تحميلاتي/الدعوة + تغيير اللغة
             keyboard = ReplyKeyboardMarkup([
-                [KeyboardButton(t('btn_my_downloads', lang))],
+                [KeyboardButton(t('btn_my_downloads', lang)), KeyboardButton(t('btn_invite', lang))],
                 [KeyboardButton(t('btn_change_language', lang))]
             ], resize_keyboard=True)
     
@@ -4640,7 +4649,7 @@ async def handle_language_selection(client, callback_query):
     else:
         from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton
         keyboard = ReplyKeyboardMarkup([
-            [KeyboardButton(t('btn_my_downloads', lang))],
+            [KeyboardButton(t('btn_my_downloads', lang)), KeyboardButton(t('btn_invite', lang))],
             [KeyboardButton(t('btn_change_language', lang))]
         ], resize_keyboard=True)
 
