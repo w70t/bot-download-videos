@@ -82,6 +82,9 @@ def init_db():
     _ensure_forced_channels_table()
     _ensure_fsub_passed_table()
     _ensure_media_cache_table()
+    _ensure_history_table()
+    _ensure_referrals_table()
+    _ensure_bonus_column()
     logger.info("✅ تم تجهيز قاعدة البيانات بنجاح")
 
 
@@ -669,3 +672,170 @@ def get_cache_stats():
         cursor.execute('SELECT COUNT(*), COALESCE(SUM(hits), 0) FROM media_cache')
         row = cursor.fetchone()
     return {'items': row[0] if row else 0, 'hits': row[1] if row else 0}
+
+
+# ═══════════════════════════════════════════════════════════════
+# سجل التحميلات والإحصائيات - Download history & statistics
+# ═══════════════════════════════════════════════════════════════
+
+def _ensure_history_table():
+    """ينشئ جدول سجل التحميلات إن لم يكن موجوداً."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS download_history (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                url TEXT,
+                title TEXT,
+                quality TEXT,
+                kind TEXT,
+                platform TEXT,
+                file_size_mb REAL,
+                from_cache BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_history_user ON download_history(user_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_history_date ON download_history(created_at)')
+
+
+def add_download_history(user_id, url, title, quality, kind, platform,
+                         file_size_mb=None, from_cache=False):
+    """يسجّل عملية تحميل ناجحة في السجل."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            INSERT INTO download_history
+                (user_id, url, title, quality, kind, platform, file_size_mb, from_cache)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ''', (user_id, url, title, quality, kind, platform, file_size_mb, from_cache))
+
+
+def get_user_history(user_id, limit=10):
+    """آخر تحميلات المستخدم: (title, quality, kind, created_at)."""
+    with db_cursor() as cursor:
+        cursor.execute('''
+            SELECT title, quality, kind, created_at
+            FROM download_history
+            WHERE user_id = %s
+            ORDER BY id DESC
+            LIMIT %s
+        ''', (user_id, limit))
+        return cursor.fetchall()
+
+
+def get_download_stats():
+    """إحصائيات شاملة للأدمن: عدد اليوم، الإجمالي، أكثر المنصات، أنشط المستخدمين."""
+    today = datetime.now().date().isoformat()
+    with db_cursor() as cursor:
+        cursor.execute('SELECT COUNT(*) FROM download_history')
+        total = cursor.fetchone()[0]
+
+        cursor.execute(
+            'SELECT COUNT(*) FROM download_history WHERE created_at::date = %s',
+            (today,)
+        )
+        today_count = cursor.fetchone()[0]
+
+        cursor.execute('''
+            SELECT COALESCE(platform, 'غير معروف') AS p, COUNT(*) AS c
+            FROM download_history
+            GROUP BY p ORDER BY c DESC LIMIT 5
+        ''')
+        platforms = cursor.fetchall()
+
+        cursor.execute('''
+            SELECT h.user_id, u.first_name, COUNT(*) AS c
+            FROM download_history h
+            LEFT JOIN users u ON h.user_id = u.user_id
+            GROUP BY h.user_id, u.first_name
+            ORDER BY c DESC LIMIT 5
+        ''')
+        top_users = cursor.fetchall()
+
+    return {
+        'today': today_count,
+        'total': total,
+        'platforms': platforms,
+        'top_users': top_users,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# نظام الدعوات والرصيد الإضافي - Referrals & bonus downloads
+# ═══════════════════════════════════════════════════════════════
+
+def _ensure_referrals_table():
+    """ينشئ جدول الدعوات إن لم يكن موجوداً (كل مستخدم يُدعى مرة واحدة)."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS referrals (
+                referred_user_id BIGINT PRIMARY KEY,
+                referrer_user_id BIGINT NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+
+
+def _ensure_bonus_column():
+    """يضيف عمود الرصيد الإضافي لجدول المستخدمين إن لم يكن موجوداً."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute(
+            'ALTER TABLE users ADD COLUMN IF NOT EXISTS bonus_downloads INTEGER DEFAULT 0'
+        )
+
+
+def record_referral(referred_user_id, referrer_user_id) -> bool:
+    """يسجّل دعوة جديدة. يرجع True إذا كانت دعوة جديدة فعلاً (تُمنح المكافأة مرة)."""
+    if int(referred_user_id) == int(referrer_user_id):
+        return False  # لا يدعو المستخدم نفسه
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            INSERT INTO referrals (referred_user_id, referrer_user_id)
+            VALUES (%s, %s)
+            ON CONFLICT (referred_user_id) DO NOTHING
+            RETURNING referred_user_id
+        ''', (referred_user_id, referrer_user_id))
+        inserted = cursor.fetchone() is not None
+    return inserted
+
+
+def get_referral_count(referrer_user_id) -> int:
+    """عدد المستخدمين الذين انضموا عبر رابط هذا المستخدم."""
+    with db_cursor() as cursor:
+        cursor.execute(
+            'SELECT COUNT(*) FROM referrals WHERE referrer_user_id = %s',
+            (referrer_user_id,)
+        )
+        return cursor.fetchone()[0]
+
+
+def add_bonus_downloads(user_id, amount):
+    """يضيف رصيد تحميلات إضافي للمستخدم (يضمن وجود الصف)."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            INSERT INTO users (user_id, bonus_downloads)
+            VALUES (%s, %s)
+            ON CONFLICT (user_id) DO UPDATE SET
+                bonus_downloads = COALESCE(users.bonus_downloads, 0) + %s
+        ''', (user_id, amount, amount))
+
+
+def get_bonus_downloads(user_id) -> int:
+    """رصيد التحميلات الإضافية للمستخدم."""
+    with db_cursor() as cursor:
+        cursor.execute('SELECT COALESCE(bonus_downloads, 0) FROM users WHERE user_id = %s',
+                       (user_id,))
+        row = cursor.fetchone()
+    return row[0] if row else 0
+
+
+def consume_bonus_download(user_id) -> bool:
+    """يستهلك تحميلاً واحداً من الرصيد الإضافي إن وُجد. يرجع True عند النجاح."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            UPDATE users SET bonus_downloads = bonus_downloads - 1
+            WHERE user_id = %s AND COALESCE(bonus_downloads, 0) > 0
+            RETURNING bonus_downloads
+        ''', (user_id,))
+        row = cursor.fetchone()
+    return row is not None

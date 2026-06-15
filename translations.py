@@ -30,8 +30,24 @@ TRANSLATIONS = {
         'choose_quality': '📺 **اختر الجودة:**\n\n🎬 {title}\n⏱️ {duration}',
         'quality_best': '📺 1080p',
         'quality_medium': '📱 720p',
+        'quality_480': '📲 480p',
+        'quality_360': '🪶 360p',
         'quality_audio': '🎵 MP3',
-        
+
+        # السجل والإحصائيات والدعوات - History / Stats / Referral
+        'btn_my_downloads': '📥 تحميلاتي',
+        'btn_invite': '🎁 ادعُ أصدقاءك',
+        'history_title': '📥 **آخر تحميلاتك:**',
+        'history_empty': '📭 لا توجد تحميلات سابقة بعد.',
+        'history_item': '{idx}. {title}\n   ⏱️ {date} • {quality}',
+        'invite_info': '🎁 **ادعُ أصدقاءك واربح تحميلات مجانية!**\n\nشارك رابطك، وكل صديق ينضم عبره يمنحك **{bonus}** تحميلات إضافية.\n\n🔗 **رابطك:**\n`{link}`\n\n👥 انضموا عبرك: **{count}**\n🎟️ رصيدك الإضافي: **{balance}** تحميلات',
+        'referral_granted': '🎁 انضم صديق عبر رابطك! حصلت على **{bonus}** تحميلات إضافية.\n🎟️ رصيدك الآن: **{balance}**',
+        'dlstats_title': '📊 **إحصائيات التحميل**\n\n📥 اليوم: **{today}**\n📦 الإجمالي: **{total}**\n⚡ من الكاش: **{cache_hits}** مرة (عناصر مخزّنة: {cache_items})\n\n🏆 **أكثر المنصات:**\n{platforms}\n\n👥 **أنشط المستخدمين:**\n{top_users}',
+        'playlist_detected': '📃 **هذا رابط قائمة تشغيل** فيها {count} مقطع.\nاضغط لتحميل أول {max} مقاطع بأفضل جودة:',
+        'playlist_btn': '📥 حمّل القائمة ({n})',
+        'playlist_started': '📃 بدأ تحميل {n} مقاطع من القائمة...',
+        'playlist_subscribers_only': '📃 **هذا رابط قائمة تشغيل**\n\nتحميل القوائم متاح للمشتركين فقط.\nأرسل رابط فيديو واحد، أو اشترك للاستفادة من تحميل القوائم.',
+
         # الاشتراك - Subscription
         'subscription_required': '⚠️ **يتطلب اشتراك مدفوع**\n\n🎬 **الفيديو:** {title}\n⏱️ **المدة:** {duration} دقيقة\n🔒 **الحد الأقصى للمجاني:** {max_duration} دقيقة',
         'subscription_benefits': '💎 **للحصول على اشتراك:**\n• تحميل فيديوهات بدون حد\n• أولوية في التحميل\n• دعم المطور',
@@ -143,8 +159,24 @@ TRANSLATIONS = {
         'choose_quality': '📺 **Choose Quality:**\n\n🎬 {title}\n⏱️ {duration}',
         'quality_best': '📺 1080p',
         'quality_medium': '📱 720p',
+        'quality_480': '📲 480p',
+        'quality_360': '🪶 360p',
         'quality_audio': '🎵 MP3',
-        
+
+        # History / Stats / Referral
+        'btn_my_downloads': '📥 My Downloads',
+        'btn_invite': '🎁 Invite Friends',
+        'history_title': '📥 **Your recent downloads:**',
+        'history_empty': '📭 No downloads yet.',
+        'history_item': '{idx}. {title}\n   ⏱️ {date} • {quality}',
+        'invite_info': '🎁 **Invite friends and earn free downloads!**\n\nShare your link — each friend who joins through it gives you **{bonus}** extra downloads.\n\n🔗 **Your link:**\n`{link}`\n\n👥 Joined via you: **{count}**\n🎟️ Your bonus balance: **{balance}** downloads',
+        'referral_granted': '🎁 A friend joined via your link! You earned **{bonus}** extra downloads.\n🎟️ Your balance: **{balance}**',
+        'dlstats_title': '📊 **Download Statistics**\n\n📥 Today: **{today}**\n📦 Total: **{total}**\n⚡ From cache: **{cache_hits}** times (stored items: {cache_items})\n\n🏆 **Top platforms:**\n{platforms}\n\n👥 **Most active users:**\n{top_users}',
+        'playlist_detected': '📃 **This is a playlist** with {count} videos.\nTap to download the first {max} in best quality:',
+        'playlist_btn': '📥 Download playlist ({n})',
+        'playlist_started': '📃 Started downloading {n} videos from the playlist...',
+        'playlist_subscribers_only': '📃 **This is a playlist link**\n\nPlaylist downloads are for subscribers only.\nSend a single video link, or subscribe to download playlists.',
+
         # Subscription
         'subscription_required': '⚠️ **Subscription Required**\n\n🎬 **Video:** {title}\n⏱️ **Duration:** {duration} minutes\n🔒 **Free Limit:** {max_duration} minutes',
         'subscription_benefits': '💎 **Get Subscription:**\n• Unlimited video downloads\n• Priority downloads\n• Support developer',

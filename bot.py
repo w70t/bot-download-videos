@@ -180,11 +180,27 @@ def cache_key_for_url(url: str) -> str:
         return url.strip().lower()
 
 
+def _platform_of(url: str) -> str:
+    """يرجع اسم المنصة من الرابط (للإحصائيات والسجل)."""
+    low = (url or '').lower()
+    for platform, markers in PLATFORM_URL_MARKERS.items():
+        if any(m in low for m in markers):
+            return platform
+    return 'other'
+
+
 # Initialize Queue Manager
 queue_manager = DownloadQueueManager(cooldown_seconds=10)
 
 # تخزين الروابط
 pending_downloads = {}
+
+# روابط قوائم التشغيل المنتظِرة تأكيد المستخدم {user_id: [urls]}
+pending_playlists = {}
+
+# عدد التحميلات الافتراضي عند الدعوة، وأقصى عدد مقاطع لقائمة التشغيل
+REFERRAL_BONUS = int(os.getenv("REFERRAL_BONUS", "3"))
+PLAYLIST_MAX = int(os.getenv("PLAYLIST_MAX", "5"))
 
 # حالة المحادثة بين الأدمن والأعضاء عبر زر الرد
 # {user_id: target_user_id} أي أن user_id ينتظر كتابة رد ليُرسَل إلى target_user_id
@@ -937,6 +953,10 @@ async def get_video_info(url: str):
             'socket_timeout': 30,  # تقليل timeout لاستجابة أسرع
             'extract_flat': False,  # نحتاج معلومات كاملة
             'nocheckcertificate': _YTDLP_NO_CHECK_CERT,
+            # رابط فيديو ضمن قائمة (watch?v=..&list=..) يُعامل كفيديو واحد؛
+            # فقط روابط القوائم الصِّرفة تُرجع entries. ونحدّ عدد المقاطع المستخرَجة.
+            'noplaylist': True,
+            'playlistend': PLAYLIST_MAX,
             # لا تفشل استخراج المعلومات بسبب مشاكل الصيغ (مهم ليوتيوب مع الكوكيز)
             'ignore_no_formats_error': True,
             'http_headers': {
@@ -1207,6 +1227,29 @@ async def process_download_from_queue(task: DownloadTask):
             await status.edit_text(t('adult_blocked', lang))
             return
 
+        # 📃 كشف قوائم التشغيل: عرض زر لتحميل أول N مقاطع (للمشتركين/الأدمن)
+        entries = [e for e in (info.get('entries') or []) if e]
+        if entries:
+            if not (subdb.is_user_subscribed(user_id) or is_admin(user_id)):
+                await status.edit_text(t('playlist_subscribers_only', lang))
+                return
+            urls = []
+            for e in entries[:PLAYLIST_MAX]:
+                u = e.get('webpage_url') or e.get('url')
+                if u and str(u).startswith('http') and is_safe_url(u):
+                    urls.append(u)
+            if urls:
+                pending_playlists[user_id] = urls
+                await status.edit_text(
+                    t('playlist_detected', lang, count=len(entries), max=len(urls)),
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton(t('playlist_btn', lang, n=len(urls)),
+                                              callback_data='playlist_dl')]
+                    ])
+                )
+                return
+            # لا روابط صالحة → تابع كفيديو واحد
+
         title = info.get('title', 'Video')[:50]
         duration = info.get('duration', 0)
         duration_str = f"{int(duration)//60}:{int(duration)%60:02d}" if duration else "0:00"
@@ -1227,14 +1270,18 @@ async def process_download_from_queue(task: DownloadTask):
                 daily_count = subdb.check_daily_limit(user_id)
                 
                 if daily_count >= daily_limit:
-                    await status.edit_text(
-                        t('daily_limit_exceeded', lang, limit=daily_limit, count=daily_count),
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton(t('subscribe_now', lang), callback_data="pay_binance")],
-                            [InlineKeyboardButton(t('contact_developer', lang), url=f"https://t.me/{subdb.get_setting('telegram_support', os.getenv('SUPPORT_USERNAME', ''))}")]
-                        ])
-                    )
-                    return
+                    # جرّب استهلاك رصيد إضافي من الدعوات قبل الحظر
+                    if subdb.consume_bonus_download(user_id):
+                        logger.info(f"🎟️ استُخدم رصيد دعوة إضافي للمستخدم {user_id}")
+                    else:
+                        await status.edit_text(
+                            t('daily_limit_exceeded', lang, limit=daily_limit, count=daily_count),
+                            reply_markup=InlineKeyboardMarkup([
+                                [InlineKeyboardButton(t('subscribe_now', lang), callback_data="pay_binance")],
+                                [InlineKeyboardButton(t('contact_developer', lang), url=f"https://t.me/{subdb.get_setting('telegram_support', os.getenv('SUPPORT_USERNAME', ''))}")]
+                            ])
+                        )
+                        return
         
         max_duration_minutes = subdb.get_max_duration()
         max_duration_seconds = max_duration_minutes * 60
@@ -1246,8 +1293,10 @@ async def process_download_from_queue(task: DownloadTask):
         
         # Show quality selection
         keyboard = [
-            [InlineKeyboardButton(t('quality_best', lang), callback_data="quality_best")],
-            [InlineKeyboardButton(t('quality_medium', lang), callback_data="quality_medium")],
+            [InlineKeyboardButton(t('quality_best', lang), callback_data="quality_best"),
+             InlineKeyboardButton(t('quality_medium', lang), callback_data="quality_medium")],
+            [InlineKeyboardButton(t('quality_480', lang), callback_data="quality_480"),
+             InlineKeyboardButton(t('quality_360', lang), callback_data="quality_360")],
             [InlineKeyboardButton(t('quality_audio', lang), callback_data="quality_audio")],
         ]
         
@@ -1423,6 +1472,11 @@ async def _try_send_from_cache(client, message, status_msg, ckey, quality,
         logger.error(f"⚠️ خطأ في إرسال للقناة (كاش): {log_error}")
 
     await _send_daily_remaining_notice(message, user_id, lang)
+    try:
+        subdb.add_download_history(user_id, url, title, quality, cached['kind'],
+                                   _platform_of(url), fsize, from_cache=True)
+    except Exception:
+        pass
     return True
 
 
@@ -1510,6 +1564,16 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                 'bestvideo[height<=720][vcodec^=avc1]+bestaudio[ext=m4a]/'
                 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/'
                 'best[height<=720][ext=mp4]/best[height<=720]/best'
+            ),
+            '480': (
+                'bestvideo[height<=480][vcodec^=avc1]+bestaudio[ext=m4a]/'
+                'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/'
+                'best[height<=480][ext=mp4]/best[height<=480]/best'
+            ),
+            '360': (
+                'bestvideo[height<=360][vcodec^=avc1]+bestaudio[ext=m4a]/'
+                'bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/'
+                'best[height<=360][ext=mp4]/best[height<=360]/best'
             ),
             'audio': 'bestaudio/best'  # النسخة الناجحة - تحميل أفضل جودة صوت
         }
@@ -1601,6 +1665,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             'merge_output_format': 'mp4',
             'retries': 15,
             'fragment_retries': 15,
+            'noplaylist': True,  # نزّل الفيديو الواحد فقط حتى لو الرابط ضمن قائمة
             'nocheckcertificate': _YTDLP_NO_CHECK_CERT,
             # لا تضبط تاريخ الملف على تاريخ رفع الفيديو الأصلي القديم
             # حتى يظهر المقطع بترتيب وقت التحميل في معرض الهاتف
@@ -1838,6 +1903,13 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             file_size_mb, cache_dur, cache_w, cache_h
         )
 
+        # 📝 تسجيل في سجل التحميلات (للإحصائيات و"تحميلاتي")
+        try:
+            subdb.add_download_history(user_id, url, title, quality, cache_kind,
+                                       _platform_of(url), file_size_mb, from_cache=False)
+        except Exception:
+            pass
+
         # تنظيف مجلد التحميل المؤقت (يتم أيضاً في finally كضمان)
         cleanup_download_dir(dl_dir)
 
@@ -1913,6 +1985,119 @@ async def download_and_upload(client, message, url, quality, callback_query=None
 # Handlers
 # ═══════════════════════════════════════════════════════════════
 
+_bot_username = None
+
+
+async def _get_bot_username(client):
+    """اسم مستخدم البوت (يُجلب مرة ويُخزَّن) لبناء روابط الدعوة."""
+    global _bot_username
+    if _bot_username is None:
+        try:
+            me = await client.get_me()
+            _bot_username = me.username
+        except Exception:
+            _bot_username = None
+    return _bot_username
+
+
+async def _process_referral_start(client, message, new_user_id):
+    """يعالج رابط الدعوة (?start=ref_<id>) لمستخدم جديد: يمنح الداعي رصيداً مرة واحدة."""
+    try:
+        parts = getattr(message, 'command', None) or []
+        if len(parts) < 2 or not str(parts[1]).startswith('ref_'):
+            return
+        referrer_id = int(str(parts[1])[4:])
+    except (ValueError, TypeError):
+        return
+    if not subdb.record_referral(new_user_id, referrer_id):
+        return  # دعوة مكررة أو دعوة النفس
+    subdb.add_bonus_downloads(referrer_id, REFERRAL_BONUS)
+    balance = subdb.get_bonus_downloads(referrer_id)
+    logger.info(f"🎁 دعوة جديدة: {new_user_id} عبر {referrer_id} (+{REFERRAL_BONUS})")
+    try:
+        r_lang = subdb.get_user_language(referrer_id)
+        await client.send_message(
+            referrer_id,
+            t('referral_granted', r_lang, bonus=REFERRAL_BONUS, balance=balance)
+        )
+    except Exception:
+        pass
+
+
+async def _show_history(client, message):
+    """يعرض آخر تحميلات المستخدم."""
+    user_id = message.from_user.id
+    lang = subdb.get_user_language(user_id)
+    rows = subdb.get_user_history(user_id, 10)
+    if not rows:
+        await message.reply_text(t('history_empty', lang))
+        return
+    qmap = {'best': '1080p', 'medium': '720p', '480': '480p', '360': '360p', 'audio': 'MP3'}
+    lines = [t('history_title', lang)]
+    for i, (title, quality, kind, created) in enumerate(rows, 1):
+        qd = 'MP3' if kind == 'audio' else qmap.get(quality, quality or '')
+        date = created.strftime('%Y-%m-%d %H:%M') if hasattr(created, 'strftime') else str(created)
+        lines.append(t('history_item', lang, idx=i, title=(title or 'فيديو')[:60],
+                       date=date, quality=qd))
+    await message.reply_text("\n".join(lines))
+
+
+async def _show_invite(client, message):
+    """يعرض رابط الدعوة وإحصاءاتها للمستخدم."""
+    user_id = message.from_user.id
+    lang = subdb.get_user_language(user_id)
+    uname = await _get_bot_username(client)
+    if not uname:
+        await message.reply_text(t('error_occurred', lang, error="bot username unavailable"))
+        return
+    link = f"https://t.me/{uname}?start=ref_{user_id}"
+    count = subdb.get_referral_count(user_id)
+    balance = subdb.get_bonus_downloads(user_id)
+    await message.reply_text(
+        t('invite_info', lang, link=link, bonus=REFERRAL_BONUS, count=count, balance=balance)
+    )
+
+
+@app.on_message(filters.command("history"))
+async def cmd_history(client, message):
+    await _show_history(client, message)
+
+
+@app.on_message(filters.command("invite"))
+async def cmd_invite(client, message):
+    await _show_invite(client, message)
+
+
+@app.on_message(filters.command("dlstats"))
+async def cmd_dlstats(client, message):
+    """إحصائيات التحميل للأدمن."""
+    if not is_admin(message.from_user.id):
+        return
+    lang = subdb.get_user_language(message.from_user.id)
+    s = subdb.get_download_stats()
+    cache = subdb.get_cache_stats()
+    platforms = "\n".join(f"  • {p}: {c}" for p, c in s['platforms']) or "  —"
+    top_users = "\n".join(
+        f"  • {(name or uid)}: {c}" for uid, name, c in s['top_users']
+    ) or "  —"
+    await message.reply_text(
+        t('dlstats_title', lang, today=s['today'], total=s['total'],
+          cache_hits=cache['hits'], cache_items=cache['items'],
+          platforms=platforms, top_users=top_users)
+    )
+
+
+@app.on_message(filters.text & filters.regex(
+    r'^(📥 تحميلاتي|📥 My Downloads|🎁 ادعُ أصدقاءك|🎁 Invite Friends)$'))
+async def handle_feature_buttons(client, message):
+    """أزرار 'تحميلاتي' و'ادعُ أصدقاءك' (عربي/إنجليزي)."""
+    text = (message.text or '').strip()
+    if text in ('📥 تحميلاتي', '📥 My Downloads'):
+        await _show_history(client, message)
+    else:
+        await _show_invite(client, message)
+
+
 @app.on_message(filters.command("start"))
 async def start(client, message):
     user_id = message.from_user.id
@@ -1933,7 +2118,10 @@ async def start(client, message):
             username=message.from_user.username,
             join_time=join_time
         )
-        
+
+        # 🎁 معالجة الدعوة إن جاء عبر رابط دعوة (مستخدم جديد فقط)
+        await _process_referral_start(client, message, user_id)
+
         # عرض اختيار اللغة
         keyboard = InlineKeyboardMarkup([
             [
@@ -1967,14 +2155,16 @@ async def start(client, message):
         is_subscribed = subdb.is_user_subscribed(user_id)
         
         if is_subscribed:
-            # مشترك - عرض زر الاشتراك + تغيير اللغة
+            # مشترك - عرض زر الاشتراك + تحميلاتي/الدعوة + تغيير اللغة
             keyboard = ReplyKeyboardMarkup([
                 [KeyboardButton(t('btn_my_subscription', lang))],
+                [KeyboardButton(t('btn_my_downloads', lang)), KeyboardButton(t('btn_invite', lang))],
                 [KeyboardButton(t('btn_change_language', lang))]
             ], resize_keyboard=True)
         else:
-            # غير مشترك - زر تغيير اللغة فقط
+            # غير مشترك - تحميلاتي/الدعوة + تغيير اللغة
             keyboard = ReplyKeyboardMarkup([
+                [KeyboardButton(t('btn_my_downloads', lang)), KeyboardButton(t('btn_invite', lang))],
                 [KeyboardButton(t('btn_change_language', lang))]
             ], resize_keyboard=True)
     
@@ -2792,8 +2982,10 @@ async def handle_url(client, message):
     
     # Show quality selection
     keyboard = [
-        [InlineKeyboardButton(t('quality_best', lang), callback_data="quality_best")],
-        [InlineKeyboardButton(t('quality_medium', lang), callback_data="quality_medium")],
+        [InlineKeyboardButton(t('quality_best', lang), callback_data="quality_best"),
+         InlineKeyboardButton(t('quality_medium', lang), callback_data="quality_medium")],
+        [InlineKeyboardButton(t('quality_480', lang), callback_data="quality_480"),
+         InlineKeyboardButton(t('quality_360', lang), callback_data="quality_360")],
         [InlineKeyboardButton(t('quality_audio', lang), callback_data="quality_audio")],
     ]
     
@@ -2821,9 +3013,31 @@ async def handle_quality(client, callback_query):
     await callback_query.message.edit_text(t('start_download', lang))
     
     await download_and_upload(client, callback_query.message, url, quality, callback_query)
-    
+
     # Safe deletion - prevents KeyError if user clicks multiple quality buttons
     pending_downloads.pop(user_id, None)
+
+
+@app.on_callback_query(filters.regex(r'^playlist_dl$'))
+async def handle_playlist_download(client, callback_query):
+    """تحميل مقاطع قائمة التشغيل تتابعياً (بأفضل جودة)."""
+    await callback_query.answer()
+    user_id = callback_query.from_user.id
+    lang = subdb.get_user_language(user_id)
+
+    urls = pending_playlists.pop(user_id, None)
+    if not urls:
+        await callback_query.message.edit_text(
+            t('error_occurred', lang, error="Session expired. Send link again.")
+        )
+        return
+
+    await callback_query.message.edit_text(t('playlist_started', lang, n=len(urls)))
+    for u in urls:
+        try:
+            await download_and_upload(client, callback_query.message, u, 'best', callback_query)
+        except Exception as e:
+            logger.error(f"❌ خطأ في تحميل مقطع من القائمة ({u[:60]}): {e}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -4403,9 +4617,10 @@ async def handle_language_selection(client, callback_query):
     else:
         from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton
         keyboard = ReplyKeyboardMarkup([
+            [KeyboardButton(t('btn_my_downloads', lang)), KeyboardButton(t('btn_invite', lang))],
             [KeyboardButton(t('btn_change_language', lang))]
         ], resize_keyboard=True)
-    
+
     await client.send_message(
         chat_id=user_id,
         text=t('welcome', lang, name=first_name),
