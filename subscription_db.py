@@ -81,6 +81,7 @@ def init_db():
     # الجداول تُنشأ من setup_postgres.py؛ هنا نضمن وجود الجداول الإضافية
     _ensure_forced_channels_table()
     _ensure_fsub_passed_table()
+    _ensure_media_cache_table()
     logger.info("✅ تم تجهيز قاعدة البيانات بنجاح")
 
 
@@ -570,3 +571,101 @@ def set_user_language(user_id: int, language: str):
             VALUES (%s, %s)
             ON CONFLICT (user_id) DO UPDATE SET language = excluded.language
         ''', (user_id, language))
+
+
+# ═══════════════════════════════════════════════════════════════
+# كاش الوسائط - Media cache (إعادة الإرسال الفوري عبر file_id)
+# الفيديو لا يُخزَّن في قاعدة البيانات؛ نخزّن فقط معرّف الملف (file_id) من
+# تيليجرام مربوطاً بالرابط (بعد التطبيع) والجودة، فيُعاد إرساله فوراً بلا تحميل.
+# ═══════════════════════════════════════════════════════════════
+
+def _ensure_media_cache_table():
+    """ينشئ جدول كاش الوسائط إن لم يكن موجوداً."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS media_cache (
+                url_key TEXT NOT NULL,
+                quality TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                title TEXT,
+                file_size_mb REAL,
+                duration INTEGER,
+                width INTEGER,
+                height INTEGER,
+                storage_chat_id BIGINT,
+                storage_msg_id BIGINT,
+                hits INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (url_key, quality)
+            )
+        ''')
+
+
+def get_cached_media(url_key: str, quality: str):
+    """يرجع صف الكاش (كقاموس) إن وُجد، وإلا None."""
+    with db_cursor() as cursor:
+        cursor.execute('''
+            SELECT kind, file_id, title, file_size_mb, duration, width, height,
+                   storage_chat_id, storage_msg_id
+            FROM media_cache
+            WHERE url_key = %s AND quality = %s
+        ''', (url_key, quality))
+        row = cursor.fetchone()
+    if not row:
+        return None
+    keys = ['kind', 'file_id', 'title', 'file_size_mb', 'duration', 'width',
+            'height', 'storage_chat_id', 'storage_msg_id']
+    return dict(zip(keys, row))
+
+
+def save_cached_media(url_key: str, quality: str, kind: str, file_id: str,
+                      title: str = None, file_size_mb: float = None,
+                      duration: int = None, width: int = None, height: int = None,
+                      storage_chat_id: int = None, storage_msg_id: int = None):
+    """يحفظ/يحدّث معرّف ملف في الكاش."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            INSERT INTO media_cache
+                (url_key, quality, kind, file_id, title, file_size_mb, duration,
+                 width, height, storage_chat_id, storage_msg_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (url_key, quality) DO UPDATE SET
+                kind = EXCLUDED.kind,
+                file_id = EXCLUDED.file_id,
+                title = EXCLUDED.title,
+                file_size_mb = EXCLUDED.file_size_mb,
+                duration = EXCLUDED.duration,
+                width = EXCLUDED.width,
+                height = EXCLUDED.height,
+                storage_chat_id = EXCLUDED.storage_chat_id,
+                storage_msg_id = EXCLUDED.storage_msg_id,
+                created_at = NOW()
+        ''', (url_key, quality, kind, file_id, title, file_size_mb, duration,
+              width, height, storage_chat_id, storage_msg_id))
+
+
+def bump_cache_hit(url_key: str, quality: str):
+    """يزيد عداد الاستخدام لإحصاء استفادة الكاش."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute(
+            'UPDATE media_cache SET hits = hits + 1 WHERE url_key = %s AND quality = %s',
+            (url_key, quality)
+        )
+
+
+def delete_cached_media(url_key: str, quality: str):
+    """يحذف صف كاش (يُستخدم عند فشل المعرّف القديم)."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute(
+            'DELETE FROM media_cache WHERE url_key = %s AND quality = %s',
+            (url_key, quality)
+        )
+
+
+def get_cache_stats():
+    """إحصائيات الكاش: عدد العناصر وإجمالي مرات الاستفادة."""
+    with db_cursor() as cursor:
+        cursor.execute('SELECT COUNT(*), COALESCE(SUM(hits), 0) FROM media_cache')
+        row = cursor.fetchone()
+    return {'items': row[0] if row else 0, 'hits': row[1] if row else 0}

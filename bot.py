@@ -24,7 +24,7 @@ import asyncio
 import yt_dlp
 import traceback
 from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qsl, urlencode
 from pyrogram import Client, filters, enums, StopPropagation
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.errors import (
@@ -152,6 +152,32 @@ def is_safe_url(url: str) -> bool:
     if _is_private_host(parsed.hostname or ''):
         return False
     return True
+
+
+# معاملات تتبّع تُحذف عند توليد مفتاح الكاش (لا تغيّر الفيديو المقصود)
+_TRACKING_PARAMS = {
+    'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
+    'si', 'feature', 'fbclid', 'igshid', 'igsh', 'spm', 'ref', 'ref_src', '_nc',
+}
+
+
+def cache_key_for_url(url: str) -> str:
+    """يولّد مفتاحاً موحّداً للرابط لاستخدامه في الكاش: حذف الجزء (#) ومعاملات
+    التتبّع، وتوحيد المضيف والمسار. يبقى دقيقاً (لا يدمج فيديوهات مختلفة)."""
+    try:
+        p = urlparse(url.strip())
+        host = (p.hostname or '').lower().lstrip('.')
+        if host.startswith('www.'):
+            host = host[4:]
+        q = sorted((k, v) for k, v in parse_qsl(p.query)
+                   if k.lower() not in _TRACKING_PARAMS)
+        path = p.path.rstrip('/')
+        key = f"{host}{path}"
+        if q:
+            key += '?' + urlencode(q)
+        return key.lower()
+    except Exception:
+        return url.strip().lower()
 
 
 # Initialize Queue Manager
@@ -1312,6 +1338,133 @@ def cleanup_download_dir(dl_dir):
         logger.error(f"❌ خطأ في حذف مجلد التحميل {dl_dir}: {e}")
 
 
+def _build_media_caption(title, file_size_mb, duration, user_name):
+    """وصف الوسائط الموحّد: العنوان قابل للنسخ (monospace) + الحجم والمدة."""
+    safe_title = (title or 'فيديو').replace('`', "'")[:300]
+    dur_line = f"⏱️ {int(duration)//60}:{int(duration)%60:02d}\n" if duration else ""
+    return (
+        f"🎬 `{safe_title}`\n\n"
+        f"📊 {file_size_mb:.1f} MB\n"
+        f"{dur_line}"
+        f"👤 {user_name}"
+    )
+
+
+async def _send_daily_remaining_notice(message, user_id, lang):
+    """يزيد عداد الحد اليومي لغير المشتركين ويعرض المتبقي (مشترك بين المسارين)."""
+    if subdb.is_user_subscribed(user_id):
+        return
+    subdb.increment_download_count(user_id)
+    daily_limit = subdb.get_daily_limit()
+    if daily_limit != -1:
+        daily_count = subdb.check_daily_limit(user_id)
+        remaining = daily_limit - daily_count
+        if remaining > 0:
+            await message.reply_text(t('downloads_remaining', lang, remaining=remaining))
+
+
+async def _try_send_from_cache(client, message, status_msg, ckey, quality,
+                               user_id, user_name, user_username, url, lang):
+    """يحاول إعادة إرسال الوسائط من الكاش بلا تحميل. يرجع True إن نجح ذلك."""
+    try:
+        cached = subdb.get_cached_media(ckey, quality)
+    except Exception as e:
+        logger.warning(f"⚠️ تعذّر قراءة الكاش: {e}")
+        return False
+    if not cached:
+        return False
+
+    title = cached.get('title') or 'فيديو'
+    fsize = cached.get('file_size_mb') or 0.0
+    cdur = cached.get('duration')
+    caption = _build_media_caption(title, fsize, cdur, user_name)
+
+    try:
+        if cached['kind'] == 'audio':
+            sent_msg = await client.send_audio(
+                chat_id=message.chat.id, audio=cached['file_id'],
+                caption=caption, duration=cdur
+            )
+        else:
+            binance_id = subdb.get_setting('binance_pay_id', os.getenv('BINANCE_PAY_ID', ''))
+            sent_msg = await client.send_video(
+                chat_id=message.chat.id, video=cached['file_id'], caption=caption,
+                duration=cdur, width=cached.get('width'), height=cached.get('height'),
+                supports_streaming=True,
+                reply_markup=_binance_support_keyboard(binance_id, lang)
+            )
+    except Exception as e:
+        # المعرّف القديم لم يعد صالحاً → احذف الصف وأعد التحميل عادياً
+        logger.warning(f"⚠️ فشل الإرسال من الكاش ({ckey}/{quality})، سيُعاد التحميل: {e}")
+        try:
+            subdb.delete_cached_media(ckey, quality)
+        except Exception:
+            pass
+        return False
+
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+    try:
+        subdb.bump_cache_hit(ckey, quality)
+    except Exception:
+        pass
+    logger.info(f"⚡ كاش: أُعيد إرسال {ckey} ({quality}) للمستخدم {user_id} بلا تحميل")
+
+    try:
+        await forward_to_log_channel(
+            client=client, message=message, sent_message=sent_msg,
+            user_id=user_id, user_name=user_name, username=user_username,
+            url=url, video_info={'title': title}, duration=cdur or 0,
+            file_size_mb=fsize
+        )
+    except Exception as log_error:
+        logger.error(f"⚠️ خطأ في إرسال للقناة (كاش): {log_error}")
+
+    await _send_daily_remaining_notice(message, user_id, lang)
+    return True
+
+
+async def _save_media_to_cache(client, sent_msg, ckey, quality, kind, title,
+                               file_size_mb, duration, width=None, height=None):
+    """يحفظ معرّف الملف في الكاش وينسخ الوسائط لقناة الأرشيف (إن وُجدت)."""
+    try:
+        media = getattr(sent_msg, 'audio', None) if kind == 'audio' \
+            else getattr(sent_msg, 'video', None)
+        file_id = getattr(media, 'file_id', None)
+        if not file_id:
+            return
+
+        storage_chat_id = storage_msg_id = None
+        storage_channel = get_channel_id('STORAGE_CHANNEL_ID')
+        if storage_channel:
+            try:
+                archived = await client.copy_message(
+                    chat_id=storage_channel,
+                    from_chat_id=sent_msg.chat.id,
+                    message_id=sent_msg.id
+                )
+                storage_chat_id = archived.chat.id
+                storage_msg_id = archived.id
+                # استخدم معرّف نسخة الأرشيف (أدوم لأنها في قناة دائمة)
+                arch_media = getattr(archived, 'audio', None) if kind == 'audio' \
+                    else getattr(archived, 'video', None)
+                file_id = getattr(arch_media, 'file_id', None) or file_id
+            except Exception as arch_err:
+                logger.warning(f"⚠️ تعذّر أرشفة الوسائط في قناة التخزين: {arch_err}")
+
+        subdb.save_cached_media(
+            url_key=ckey, quality=quality, kind=kind, file_id=file_id,
+            title=title, file_size_mb=file_size_mb, duration=duration,
+            width=width, height=height,
+            storage_chat_id=storage_chat_id, storage_msg_id=storage_msg_id
+        )
+        logger.info(f"💾 حُفظ في الكاش: {ckey} ({quality})")
+    except Exception as e:
+        logger.warning(f"⚠️ تعذّر حفظ الكاش: {e}")
+
+
 async def download_and_upload(client, message, url, quality, callback_query=None):
     """تحميل ورفع الفيديو"""
     # الحصول على معلومات المستخدم من callback_query إذا كان موجوداً
@@ -1327,6 +1480,15 @@ async def download_and_upload(client, message, url, quality, callback_query=None
     # Get user language
     lang = subdb.get_user_language(user_id)
     status_msg = await message.reply_text(t('processing', lang))
+
+    is_audio = (quality == 'audio')
+    ckey = cache_key_for_url(url)
+
+    # ⚡ كاش: إن كان نفس الرابط+الجودة محمّلاً سابقاً، أعِد إرساله فوراً من
+    # معرّف الملف (file_id) بلا أي تحميل (الفيديو محفوظ على خوادم تيليجرام).
+    if await _try_send_from_cache(client, message, status_msg, ckey, quality,
+                                  user_id, user_name, user_username, url, lang):
+        return
 
     # مجلد تحميل مؤقت فريد لكل عملية: يمنع تضارب الأسماء وحذف ملفات تحميلات
     # متزامنة لمستخدمين آخرين (كان الحذف سابقاً يمسح كل الملفات في المجلد).
@@ -1585,6 +1747,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                 progress=upload_progress_tracker
             )
             logger.info(f"✅ نجح إرسال الملف الصوتي: {file_size_mb:.1f}MB")
+            cache_kind, cache_dur, cache_w, cache_h = 'audio', audio_duration, None, None
 
 
         else:
@@ -1647,7 +1810,8 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                         os.remove(thumb_path)
                     except Exception:
                         pass
-        
+            cache_kind, cache_dur, cache_w, cache_h = 'video', video_duration, video_width, video_height
+
         await status_msg.delete()
         logger.info(f"✅ نجح رفع {file_size_mb:.1f}MB للمستخدم {user_id}")
         
@@ -1667,7 +1831,13 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             )
         except Exception as log_error:
             logger.error(f"⚠️ خطأ في إرسال للقناة: {log_error}")
-        
+
+        # 💾 حفظ في الكاش لإعادة الإرسال الفوري مستقبلاً (بلا تحميل)
+        await _save_media_to_cache(
+            client, sent_msg, ckey, quality, cache_kind, title,
+            file_size_mb, cache_dur, cache_w, cache_h
+        )
+
         # تنظيف مجلد التحميل المؤقت (يتم أيضاً في finally كضمان)
         cleanup_download_dir(dl_dir)
 
