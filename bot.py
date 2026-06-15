@@ -909,7 +909,16 @@ def get_file_size_mb(file_path):
 
 # عملاء يوتيوب: android_vr لا يتطلب PO token؛ نتجنّب 'tv' لأنه يبلّغ DRM زوراً بدون كوكيز
 # و'web_embedded' يسبب خطأ إعداد. formats=missing_pot يسمح باستخدام الصيغ المحجوبة بلا توكن.
-YT_PLAYER_CLIENTS = ['default', 'android_vr', 'web_safari', 'mweb']
+# عملاء يوتيوب: قابلة للضبط عبر .env (YT_PLAYER_CLIENTS) لموازنة السرعة/النجاح.
+# تقليل العدد يسرّع ظهور أزرار الجودة (كل عميل = طلب شبكة)، لكن قد يقلّل النجاح
+# لبعض الفيديوهات. الافتراضي عملاء قليلون وسريعون نسبياً.
+_yt_clients_env = os.getenv("YT_PLAYER_CLIENTS", "").strip()
+YT_PLAYER_CLIENTS = [c.strip() for c in _yt_clients_env.split(',') if c.strip()] \
+    or ['default', 'web_safari', 'mweb']
+
+# عدد أجزاء التحميل المتوازية (يسرّع تحميل يوتيوب/الأجزاء). قيمة معتدلة تتفادى
+# الحظر من المنصة (>16 من نفس الـIP قد يُحظر).
+YTDLP_CONCURRENT_FRAGMENTS = max(1, int(os.getenv("YTDLP_CONCURRENT_FRAGMENTS", "4")))
 
 
 def _youtube_extractor_args():
@@ -1669,6 +1678,8 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             'merge_output_format': 'mp4',
             'retries': 15,
             'fragment_retries': 15,
+            # تحميل أجزاء DASH/HLS بالتوازي = أسرع بكثير ليوتيوب والمنصات المجزّأة
+            'concurrent_fragment_downloads': YTDLP_CONCURRENT_FRAGMENTS,
             'noplaylist': True,  # نزّل الفيديو الواحد فقط حتى لو الرابط ضمن قائمة
             'nocheckcertificate': _YTDLP_NO_CHECK_CERT,
             # لا تضبط تاريخ الملف على تاريخ رفع الفيديو الأصلي القديم
