@@ -1097,7 +1097,7 @@ async def forward_to_log_channel(client, message, sent_message, user_id, user_na
         channel_id = get_channel_id('LOG_CHANNEL_ID')
 
         if not channel_id:
-            return
+            return None
         
         # Format username
         username_text = f"@{html.escape(str(username))}" if username else "⚠️ لا يوجد يوزر"
@@ -1166,8 +1166,10 @@ async def forward_to_log_channel(client, message, sent_message, user_id, user_na
         
         # نسخ الفيديو إلى القناة مع كل التفاصيل كوصف في رسالة واحدة مرتبة
         # (copy_message يستخدم نفس file_id فلا يعيد رفع الفيديو = فوري)
+        # نُرجع رسالة السجل لإعادة استخدام نسختها الدائمة في الكاش.
+        log_msg = None
         try:
-            await client.copy_message(
+            log_msg = await client.copy_message(
                 chat_id=channel_id,
                 from_chat_id=sent_message.chat.id,
                 message_id=sent_message.id,
@@ -1177,11 +1179,15 @@ async def forward_to_log_channel(client, message, sent_message, user_id, user_na
         except Exception as copy_err:
             # احتياطياً عند فشل النسخ: حوّل الفيديو ثم أرسل التفاصيل تحته
             logger.warning(f"⚠️ تعذّر نسخ الفيديو للقناة، استخدام التحويل: {copy_err}")
-            await client.forward_messages(
-                chat_id=channel_id,
-                from_chat_id=sent_message.chat.id,
-                message_ids=sent_message.id
-            )
+            try:
+                fwd = await client.forward_messages(
+                    chat_id=channel_id,
+                    from_chat_id=sent_message.chat.id,
+                    message_ids=sent_message.id
+                )
+                log_msg = fwd[0] if isinstance(fwd, list) else fwd
+            except Exception:
+                log_msg = None
             await client.send_message(
                 chat_id=channel_id,
                 text=caption,
@@ -1189,9 +1195,11 @@ async def forward_to_log_channel(client, message, sent_message, user_id, user_na
             )
 
         logger.info(f"✅ تم إرسال الفيديو والمعلومات إلى القناة في رسالة واحدة")
-        
+        return log_msg
+
     except Exception as e:
         logger.error(f"❌ خطأ في تحويل الفيديو إلى القناة: {str(e)}")
+        return None
 
 
 async def process_download_from_queue(task: DownloadTask):
@@ -1481,33 +1489,28 @@ async def _try_send_from_cache(client, message, status_msg, ckey, quality,
     return True
 
 
-async def _save_media_to_cache(client, sent_msg, ckey, quality, kind, title,
+async def _save_media_to_cache(sent_msg, log_msg, ckey, quality, kind, title,
                                file_size_mb, duration, width=None, height=None):
-    """يحفظ معرّف الملف في الكاش وينسخ الوسائط لقناة الأرشيف (إن وُجدت)."""
+    """يحفظ معرّف الملف في الكاش. يعيد استخدام نسخة قناة السجلات (log_msg)
+    كمرجع دائم إن توفّرت، وإلا يستخدم رسالة المستخدم. لا حاجة لقناة أرشيف منفصلة."""
     try:
-        media = getattr(sent_msg, 'audio', None) if kind == 'audio' \
-            else getattr(sent_msg, 'video', None)
-        file_id = getattr(media, 'file_id', None)
+        def _file_id_of(msg):
+            if not msg:
+                return None
+            media = getattr(msg, 'audio', None) if kind == 'audio' \
+                else getattr(msg, 'video', None)
+            return getattr(media, 'file_id', None)
+
+        # فضّل نسخة قناة السجلات (دائمة)، ثم رسالة المستخدم
+        storage_chat_id = storage_msg_id = None
+        file_id = _file_id_of(log_msg)
+        if file_id:
+            storage_chat_id = getattr(getattr(log_msg, 'chat', None), 'id', None)
+            storage_msg_id = getattr(log_msg, 'id', None)
+        else:
+            file_id = _file_id_of(sent_msg)
         if not file_id:
             return
-
-        storage_chat_id = storage_msg_id = None
-        storage_channel = get_channel_id('STORAGE_CHANNEL_ID')
-        if storage_channel:
-            try:
-                archived = await client.copy_message(
-                    chat_id=storage_channel,
-                    from_chat_id=sent_msg.chat.id,
-                    message_id=sent_msg.id
-                )
-                storage_chat_id = archived.chat.id
-                storage_msg_id = archived.id
-                # استخدم معرّف نسخة الأرشيف (أدوم لأنها في قناة دائمة)
-                arch_media = getattr(archived, 'audio', None) if kind == 'audio' \
-                    else getattr(archived, 'video', None)
-                file_id = getattr(arch_media, 'file_id', None) or file_id
-            except Exception as arch_err:
-                logger.warning(f"⚠️ تعذّر أرشفة الوسائط في قناة التخزين: {arch_err}")
 
         subdb.save_cached_media(
             url_key=ckey, quality=quality, kind=kind, file_id=file_id,
@@ -1881,9 +1884,10 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         await status_msg.delete()
         logger.info(f"✅ نجح رفع {file_size_mb:.1f}MB للمستخدم {user_id}")
         
-        # تحويل الفيديو إلى قناة السجلات
+        # تحويل الفيديو إلى قناة السجلات (نلتقط رسالة السجل لإعادة استخدامها كمرجع كاش)
+        log_msg = None
         try:
-            await forward_to_log_channel(
+            log_msg = await forward_to_log_channel(
                 client=client,
                 message=message,
                 sent_message=sent_msg,
@@ -1899,8 +1903,9 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             logger.error(f"⚠️ خطأ في إرسال للقناة: {log_error}")
 
         # 💾 حفظ في الكاش لإعادة الإرسال الفوري مستقبلاً (بلا تحميل)
+        # نعيد استخدام نسخة قناة السجلات نفسها (لا قناة أرشيف منفصلة)
         await _save_media_to_cache(
-            client, sent_msg, ckey, quality, cache_kind, title,
+            sent_msg, log_msg, ckey, quality, cache_kind, title,
             file_size_mb, cache_dur, cache_w, cache_h
         )
 
