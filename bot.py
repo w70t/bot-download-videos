@@ -761,30 +761,31 @@ async def send_error_to_admin(user_id, user_name, error_message, url, error_trac
         logger.info(f"💡 تأكد من إضافة البوت كمدير في قناة سجلات الأخطاء")
         return
     
-    # User link (blue clickable name)
-    user_link = f'<a href="tg://user?id={user_id}">{user_name}</a>'
-    
+    # User link (blue clickable name) - مؤمّن من رموز HTML
+    user_link = f'<a href="tg://user?id={user_id}">{html.escape(str(user_name or "مستخدم"))}</a>'
+
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ تم الإصلاح", callback_data=f"resolve_{error_id}")]
     ])
-    
+
     try:
-        # بناء الرسالة الأساسية
+        # بناء الرسالة الأساسية (HTML بالكامل + تأمين كل القيم بـ html.escape
+        # حتى لا يكسر الرابط/نص الخطأ/الـtraceback تحليل HTML — مثل <module>)
         error_text = (
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔔 **خطأ جديد من مستخدم**\n\n"
-            f"👤 **المستخدم:** {user_link}\n"
-            f"🆔 **ID:** <code>{user_id}</code>\n"
-            f"🔗 **الرابط:** <code>{url}</code>\n\n"
-            f"❌ **الخطأ:**\n<code>{error_message[:300]}</code>\n\n"
+            f"🔔 <b>خطأ جديد من مستخدم</b>\n\n"
+            f"👤 <b>المستخدم:</b> {user_link}\n"
+            f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
+            f"🔗 <b>الرابط:</b> <code>{html.escape(str(url))}</code>\n\n"
+            f"❌ <b>الخطأ:</b>\n<code>{html.escape(str(error_message)[:300])}</code>\n\n"
         )
-        
+
         # إضافة traceback إذا كان متوفراً
         if error_traceback:
             # تقصير traceback إذا كان طويلاً جداً (Telegram limit)
             traceback_text = error_traceback[:800] if len(error_traceback) > 800 else error_traceback
-            error_text += f"📋 **سجلات الخطأ (Traceback):**\n<code>{traceback_text}</code>\n\n"
-        
+            error_text += f"📋 <b>سجلات الخطأ (Traceback):</b>\n<code>{html.escape(traceback_text)}</code>\n\n"
+
         error_text += (
             f"🆔 Error ID: <code>{error_id}</code>\n"
             f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
@@ -1701,8 +1702,10 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                 pass
         else:
             # خطأ حقيقي - إرسال تنبيه للأدمن
-            user_name = message.from_user.first_name or "مستخدم"
-            
+            # ملاحظة: user_name مضبوط صحيحاً في بداية الدالة (من callback_query
+            # أو message)؛ لا نعيد ضبطه من message.from_user لأنها قد تكون رسالة
+            # البوت نفسه عند التحميل عبر أزرار الجودة (فيظهر الخطأ باسم البوت).
+
             # الحصول على traceback الكامل
             error_traceback = traceback.format_exc()
             
