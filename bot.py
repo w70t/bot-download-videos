@@ -2610,6 +2610,12 @@ async def start(client, message):
         reply_markup=keyboard
     )
 
+    # 📋 اسأل العضو الاستبيان (الجنس + سؤال الأدمن) إن لم يجب بعد — الأدمن مُعفى
+    if not is_admin(user_id):
+        survey_step = _survey_next(user_id)
+        if survey_step:
+            await _ask_survey_step(message.reply_text, user_id, lang, survey_step)
+
 
 # معالج الأزرار السريعة
 @app.on_message(filters.text & filters.regex(r'^(🍪 Cookies|📊 التقرير اليومي|🔔 الأخطاء|💎 إعدادات الاشتراك|📁 نسخ احتياطي)$'))
@@ -5139,7 +5145,17 @@ async def handle_language_selection(client, callback_query):
         text=t('welcome', lang, name=first_name),
         reply_markup=keyboard
     )
-    
+
+    # 📋 اسأل العضو الجديد الاستبيان (الجنس + سؤال الأدمن) فور اختيار اللغة
+    if not is_admin(user_id):
+        survey_step = _survey_next(user_id)
+        if survey_step:
+            await _ask_survey_step(
+                lambda text, reply_markup=None: client.send_message(
+                    user_id, text, reply_markup=reply_markup),
+                user_id, lang, survey_step
+            )
+
     await callback_query.answer()
 
 @app.on_message(filters.text & ~filters.regex(r'^/'), group=10)
