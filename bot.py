@@ -4548,30 +4548,48 @@ async def handle_conversation_reply(client, message):
 
     target_lang = subdb.get_user_language(target_id)
 
-    if sender_is_admin:
-        # المطور يرد على عضو → نص "رسالة من المطور"
-        body = f"{t('direct_message_prefix', target_lang)}\n\n{reply_text}"
-    else:
-        # عضو يرد على المطور → نعرض اسمه ومعرّفه
-        sender_name = message.from_user.first_name or "عضو"
-        body = (f"{t('member_reply_prefix', target_lang, name=sender_name, user_id=sender_id)}"
-                f"\n\n{reply_text}")
-
-    # زر رد للطرف الآخر ليرد على المرسل الحالي
-    reply_kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            t('reply_button', target_lang),
-            callback_data=f"reply_msg_{sender_id}"
-        )
+    sender_lang = subdb.get_user_language(sender_id)
+    # زر "رد على العضو" دائماً يشير للمرسل الحالي (العضو) ليبقى في محادثته
+    member_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(t('reply_button', target_lang), callback_data=f"reply_msg_{sender_id}")
     ]])
 
-    sender_lang = subdb.get_user_language(sender_id)
-    try:
-        await client.send_message(chat_id=target_id, text=body, reply_markup=reply_kb)
-        await message.reply_text(t('reply_sent', sender_lang))
-    except Exception as e:
-        logger.error(f"❌ فشل تمرير الرد من {sender_id} إلى {target_id}: {e}")
-        await message.reply_text(t('reply_failed', sender_lang))
+    if sender_is_admin:
+        # الأدمن يرد على عضو → يصل العضو في الخاص، وزر الرد يعيده للقناة
+        body = f"{t('direct_message_prefix', target_lang)}\n\n{reply_text}"
+        try:
+            await client.send_message(chat_id=target_id, text=body, reply_markup=member_kb)
+            await message.reply_text(t('reply_sent', sender_lang))
+        except Exception as e:
+            logger.error(f"❌ فشل إرسال رد الأدمن إلى {target_id}: {e}")
+            await message.reply_text(t('reply_failed', sender_lang))
+    else:
+        # عضو يرد → ننشر رسالته في قناة الأعضاء (تبقى محادثة كل عضو منفصلة هناك)
+        sender_name = message.from_user.first_name or "عضو"
+        channel_id = get_channel_id('SURVEY_CHANNEL_ID')
+        if channel_id:
+            ch_body = (
+                f"💬 <b>رسالة من عضو</b>\n"
+                f"👤 <a href=\"tg://user?id={sender_id}\">{html.escape(sender_name)}</a>"
+                f" | 🆔 <code>{sender_id}</code>\n\n{html.escape(reply_text)}"
+            )
+            try:
+                await client.send_message(channel_id, ch_body,
+                                          parse_mode=enums.ParseMode.HTML, reply_markup=member_kb)
+                await message.reply_text(t('reply_sent', sender_lang))
+            except Exception as e:
+                logger.error(f"❌ فشل نشر رد العضو في القناة: {e}")
+                await message.reply_text(t('reply_failed', sender_lang))
+        else:
+            # لا توجد قناة → السلوك القديم: يصل خاص الأدمن
+            body = (f"{t('member_reply_prefix', target_lang, name=sender_name, user_id=sender_id)}"
+                    f"\n\n{reply_text}")
+            try:
+                await client.send_message(chat_id=target_id, text=body, reply_markup=member_kb)
+                await message.reply_text(t('reply_sent', sender_lang))
+            except Exception as e:
+                logger.error(f"❌ فشل تمرير رد العضو إلى {target_id}: {e}")
+                await message.reply_text(t('reply_failed', sender_lang))
 
     raise StopPropagation
 
