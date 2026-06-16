@@ -85,6 +85,7 @@ def init_db():
     _ensure_history_table()
     _ensure_referrals_table()
     _ensure_bonus_column()
+    _ensure_moderation_table()
     logger.info("✅ تم تجهيز قاعدة البيانات بنجاح")
 
 
@@ -853,3 +854,93 @@ def consume_bonus_download(user_id) -> bool:
         ''', (user_id,))
         row = cursor.fetchone()
     return row is not None
+
+
+# ═══════════════════════════════════════════════════════════════
+# نظام العقوبات والحظر - Moderation / bans
+# ═══════════════════════════════════════════════════════════════
+
+def _ensure_moderation_table():
+    """ينشئ جدول العقوبات إن لم يكن موجوداً."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS moderation (
+                user_id BIGINT PRIMARY KEY,
+                banned BOOLEAN DEFAULT FALSE,
+                reason TEXT,
+                strikes INTEGER DEFAULT 0,
+                pledged BOOLEAN DEFAULT FALSE,
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+
+
+def ban_user(user_id, reason: str) -> int:
+    """يحظر المستخدم (يزيد عدّاد المخالفات). يرجع عدد المخالفات بعد الحظر."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            INSERT INTO moderation (user_id, banned, reason, strikes)
+            VALUES (%s, TRUE, %s, 1)
+            ON CONFLICT (user_id) DO UPDATE SET
+                banned = TRUE,
+                reason = EXCLUDED.reason,
+                strikes = moderation.strikes + 1,
+                updated_at = NOW()
+            RETURNING strikes
+        ''', (user_id, reason))
+        row = cursor.fetchone()
+    return row[0] if row else 1
+
+
+def is_user_banned(user_id) -> bool:
+    """هل المستخدم محظور حالياً؟"""
+    with db_cursor() as cursor:
+        cursor.execute('SELECT banned FROM moderation WHERE user_id = %s', (user_id,))
+        row = cursor.fetchone()
+    return bool(row and row[0])
+
+
+def get_ban_info(user_id):
+    """معلومات الحظر: (banned, reason, strikes, pledged) أو None."""
+    with db_cursor() as cursor:
+        cursor.execute(
+            'SELECT banned, reason, strikes, pledged FROM moderation WHERE user_id = %s',
+            (user_id,))
+        row = cursor.fetchone()
+    if not row:
+        return None
+    return {'banned': row[0], 'reason': row[1], 'strikes': row[2], 'pledged': row[3]}
+
+
+def pledge_unban(user_id) -> bool:
+    """رفع الحظر عبر التعهّد (يُسمح به مرة واحدة فقط). يرجع True عند القبول."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            UPDATE moderation SET banned = FALSE, pledged = TRUE, updated_at = NOW()
+            WHERE user_id = %s AND banned = TRUE AND pledged = FALSE
+            RETURNING user_id
+        ''', (user_id,))
+        row = cursor.fetchone()
+    return row is not None
+
+
+def admin_unban(user_id) -> bool:
+    """رفع الحظر من الأدمن (يبقي سجل المخالفات). يرجع True إن كان محظوراً."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            UPDATE moderation SET banned = FALSE, updated_at = NOW()
+            WHERE user_id = %s AND banned = TRUE
+            RETURNING user_id
+        ''', (user_id,))
+        row = cursor.fetchone()
+    return row is not None
+
+
+def get_banned_users():
+    """قائمة المحظورين حالياً: (user_id, reason, strikes)."""
+    with db_cursor() as cursor:
+        cursor.execute('''
+            SELECT user_id, reason, strikes FROM moderation
+            WHERE banned = TRUE ORDER BY updated_at DESC
+        ''')
+        return cursor.fetchall()

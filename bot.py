@@ -1305,16 +1305,11 @@ async def process_download_from_queue(task: DownloadTask):
             await status.edit_text(t('invalid_url', lang))
             return
 
-        # 🔞 حظر المحتوى الإباحي بعد الاستخراج (مسار قائمة الانتظار)
-        if adult_filter_enabled() and is_adult_info(info):
-            logger.info(f"🔞 Blocked adult content (queue) from user {user_id}: {info.get('title')}")
-            await status.edit_text(t('adult_blocked', lang))
-            return
-
-        # 🚫 حظر حساب محظور من قبل الأدمن (حسب الناشر)
-        if is_blocked_account(info):
-            logger.info(f"🚫 Blocked account content (queue) from user {user_id}: {info.get('uploader')}")
-            await status.edit_text(t('adult_blocked', lang))
+        # 🔞 محتوى إباحي/حساب محظور بعد الاستخراج → عاقِب المستخدم (حظر + تعهّد)
+        if (adult_filter_enabled() and is_adult_info(info)) or is_blocked_account(info):
+            logger.info(f"🔞 Adult/blocked content (queue) from user {user_id}: {info.get('uploader')}")
+            ban_text, ban_kb = await _apply_adult_ban(app, user_id, lang)
+            await status.edit_text(ban_text, reply_markup=ban_kb)
             return
 
         # 📃 كشف قوائم التشغيل: عرض زر لتحميل أول N مقاطع (للمشتركين/الأدمن)
@@ -1621,6 +1616,12 @@ async def download_and_upload(client, message, url, quality, callback_query=None
     lang = subdb.get_user_language(user_id)
     status_msg = await message.reply_text(t('processing', lang))
 
+    # 🚫 مستخدم محظور: اعرض شاشة الحظر/التعهّد ولا تكمل (الأدمن مُعفى)
+    if not is_admin(user_id) and subdb.is_user_banned(user_id):
+        ban_text, ban_kb = _banned_block_content(user_id, lang)
+        await status_msg.edit_text(ban_text, reply_markup=ban_kb)
+        return
+
     is_audio = (quality == 'audio')
     ckey = cache_key_for_url(url)
 
@@ -1813,7 +1814,8 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         # التحميل وأي مسار)، حتى لو فات الفحص الأول. لا نرفعه ولا نخزّنه في الكاش.
         if (adult_filter_enabled() and is_adult_info(info)) or is_blocked_account(info):
             logger.info(f"🚫 Blocked at download stage for user {user_id}: {info.get('uploader')}")
-            await status_msg.edit_text(t('adult_blocked', lang))
+            ban_text, ban_kb = await _apply_adult_ban(client, user_id, lang)
+            await status_msg.edit_text(ban_text, reply_markup=ban_kb)
             return
 
         # ⚠️ إذا كان تحميل صوتي، FFmpegExtractAudio يغير الامتداد إلى .mp3
@@ -2177,6 +2179,93 @@ async def _build_invite_text(client, user_id, lang):
 def _invite_button(lang):
     """زر الدعوة الذي يظهر عند انتهاء الحد اليومي."""
     return InlineKeyboardButton(t('btn_invite', lang), callback_data="show_invite")
+
+
+# ═══════════════════════════════════════════════════════════════
+# نظام العقوبات: حظر بسبب الإباحية + تعهّد للعودة
+# ═══════════════════════════════════════════════════════════════
+
+def _ban_screen_content(lang, ban_info):
+    """يبني (نص، أزرار) شاشة الحظر حسب الحالة (أول مخالفة أم حظر دائم)."""
+    # نقض التعهّد سابقاً (pledged) ثم حُظر مجدداً = حظر دائم (الأدمن فقط يرفعه)
+    if ban_info and ban_info.get('pledged'):
+        return t('banned_permanent', lang), InlineKeyboardMarkup([[_invite_button(lang)]])
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(t('btn_pledge', lang), callback_data='pledge_unban')],
+        [_invite_button(lang)],
+    ])
+    return t('banned_screen', lang), keyboard
+
+
+async def _apply_adult_ban(client, user_id, lang):
+    """يحظر المستخدم بسبب محاولة تحميل إباحي ويرجع (نص، أزرار) لشاشة الحظر.
+    الأدمن مُعفى (لا يُحظر، يُعرض له الرفض فقط)."""
+    if is_admin(user_id):
+        return t('adult_blocked', lang), None
+    strikes = subdb.ban_user(user_id, t('ban_reason_adult', lang))
+    logger.info(f"🚫 حظر المستخدم {user_id} بسبب الإباحية (مخالفة #{strikes})")
+    return _ban_screen_content(lang, subdb.get_ban_info(user_id))
+
+
+def _banned_block_content(user_id, lang):
+    """شاشة الحظر لمستخدم محظور أصلاً (للتذكير عند محاولته الاستخدام)."""
+    return _ban_screen_content(lang, subdb.get_ban_info(user_id))
+
+
+@app.on_callback_query(filters.regex(r'^pledge_unban$'))
+async def handle_pledge_unban(client, callback_query):
+    """رفع الحظر عبر التعهّد (مرة واحدة). نقضه لاحقاً = حظر دائم."""
+    await callback_query.answer()
+    user_id = callback_query.from_user.id
+    lang = subdb.get_user_language(user_id)
+    if subdb.pledge_unban(user_id):
+        logger.info(f"✋ المستخدم {user_id} تعهّد ورُفع حظره")
+        await callback_query.message.edit_text(t('pledge_accepted', lang))
+    else:
+        await callback_query.message.edit_text(t('pledge_denied', lang))
+
+
+@app.on_message(filters.command("unban"))
+async def cmd_unban(client, message):
+    """رفع الحظر عن مستخدم (أدمن)."""
+    if not is_admin(message.from_user.id):
+        return
+    parts = getattr(message, 'command', []) or []
+    if len(parts) < 2:
+        await message.reply_text("الاستخدام: /unban <معرّف المستخدم>")
+        return
+    try:
+        uid = int(parts[1])
+    except ValueError:
+        await message.reply_text("❌ معرّف غير صالح.")
+        return
+    if subdb.admin_unban(uid):
+        await message.reply_text(f"✅ تم رفع الحظر عن المستخدم {uid}")
+        try:
+            await client.send_message(uid, t('pledge_accepted', subdb.get_user_language(uid)))
+        except Exception:
+            pass
+    else:
+        await message.reply_text(f"ℹ️ المستخدم {uid} غير محظور.")
+
+
+@app.on_message(filters.command("banned"))
+async def cmd_banned(client, message):
+    """قائمة المحظورين (أدمن)."""
+    if not is_admin(message.from_user.id):
+        return
+    rows = subdb.get_banned_users()
+    if not rows:
+        await message.reply_text("✅ لا يوجد مستخدمون محظورون.")
+        return
+    body = "\n".join(
+        f"  • <code>{uid}</code> — {html.escape(str(reason or ''))} (مخالفات: {strikes})"
+        for uid, reason, strikes in rows
+    )
+    await message.reply_text(
+        f"🚫 <b>المحظورون ({len(rows)}):</b>\n{body}\n\nلرفع الحظر: /unban &lt;المعرّف&gt;",
+        parse_mode=enums.ParseMode.HTML
+    )
 
 
 @app.on_callback_query(filters.regex(r'^show_invite$'))
@@ -3045,16 +3134,17 @@ async def handle_url(client, message):
     # Get user language FIRST
     lang = subdb.get_user_language(user_id)
 
-    # 🔞 حظر المحتوى الإباحي قبل أي معالجة (فحص النطاق/الرابط)
-    if adult_filter_enabled() and is_adult_url(url):
-        logger.info(f"🔞 Blocked adult URL from user {user_id}: {_url_host(url)}")
-        await message.reply_text(t('adult_blocked', lang))
+    # 🚫 مستخدم محظور أصلاً: اعرض شاشة الحظر/التعهّد (الأدمن مُعفى)
+    if not is_admin(user_id) and subdb.is_user_banned(user_id):
+        ban_text, ban_kb = _banned_block_content(user_id, lang)
+        await message.reply_text(ban_text, reply_markup=ban_kb)
         return
 
-    # 🚫 حظر حساب X/تويتر محظور (قبل الاستخراج، يشمل إعادة الإرسال من الكاش)
-    if is_blocked_url(url):
-        logger.info(f"🚫 Blocked account URL from user {user_id}: {_handle_from_url(url)}")
-        await message.reply_text(t('adult_blocked', lang))
+    # 🔞 محتوى إباحي/حساب محظور → عاقِب المستخدم (حظر + تعهّد)
+    if (adult_filter_enabled() and is_adult_url(url)) or is_blocked_url(url):
+        logger.info(f"🔞 Adult/blocked URL from user {user_id}: {_url_host(url)}")
+        ban_text, ban_kb = await _apply_adult_ban(client, user_id, lang)
+        await message.reply_text(ban_text, reply_markup=ban_kb)
         return
 
     # 🚫 حماية SSRF: ارفض الروابط الداخلية/غير http(s) قبل تمريرها لـ yt-dlp
