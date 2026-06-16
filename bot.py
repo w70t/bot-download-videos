@@ -2443,6 +2443,22 @@ async def _ask_survey_step(send_func, user_id, lang, step):
         await send_func(_member_question_text(), reply_markup=_question_keyboard(lang))
 
 
+def _gender_label(gender):
+    return '👨 رجل' if gender == 'male' else ('👩 امرأة' if gender == 'female' else '— غير محدد')
+
+
+def _member_header_html(user):
+    """رأس موحّد لرسائل العضو في القناة: الاسم + اليوزر + الجنس + المعرّف."""
+    uid = user.id
+    name = html.escape(str(getattr(user, 'first_name', None) or 'مستخدم'))
+    uname = f"@{html.escape(user.username)}" if getattr(user, 'username', None) else '⚠️ لا يوجد'
+    gender_txt = _gender_label(subdb.get_survey(uid).get('gender'))
+    return (f"👤 <a href=\"tg://user?id={uid}\">{name}</a>\n"
+            f"📛 اليوزر: {uname}\n"
+            f"👥 الجنس: {gender_txt}\n"
+            f"🆔 ID: <code>{uid}</code>")
+
+
 async def _post_survey_result(client, user):
     """ينشر إجابات العضو على الاستبيان في قناة الاستبيان (إن وُجدت) مع زر رد مباشر."""
     channel_id = get_channel_id('SURVEY_CHANNEL_ID')
@@ -2450,20 +2466,10 @@ async def _post_survey_result(client, user):
         return
     uid = user.id
     s = subdb.get_survey(uid)
-    gender_txt = ('👨 رجل' if s.get('gender') == 'male'
-                  else '👩 امرأة' if s.get('gender') == 'female' else '—')
-    name = html.escape(str(getattr(user, 'first_name', None) or 'مستخدم'))
-    uname = f"@{html.escape(user.username)}" if getattr(user, 'username', None) else '⚠️ لا يوجد'
-    lines = [
-        "📋 <b>إجابات عضو على الاستبيان</b>\n",
-        f"👤 الاسم: <a href=\"tg://user?id={uid}\">{name}</a>",
-        f"📛 اليوزر: {uname}",
-        f"🆔 ID: <code>{uid}</code>",
-        f"👥 الجنس: {gender_txt}",
-    ]
+    lines = ["📋 <b>إجابات عضو على الاستبيان</b>\n", _member_header_html(user)]
     if _member_question_enabled() and s.get('q_answer'):
         ans = '✅ نعم' if s['q_answer'] == 'yes' else '❌ لا'
-        lines.append(f"❓ {html.escape(_member_question_text())}: {ans}")
+        lines.append(f"\n❓ {html.escape(_member_question_text())}: {ans}")
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("💬 رد على العضو", callback_data=f"reply_msg_{uid}")
     ]])
@@ -4569,9 +4575,8 @@ async def handle_conversation_reply(client, message):
         channel_id = get_channel_id('SURVEY_CHANNEL_ID')
         if channel_id:
             ch_body = (
-                f"💬 <b>رسالة من عضو</b>\n"
-                f"👤 <a href=\"tg://user?id={sender_id}\">{html.escape(sender_name)}</a>"
-                f" | 🆔 <code>{sender_id}</code>\n\n{html.escape(reply_text)}"
+                f"💬 <b>رسالة من عضو</b>\n{_member_header_html(message.from_user)}"
+                f"\n\n{html.escape(reply_text)}"
             )
             try:
                 await client.send_message(channel_id, ch_body,
