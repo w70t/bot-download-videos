@@ -417,6 +417,11 @@ def adult_filter_enabled():
     return subdb.get_setting('block_adult_content', '1') == '1'
 
 
+def downloads_enabled():
+    """هل التحميل مُفعّل للأعضاء؟ (افتراضياً مُفعّل). الأدمن لا يتأثر."""
+    return subdb.get_setting('downloads_enabled', '1') == '1'
+
+
 def generate_video_thumbnail(video_path, duration=None):
     """يولّد صورة مصغّرة (JPEG) للفيديو حتى تظهر معاينة ثابتة في تلجرام
     بدل الإطار الأسود/المتجمّد. يرجع مسار المصغّر أو None عند الفشل."""
@@ -1620,6 +1625,11 @@ async def download_and_upload(client, message, url, quality, callback_query=None
     # Get user language
     lang = subdb.get_user_language(user_id)
     status_msg = await message.reply_text(t('processing', lang))
+
+    # ⏸️ إيقاف التحميل العام (الأدمن مُعفى)
+    if not is_admin(user_id) and not downloads_enabled():
+        await status_msg.edit_text(t('downloads_paused', lang))
+        return
 
     # 🚫 مستخدم محظور: اعرض شاشة الحظر/التعهّد ولا تكمل (الأدمن مُعفى)
     if not is_admin(user_id) and subdb.is_user_banned(user_id):
@@ -3302,6 +3312,11 @@ async def handle_url(client, message):
     # Get user language FIRST
     lang = subdb.get_user_language(user_id)
 
+    # ⏸️ إيقاف التحميل العام (الأدمن مُعفى)
+    if not is_admin(user_id) and not downloads_enabled():
+        await message.reply_text(t('downloads_paused', lang))
+        return
+
     # 🚫 مستخدم محظور أصلاً: اعرض شاشة الحظر/التعهّد (الأدمن مُعفى)
     if not is_admin(user_id) and subdb.is_user_banned(user_id):
         ban_text, ban_kb = _banned_block_content(user_id, lang)
@@ -3908,8 +3923,11 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
     stats = subdb.get_user_stats()
     adult_on = adult_filter_enabled()
     adult_label = f"🔞 حظر المحتوى الإباحي: {'✅ مُفعّل' if adult_on else '❌ متوقف'}"
+    dl_on = downloads_enabled()
+    dl_label = "⏸️ إيقاف التحميل للجميع" if dl_on else "▶️ تشغيل التحميل للجميع"
 
     keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(dl_label, callback_data="sub_toggle_downloads")],
         [InlineKeyboardButton("⏱️ تحديد المدة القصوى", callback_data="sub_set_duration")],
         [InlineKeyboardButton("💰 تحديد السعر", callback_data="sub_set_price")],
         [InlineKeyboardButton(adult_label, callback_data="sub_toggle_adult")],
@@ -3935,7 +3953,8 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
         f"⏱️ **الحد الأقصى للمجاني:** {max_duration} دقيقة\n"
         f"💰 **سعر الاشتراك:** ${price}\n"
         f"📅 **مدة الاشتراك:** {duration_days} يوم\n"
-        f"🔞 **حظر المحتوى الإباحي:** {'مُفعّل ✅' if adult_on else 'متوقف ❌'}\n\n"
+        f"🔞 **حظر المحتوى الإباحي:** {'مُفعّل ✅' if adult_on else 'متوقف ❌'}\n"
+        f"⏯️ **التحميل للأعضاء:** {'يعمل ▶️' if dl_on else 'متوقف ⏸️'}\n\n"
         f"📊 **الإحصائيات:**\n"
         f"• المجموع: {stats['total']} عضو\n"
         f"• المشتركون: {stats['subscribed']} 💎\n"
@@ -3957,6 +3976,20 @@ async def handle_subscription_settings(client, callback_query):
         return
     
     action = callback_query.data[len('sub_'):]  # إزالة البادئة فقط (لا كل التكرارات)
+
+    if action == 'toggle_downloads':
+        new_state = '0' if downloads_enabled() else '1'
+        subdb.set_setting('downloads_enabled', new_state)
+        await callback_query.answer(
+            "▶️ تم تشغيل التحميل للجميع" if new_state == '1'
+            else "⏸️ تم إيقاف التحميل للجميع (الأدمن غير متأثر)",
+            show_alert=True
+        )
+        await subscription_settings_panel(
+            client, callback_query.message,
+            user_id=callback_query.from_user.id, edit=True
+        )
+        return
 
     if action == 'toggle_adult':
         new_state = '0' if adult_filter_enabled() else '1'
