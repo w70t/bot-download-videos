@@ -1240,6 +1240,9 @@ async def forward_to_log_channel(client, message, sent_message, user_id, user_na
 🕐 {date_text}
 ━━━━━━━━━━━━━━━━━━━━━━"""
         
+        # أزرار تحكّم الأدمن (حظر/رفع حظر) أسفل رسالة السجل — لا تظهر للأدمن نفسه
+        admin_kb = None if is_admin(user_id) else _admin_ban_buttons(user_id)
+
         # نسخ الفيديو إلى القناة مع كل التفاصيل كوصف في رسالة واحدة مرتبة
         # (copy_message يستخدم نفس file_id فلا يعيد رفع الفيديو = فوري)
         # نُرجع رسالة السجل لإعادة استخدام نسختها الدائمة في الكاش.
@@ -1250,7 +1253,8 @@ async def forward_to_log_channel(client, message, sent_message, user_id, user_na
                 from_chat_id=sent_message.chat.id,
                 message_id=sent_message.id,
                 caption=caption,
-                parse_mode=enums.ParseMode.HTML
+                parse_mode=enums.ParseMode.HTML,
+                reply_markup=admin_kb
             )
         except Exception as copy_err:
             # احتياطياً عند فشل النسخ: حوّل الفيديو ثم أرسل التفاصيل تحته
@@ -1267,7 +1271,8 @@ async def forward_to_log_channel(client, message, sent_message, user_id, user_na
             await client.send_message(
                 chat_id=channel_id,
                 text=caption,
-                parse_mode=enums.ParseMode.HTML
+                parse_mode=enums.ParseMode.HTML,
+                reply_markup=admin_kb
             )
 
         logger.info(f"✅ تم إرسال الفيديو والمعلومات إلى القناة في رسالة واحدة")
@@ -2266,6 +2271,81 @@ async def cmd_banned(client, message):
         f"🚫 <b>المحظورون ({len(rows)}):</b>\n{body}\n\nلرفع الحظر: /unban &lt;المعرّف&gt;",
         parse_mode=enums.ParseMode.HTML
     )
+
+
+def _admin_ban_buttons(uid):
+    """أزرار تحكّم الأدمن لحظر/رفع حظر مستخدم (تظهر في قناة السجلات)."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔨 حظر دائم", callback_data=f"permban_{uid}"),
+         InlineKeyboardButton("⚠️ تحذير", callback_data=f"warnban_{uid}")],
+        [InlineKeyboardButton("✅ رفع الحظر", callback_data=f"adminunban_{uid}")],
+    ])
+
+
+async def _notify_user_ban_state(client, uid, permanent):
+    """يُشعر المستخدم بحالته الجديدة (حظر دائم/تحذيري) مع شاشة التعهّد إن أمكن."""
+    try:
+        ulang = subdb.get_user_language(uid)
+        if permanent:
+            await client.send_message(uid, t('banned_permanent', ulang))
+        else:
+            text, kb = _banned_block_content(uid, ulang)
+            await client.send_message(uid, text, reply_markup=kb)
+    except Exception:
+        pass
+
+
+@app.on_callback_query(filters.regex(r'^permban_'))
+async def handle_admin_permban(client, callback_query):
+    """حظر دائم لمستخدم (زر أدمن في قناة السجلات)."""
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("للمشرفين فقط!", show_alert=True)
+        return
+    try:
+        uid = int(callback_query.data.split('_', 1)[1])
+    except (ValueError, IndexError):
+        return
+    subdb.admin_ban(uid, "حظر دائم من الأدمن", permanent=True)
+    logger.info(f"🔨 الأدمن حظر المستخدم {uid} حظراً دائماً")
+    await callback_query.answer(f"🔨 تم حظر {uid} حظراً دائماً", show_alert=True)
+    await _notify_user_ban_state(client, uid, permanent=True)
+
+
+@app.on_callback_query(filters.regex(r'^warnban_'))
+async def handle_admin_warnban(client, callback_query):
+    """حظر تحذيري (يستطيع المستخدم رفعه بالتعهّد) — زر أدمن."""
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("للمشرفين فقط!", show_alert=True)
+        return
+    try:
+        uid = int(callback_query.data.split('_', 1)[1])
+    except (ValueError, IndexError):
+        return
+    subdb.admin_ban(uid, "حظر تحذيري من الأدمن", permanent=False)
+    logger.info(f"⚠️ الأدمن حظر المستخدم {uid} حظراً تحذيرياً")
+    await callback_query.answer(f"⚠️ تم تحذير وحظر {uid} (يمكنه التعهّد)", show_alert=True)
+    await _notify_user_ban_state(client, uid, permanent=False)
+
+
+@app.on_callback_query(filters.regex(r'^adminunban_'))
+async def handle_admin_unban_btn(client, callback_query):
+    """رفع الحظر عن مستخدم (زر أدمن)."""
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("للمشرفين فقط!", show_alert=True)
+        return
+    try:
+        uid = int(callback_query.data.split('_', 1)[1])
+    except (ValueError, IndexError):
+        return
+    if subdb.admin_unban(uid):
+        logger.info(f"✅ الأدمن رفع الحظر عن المستخدم {uid}")
+        await callback_query.answer(f"✅ تم رفع الحظر عن {uid}", show_alert=True)
+        try:
+            await client.send_message(uid, t('pledge_accepted', subdb.get_user_language(uid)))
+        except Exception:
+            pass
+    else:
+        await callback_query.answer(f"ℹ️ {uid} غير محظور", show_alert=True)
 
 
 @app.on_callback_query(filters.regex(r'^show_invite$'))

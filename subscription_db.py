@@ -936,6 +936,23 @@ def admin_unban(user_id) -> bool:
     return row is not None
 
 
+def admin_ban(user_id, reason: str, permanent: bool = False):
+    """حظر من الأدمن. permanent=True يجعله دائماً (لا يُرفع بالتعهّد، الأدمن فقط).
+    permanent=False = حظر تحذيري يستطيع المستخدم رفعه بالتعهّد مرة واحدة."""
+    pledged = bool(permanent)  # دائم → نعتبره "تعهّد مستهلك" فلا يُرفع بالتعهّد
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            INSERT INTO moderation (user_id, banned, reason, strikes, pledged)
+            VALUES (%s, TRUE, %s, 1, %s)
+            ON CONFLICT (user_id) DO UPDATE SET
+                banned = TRUE,
+                reason = EXCLUDED.reason,
+                strikes = moderation.strikes + 1,
+                pledged = EXCLUDED.pledged,
+                updated_at = NOW()
+        ''', (user_id, reason, pledged))
+
+
 def get_banned_users():
     """قائمة المحظورين حالياً: (user_id, reason, strikes)."""
     with db_cursor() as cursor:
