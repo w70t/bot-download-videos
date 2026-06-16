@@ -2468,6 +2468,11 @@ def _gender_label(gender):
     return '👨 رجل' if gender == 'male' else ('👩 امرأة' if gender == 'female' else '— غير محدد')
 
 
+def _user_link(uid, name):
+    """اسم قابل للضغط (أزرق) يفتح محادثة المستخدم حتى بلا يوزر."""
+    return f'<a href="tg://user?id={uid}">{html.escape(str(name or "مستخدم"))}</a>'
+
+
 def _member_header_html(user):
     """رأس موحّد لرسائل العضو في القناة: الاسم + اليوزر + الجنس + المعرّف."""
     uid = user.id
@@ -4341,13 +4346,12 @@ async def handle_subscription_settings(client, callback_query):
             )
             return
         
-        text = "👥 **قائمة المشتركين**\n\n"
-        
+        text = "👥 <b>قائمة المشتركين</b>\n\n"
+
         for idx, sub in enumerate(subscribers[:20], 1):  # أول 20 مشترك
             user_id, username, first_name, end_date, method = sub
-            username_str = f"@{username}" if username else "لا يوجد"
-            name = first_name or "مستخدم"
-            
+            username_str = f"@{html.escape(username)}" if username else "لا يوجد"
+
             # حساب الأيام المتبقية
             if end_date:
                 # PostgreSQL يُرجع datetime object مباشرة، بينما SQLite يُرجع string
@@ -4359,13 +4363,15 @@ async def handle_subscription_settings(client, callback_query):
                 days_str = f"{days_left} يوم" if days_left > 0 else "منتهي"
             else:
                 days_str = "مدى الحياة"
-            
-            text += f"{idx}. {name} ({username_str})\n"
-            text += f"   🆔 `{user_id}` | ⏳ {days_str}\n\n"
-        
-        text += f"\n📊 **إجمالي المشتركين:** {len(subscribers)}"
 
-        await callback_query.message.edit_text(text, reply_markup=_sub_settings_back_kb())
+            text += f"{idx}. {_user_link(user_id, first_name)} ({username_str})\n"
+            text += f"   🆔 <code>{user_id}</code> | ⏳ {days_str}\n\n"
+
+        text += f"\n📊 <b>إجمالي المشتركين:</b> {len(subscribers)}\n"
+        text += "💡 اضغط الاسم (الأزرق) لفتح محادثة المشترك."
+
+        await callback_query.message.edit_text(
+            text, reply_markup=_sub_settings_back_kb(), parse_mode=enums.ParseMode.HTML)
         
     elif action == 'pending_payments':
         payments = subdb.get_pending_payments()
@@ -4397,28 +4403,31 @@ async def handle_subscription_settings(client, callback_query):
         stats = subdb.get_user_stats()
         all_users = subdb.get_all_users()
         
-        text = "📊 **إحصائيات الأعضاء**\n\n"
-        text += f"👥 **إجمالي الأعضاء:** {stats['total']}\n"
-        text += f"💎 **المشتركون:** {stats['subscribed']}\n"
-        text += f"🆓 **العاديون:** {stats['free']}\n\n"
-        
-        # عرض بعض المشتركين مع الأيام المتبقية
+        gs = subdb.get_gender_stats()
+        text = "📊 <b>إحصائيات الأعضاء</b>\n\n"
+        text += f"👥 <b>إجمالي الأعضاء:</b> {stats['total']}\n"
+        text += f"💎 <b>المشتركون:</b> {stats['subscribed']}\n"
+        text += f"🆓 <b>العاديون:</b> {stats['free']}\n"
+        text += f"👤 <b>الجنس:</b> 👨 {gs['male']} | 👩 {gs['female']}\n\n"
+
+        # عرض بعض المشتركين مع الأيام المتبقية (الاسم قابل للضغط)
         if stats['subscribed'] > 0:
             text += "━━━━━━━━━━━━━━━━\n"
-            text += "**المشتركون الحاليون:**\n\n"
-            
+            text += "<b>المشتركون الحاليون:</b>\n\n"
+
             count = 0
             for user in all_users:
                 user_id, username, first_name, is_subscribed, subscription_end = user
                 if is_subscribed:
                     days_left = subdb.get_days_remaining(user_id)
-                    name = first_name or "مستخدم"
-                    text += f"• {name}: {days_left} يوم متبقية\n"
+                    text += f"• {_user_link(user_id, first_name)}: {days_left} يوم متبقية\n"
                     count += 1
                     if count >= 10:  # أول 10 مشتركين
                         break
+            text += "\n💡 اضغط الاسم (الأزرق) لفتح محادثة المشترك."
 
-        await callback_query.message.edit_text(text, reply_markup=_sub_settings_back_kb())
+        await callback_query.message.edit_text(
+            text, reply_markup=_sub_settings_back_kb(), parse_mode=enums.ParseMode.HTML)
     
     elif action == 'recent_users':
         users = subdb.get_recent_users(50)
@@ -4427,22 +4436,21 @@ async def handle_subscription_settings(client, callback_query):
             await callback_query.message.edit_text("📝 **لا يوجد مستخدمون**")
             return
         
-        text = "📊 **آخر 50 مستخدم**\n\n"
-        
+        text = "📊 <b>آخر 50 مستخدم</b>\n\n"
+
         for idx, user in enumerate(users[:50], 1):
             user_id, username, first_name, is_subscribed = user
-            username_str = f"@{username}" if username else "لا يوجد"
-            name = first_name or "مستخدم"
+            username_str = f"@{html.escape(username)}" if username else "لا يوجد"
             status = "💎" if is_subscribed else "🆓"
-            
-            text += f"{idx}. {status} {name} ({username_str})\n"
-            text += f"   🆔 `{user_id}`\n\n"
-        
-        text += f"\n📊 **إجمالي المستخدمين:** {len(users)}\n\n"
-        text += "💡 **لمراسلة أي مستخدم:**\n"
-        text += "استخدم زر 'رسالة خاصة' وأرسل ID المستخدم"
 
-        await callback_query.message.edit_text(text, reply_markup=_sub_settings_back_kb())
+            text += f"{idx}. {status} {_user_link(user_id, first_name)} ({username_str})\n"
+            text += f"   🆔 <code>{user_id}</code>\n\n"
+
+        text += f"\n📊 <b>إجمالي المستخدمين:</b> {len(users)}\n\n"
+        text += "💡 اضغط على اسم أي مستخدم (الأزرق) لفتح محادثته ومراسلته مباشرة — حتى بلا يوزر."
+
+        await callback_query.message.edit_text(
+            text, reply_markup=_sub_settings_back_kb(), parse_mode=enums.ParseMode.HTML)
     
     elif action == 'promote_user':
         await callback_query.message.edit_text(
