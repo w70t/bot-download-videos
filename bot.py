@@ -4063,6 +4063,7 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
         [InlineKeyboardButton("💳 الدفوعات المعلقة", callback_data="sub_pending_payments")],
         [InlineKeyboardButton("📊 إحصائيات الأعضاء", callback_data="sub_member_stats")],
         [InlineKeyboardButton("🔍 بحث عن عضو", callback_data="sub_search_user")],
+        [InlineKeyboardButton("✉️ مراسلة عضو (عبر البوت)", callback_data="msg_direct_user")],
         [InlineKeyboardButton("🚫 معاقبة عضو (حظر/رفع)", callback_data="sub_punish_user")],
         [InlineKeyboardButton("📛 المحظورون", callback_data="sub_banned_list")],
         [InlineKeyboardButton("✏️ ترقية عضو", callback_data="sub_promote_user")],
@@ -4447,7 +4448,9 @@ async def handle_subscription_settings(client, callback_query):
             text += f"   🆔 <code>{user_id}</code>\n\n"
 
         text += f"\n📊 <b>إجمالي المستخدمين:</b> {len(users)}\n\n"
-        text += "💡 اضغط على اسم أي مستخدم (الأزرق) لفتح محادثته ومراسلته مباشرة — حتى بلا يوزر."
+        text += ("💡 اضغط اسم العضو (الأزرق) لفتح ملفه. وإن لم يفتح (عضو بلا يوزر):\n"
+                 "انسخ الـ🆔 (اضغط عليه) ثم استخدم زر «✉️ مراسلة عضو» لمراسلته عبر "
+                 "البوت — يعمل مع الجميع.")
 
         await callback_query.message.edit_text(
             text, reply_markup=_sub_settings_back_kb(), parse_mode=enums.ParseMode.HTML)
