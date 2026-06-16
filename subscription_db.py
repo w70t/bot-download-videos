@@ -87,6 +87,7 @@ def init_db():
     _ensure_bonus_column()
     _ensure_moderation_table()
     _ensure_survey_table()
+    _ensure_questions_tables()
     logger.info("✅ تم تجهيز قاعدة البيانات بنجاح")
 
 
@@ -1028,7 +1029,7 @@ def get_gender_stats():
 
 
 def get_question_stats(version):
-    """إحصائية إجابات سؤال الأدمن للنسخة الحالية: {'yes': n, 'no': n}."""
+    """(قديمة - للتوافق) إحصائية إجابات سؤال واحد حسب النسخة."""
     with db_cursor() as cursor:
         cursor.execute('''
             SELECT q_answer, COUNT(*) FROM member_survey
@@ -1040,3 +1041,113 @@ def get_question_stats(version):
         if a in d:
             d[a] = c
     return d
+
+
+# ═══════════════════════════════════════════════════════════════
+# أسئلة الأعضاء المتعددة - Multiple admin questions
+# ═══════════════════════════════════════════════════════════════
+
+def _ensure_questions_tables():
+    """جداول الأسئلة المتعددة وإجابات الأعضاء، مع ترحيل السؤال القديم الواحد."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS admin_questions (
+                id SERIAL PRIMARY KEY,
+                text TEXT NOT NULL,
+                enabled BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS member_answers (
+                user_id BIGINT NOT NULL,
+                question_id INTEGER NOT NULL,
+                answer TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (user_id, question_id)
+            )
+        ''')
+    # ترحيل السؤال القديم الواحد (إن وُجد ولا توجد أسئلة بعد)
+    try:
+        with db_cursor() as cursor:
+            cursor.execute('SELECT COUNT(*) FROM admin_questions')
+            n = cursor.fetchone()[0]
+        if n == 0:
+            old = (get_setting('member_question', '') or '').strip()
+            if old:
+                add_question(old, get_setting('member_question_enabled', '0') == '1')
+    except Exception:
+        pass
+
+
+def add_question(text, enabled=True):
+    """يضيف سؤالاً جديداً ويرجع معرّفه."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('INSERT INTO admin_questions (text, enabled) VALUES (%s, %s) RETURNING id',
+                       (text, enabled))
+        return cursor.fetchone()[0]
+
+
+def delete_question(qid):
+    """يحذف سؤالاً وكل إجاباته."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('DELETE FROM admin_questions WHERE id = %s', (qid,))
+        cursor.execute('DELETE FROM member_answers WHERE question_id = %s', (qid,))
+
+
+def set_question_enabled(qid, enabled):
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('UPDATE admin_questions SET enabled = %s WHERE id = %s', (enabled, qid))
+
+
+def get_questions():
+    """كل الأسئلة: (id, text, enabled)."""
+    with db_cursor() as cursor:
+        cursor.execute('SELECT id, text, enabled FROM admin_questions ORDER BY id')
+        return cursor.fetchall()
+
+
+def get_unanswered_questions(user_id):
+    """أسئلة مفعّلة لم يجب عليها المستخدم بعد: (id, text)."""
+    with db_cursor() as cursor:
+        cursor.execute('''
+            SELECT q.id, q.text FROM admin_questions q
+            WHERE q.enabled = TRUE AND NOT EXISTS (
+                SELECT 1 FROM member_answers a
+                WHERE a.user_id = %s AND a.question_id = q.id)
+            ORDER BY q.id
+        ''', (user_id,))
+        return cursor.fetchall()
+
+
+def save_question_answer(user_id, qid, answer):
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            INSERT INTO member_answers (user_id, question_id, answer)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (user_id, question_id) DO UPDATE SET answer = EXCLUDED.answer
+        ''', (user_id, qid, answer))
+
+
+def get_question_answer_stats(qid):
+    """إحصائية إجابات سؤال محدد: {'yes': n, 'no': n}."""
+    with db_cursor() as cursor:
+        cursor.execute('SELECT answer, COUNT(*) FROM member_answers WHERE question_id = %s GROUP BY answer',
+                       (qid,))
+        rows = cursor.fetchall()
+    d = {'yes': 0, 'no': 0}
+    for a, c in rows:
+        if a in d:
+            d[a] = c
+    return d
+
+
+def get_member_answers(user_id):
+    """إجابات عضو على كل الأسئلة: (text, answer)."""
+    with db_cursor() as cursor:
+        cursor.execute('''
+            SELECT q.text, a.answer FROM member_answers a
+            JOIN admin_questions q ON a.question_id = q.id
+            WHERE a.user_id = %s ORDER BY a.question_id
+        ''', (user_id,))
+        return cursor.fetchall()
