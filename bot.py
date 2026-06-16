@@ -1033,7 +1033,7 @@ def get_file_size_mb(file_path):
 # لبعض الفيديوهات. الافتراضي عملاء قليلون وسريعون نسبياً.
 _yt_clients_env = os.getenv("YT_PLAYER_CLIENTS", "").strip()
 YT_PLAYER_CLIENTS = [c.strip() for c in _yt_clients_env.split(',') if c.strip()] \
-    or ['default', 'web_safari', 'mweb']
+    or ['default', 'android_vr', 'web_safari', 'mweb']
 
 # عدد أجزاء التحميل المتوازية (يسرّع تحميل يوتيوب/الأجزاء). قيمة معتدلة تتفادى
 # الحظر من المنصة (>16 من نفس الـIP قد يُحظر).
@@ -1862,21 +1862,38 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         
         is_youtube_url = any(m in url.lower() for m in PLATFORM_URL_MARKERS['youtube'])
 
-        def download(use_cookies=True):
+        def download(use_cookies=True, fmt=None):
             o = dict(ydl_opts)
+            if fmt:
+                o['format'] = fmt
             if not use_cookies:
                 o.pop('cookiefile', None)
             with yt_dlp.YoutubeDL(o) as ydl:
                 info = ydl.extract_info(url, download=True)
                 return info, ydl.prepare_filename(info)
 
+        # صيغة متساهلة احتياطية عند فشل المُحدّد الصارم (بلا فلترة ترميز/امتداد)
+        fallback_fmt = 'bestaudio/best' if is_audio else 'bv*+ba/b/best'
+
         try:
             info, file_path = await loop.run_in_executor(None, lambda: download(True))
         except Exception as dl_err:
+            msg = str(dl_err).lower()
             # يوتيوب مع الكوكيز قد يفشل بسبب حجب الصيغ → أعد المحاولة بدون كوكيز
             if ydl_opts.get('cookiefile') and is_youtube_url and _is_youtube_cookie_issue(dl_err):
                 logger.warning("⚠️ فشل تحميل يوتيوب مع الكوكيز، إعادة المحاولة بدون كوكيز...")
-                info, file_path = await loop.run_in_executor(None, lambda: download(False))
+                try:
+                    info, file_path = await loop.run_in_executor(None, lambda: download(False))
+                except Exception as e2:
+                    if 'requested format is not available' in str(e2).lower() or 'no video formats' in str(e2).lower():
+                        logger.warning("⚠️ الصيغة غير متوفرة، إعادة المحاولة بأفضل صيغة متاحة (بلا كوكيز)")
+                        info, file_path = await loop.run_in_executor(None, lambda: download(False, fallback_fmt))
+                    else:
+                        raise
+            # الصيغة المطلوبة غير متوفرة → أعد المحاولة بأفضل صيغة متاحة
+            elif 'requested format is not available' in msg or 'no video formats' in msg:
+                logger.warning("⚠️ الصيغة المطلوبة غير متوفرة، إعادة المحاولة بأفضل صيغة متاحة")
+                info, file_path = await loop.run_in_executor(None, lambda: download(True, fallback_fmt))
             else:
                 raise
 
