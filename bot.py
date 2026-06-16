@@ -339,7 +339,7 @@ def is_adult_url(url):
 
 
 def is_adult_info(info):
-    """فحص بيانات الفيديو بعد الاستخراج (العنوان/الوصف/الفئات)."""
+    """فحص بيانات الفيديو بعد الاستخراج (الحساسية/العنوان/الوصف/الناشر)."""
     if not info:
         return False
     try:
@@ -347,10 +347,69 @@ def is_adult_info(info):
             return True
     except (TypeError, ValueError):
         pass
-    parts = [info.get('title'), info.get('description'), info.get('uploader')]
+    # علم الحساسية في X/تويتر ومنصات أخرى
+    if info.get('possibly_sensitive') or info.get('is_nsfw') or info.get('nsfw'):
+        return True
+    parts = [info.get('title'), info.get('description'), info.get('uploader'),
+             info.get('uploader_id'), info.get('channel'), info.get('uploader_url')]
     parts.extend(info.get('categories') or [])
     parts.extend(info.get('tags') or [])
     return any(_text_has_adult_keyword(p) for p in parts)
+
+
+def _blocked_accounts():
+    """مجموعة الحسابات المحظورة (يديرها الأدمن، مفصولة بفواصل)."""
+    raw = subdb.get_setting('blocked_accounts', '') or ''
+    return {x.strip().lower().lstrip('@') for x in raw.split(',') if x.strip()}
+
+
+def _handle_from_url(url):
+    """يستخرج اسم الحساب من رابط X/تويتر (x.com/<handle>/status/...)."""
+    try:
+        p = urlparse(url if '://' in url else 'http://' + url)
+        host = (p.hostname or '').lower()
+        if not any(h in host for h in ('x.com', 'twitter.com')):
+            return None
+        parts = [x for x in p.path.split('/') if x]
+        if parts and parts[0].lower() not in ('i', 'status', 'home', 'search'):
+            return parts[0].lstrip('@').lower()
+    except Exception:
+        pass
+    return None
+
+
+def is_blocked_url(url):
+    """حظر مبكر (قبل الاستخراج) حسب اسم الحساب في رابط X/تويتر."""
+    h = _handle_from_url(url)
+    return bool(h and h in _blocked_accounts())
+
+
+def _account_identifiers(info):
+    """يجمع معرّفات الناشر الممكنة من معلومات الفيديو (للمطابقة مع قائمة الحظر)."""
+    ids = set()
+    if not info:
+        return ids
+    for key in ('uploader_id', 'uploader', 'channel_id', 'channel', 'creator',
+                'uploader_url', 'channel_url', 'webpage_url'):
+        v = info.get(key)
+        if not v:
+            continue
+        s = str(v).strip().lower().lstrip('@')
+        if s:
+            ids.add(s)
+            if '/' in s:  # استخرج اسم الحساب من نهاية الرابط
+                tail = s.rstrip('/').split('/')[-1]
+                if tail:
+                    ids.add(tail.lstrip('@'))
+    return ids
+
+
+def is_blocked_account(info):
+    """هل ناشر هذا المحتوى ضمن قائمة الحسابات المحظورة؟"""
+    blocked = _blocked_accounts()
+    if not blocked:
+        return False
+    return bool(_account_identifiers(info) & blocked)
 
 
 def adult_filter_enabled():
@@ -1133,7 +1192,15 @@ async def forward_to_log_channel(client, message, sent_message, user_id, user_na
             platform, icon = 'TikTok', '🎵'
         else:
             platform, icon = 'رابط', '🔗'
-        
+
+        # حساب المصدر (الناشر) — يساعد الأدمن على حظره بـ /blockacc إن لزم
+        src_account = ''
+        if video_info:
+            acc = video_info.get('uploader_id') or video_info.get('uploader') \
+                or video_info.get('channel')
+            if acc:
+                src_account = f"\n👤 الحساب: <code>{html.escape(str(acc).lstrip('@'))}</code>"
+
         # Views formatting
         views = video_info.get('view_count', 'N/A') if video_info else 'N/A'
         if isinstance(views, int):
@@ -1158,7 +1225,7 @@ async def forward_to_log_channel(client, message, sent_message, user_id, user_na
 ╠═ اليوزر: {username_text}  
 ╚═ ID: <code>{user_id}</code>
 
-🔗 المصدر: {icon} {platform}
+🔗 المصدر: {icon} {platform}{src_account}
 📎 {html.escape(url)}
 
 🎞️ العنوان
@@ -1241,6 +1308,12 @@ async def process_download_from_queue(task: DownloadTask):
         # 🔞 حظر المحتوى الإباحي بعد الاستخراج (مسار قائمة الانتظار)
         if adult_filter_enabled() and is_adult_info(info):
             logger.info(f"🔞 Blocked adult content (queue) from user {user_id}: {info.get('title')}")
+            await status.edit_text(t('adult_blocked', lang))
+            return
+
+        # 🚫 حظر حساب محظور من قبل الأدمن (حسب الناشر)
+        if is_blocked_account(info):
+            logger.info(f"🚫 Blocked account content (queue) from user {user_id}: {info.get('uploader')}")
             await status.edit_text(t('adult_blocked', lang))
             return
 
@@ -1735,7 +1808,14 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                 info, file_path = await loop.run_in_executor(None, lambda: download(False))
             else:
                 raise
-        
+
+        # 🔞 شبكة أمان: امنع المحتوى الحساس/المحظور قبل الرفع (يغطي القوائم وإعادة
+        # التحميل وأي مسار)، حتى لو فات الفحص الأول. لا نرفعه ولا نخزّنه في الكاش.
+        if (adult_filter_enabled() and is_adult_info(info)) or is_blocked_account(info):
+            logger.info(f"🚫 Blocked at download stage for user {user_id}: {info.get('uploader')}")
+            await status_msg.edit_text(t('adult_blocked', lang))
+            return
+
         # ⚠️ إذا كان تحميل صوتي، FFmpegExtractAudio يغير الامتداد إلى .mp3
         # لذلك نحتاج إلى تحديث file_path للملف الحقيقي
         if is_audio:
@@ -2136,6 +2216,57 @@ async def cmd_dlstats(client, message):
           cache_hits=cache['hits'], cache_items=cache['items'],
           platforms=platforms, top_users=top_users)
     )
+
+
+@app.on_message(filters.command("blockacc"))
+async def cmd_blockacc(client, message):
+    """حظر حساب (X/تويتر أو غيره) ليُرفض كل محتواه. للأدمن فقط."""
+    if not is_admin(message.from_user.id):
+        return
+    parts = getattr(message, 'command', []) or []
+    if len(parts) < 2:
+        await message.reply_text("الاستخدام: /blockacc <اسم الحساب أو معرّفه>\nمثال: /blockacc someuser")
+        return
+    acc = parts[1].strip().lstrip('@').lower()
+    added = _add_to_setting_list('blocked_accounts', acc)
+    await message.reply_text(
+        (f"✅ تم حظر الحساب: <code>{html.escape(acc)}</code>\nلن يُسمح بتحميل أي محتوى منه."
+         if added else f"ℹ️ الحساب محظور مسبقاً: <code>{html.escape(acc)}</code>"),
+        parse_mode=enums.ParseMode.HTML
+    )
+
+
+@app.on_message(filters.command("unblockacc"))
+async def cmd_unblockacc(client, message):
+    """رفع الحظر عن حساب. للأدمن فقط."""
+    if not is_admin(message.from_user.id):
+        return
+    parts = getattr(message, 'command', []) or []
+    if len(parts) < 2:
+        await message.reply_text("الاستخدام: /unblockacc <اسم الحساب>")
+        return
+    acc = parts[1].strip().lstrip('@').lower()
+    raw = subdb.get_setting('blocked_accounts', '') or ''
+    items = [x.strip() for x in raw.split(',') if x.strip()]
+    new_items = [x for x in items if x.lower().lstrip('@') != acc]
+    if len(new_items) == len(items):
+        await message.reply_text(f"ℹ️ الحساب ليس في قائمة الحظر: {acc}")
+        return
+    subdb.set_setting('blocked_accounts', ','.join(new_items))
+    await message.reply_text(f"✅ تم رفع الحظر عن: {acc}")
+
+
+@app.on_message(filters.command("blockedaccs"))
+async def cmd_blockedaccs(client, message):
+    """عرض قائمة الحسابات المحظورة. للأدمن فقط."""
+    if not is_admin(message.from_user.id):
+        return
+    accs = sorted(_blocked_accounts())
+    if not accs:
+        await message.reply_text("📋 لا توجد حسابات محظورة.\nأضِف حساباً بـ: /blockacc <الحساب>")
+        return
+    body = "\n".join(f"  • {a}" for a in accs)
+    await message.reply_text(f"📋 **الحسابات المحظورة ({len(accs)}):**\n{body}\n\nلرفع الحظر: /unblockacc <الحساب>")
 
 
 @app.on_message(filters.text & filters.regex(
@@ -2917,6 +3048,12 @@ async def handle_url(client, message):
     # 🔞 حظر المحتوى الإباحي قبل أي معالجة (فحص النطاق/الرابط)
     if adult_filter_enabled() and is_adult_url(url):
         logger.info(f"🔞 Blocked adult URL from user {user_id}: {_url_host(url)}")
+        await message.reply_text(t('adult_blocked', lang))
+        return
+
+    # 🚫 حظر حساب X/تويتر محظور (قبل الاستخراج، يشمل إعادة الإرسال من الكاش)
+    if is_blocked_url(url):
+        logger.info(f"🚫 Blocked account URL from user {user_id}: {_handle_from_url(url)}")
         await message.reply_text(t('adult_blocked', lang))
         return
 
