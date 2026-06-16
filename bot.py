@@ -2042,7 +2042,7 @@ async def _process_referral_start(client, message, new_user_id):
 
 
 async def _show_history(client, message):
-    """يعرض آخر تحميلات المستخدم."""
+    """يعرض آخر تحميلات المستخدم كأزرار؛ الضغط يعيد الإرسال فوراً من الكاش."""
     user_id = message.from_user.id
     lang = subdb.get_user_language(user_id)
     rows = subdb.get_user_history(user_id, 10)
@@ -2050,13 +2050,36 @@ async def _show_history(client, message):
         await message.reply_text(t('history_empty', lang))
         return
     qmap = {'best': '1080p', 'medium': '720p', '480': '480p', '360': '360p', 'audio': 'MP3'}
-    lines = [t('history_title', lang)]
-    for i, (title, quality, kind, created) in enumerate(rows, 1):
+    buttons = []
+    for hid, title, quality, kind, created, url in rows:
         qd = 'MP3' if kind == 'audio' else qmap.get(quality, quality or '')
-        date = created.strftime('%Y-%m-%d %H:%M') if hasattr(created, 'strftime') else str(created)
-        lines.append(t('history_item', lang, idx=i, title=(title or 'فيديو')[:60],
-                       date=date, quality=qd))
-    await message.reply_text("\n".join(lines))
+        label = f"{(title or 'فيديو')[:35]} • {qd}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"redl_{hid}")])
+    await message.reply_text(
+        t('history_title', lang) + "\n" + t('history_tap_hint', lang),
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+@app.on_callback_query(filters.regex(r'^redl_'))
+async def handle_redownload(client, callback_query):
+    """يعيد إرسال فيديو من السجل: فوراً من الكاش إن وُجد، وإلا يحمّله من جديد."""
+    await callback_query.answer()
+    user_id = callback_query.from_user.id
+    lang = subdb.get_user_language(user_id)
+    try:
+        history_id = int(callback_query.data.replace('redl_', ''))
+    except ValueError:
+        return
+    item = subdb.get_history_item(history_id, user_id)
+    if not item or not item.get('url'):
+        await callback_query.message.reply_text(
+            t('error_occurred', lang, error="not found")
+        )
+        return
+    # download_and_upload يفحص الكاش أولاً (إرسال فوري) وإلا يحمّل من جديد
+    await download_and_upload(client, callback_query.message,
+                             item['url'], item['quality'] or 'best', callback_query)
 
 
 async def _build_invite_text(client, user_id, lang):

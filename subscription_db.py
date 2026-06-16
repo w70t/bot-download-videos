@@ -711,16 +711,30 @@ def add_download_history(user_id, url, title, quality, kind, platform,
 
 
 def get_user_history(user_id, limit=10):
-    """آخر تحميلات المستخدم: (title, quality, kind, created_at)."""
+    """آخر تحميلات المستخدم: (id, title, quality, kind, created_at, url)."""
     with db_cursor() as cursor:
         cursor.execute('''
-            SELECT title, quality, kind, created_at
+            SELECT id, title, quality, kind, created_at, url
             FROM download_history
             WHERE user_id = %s
             ORDER BY id DESC
             LIMIT %s
         ''', (user_id, limit))
         return cursor.fetchall()
+
+
+def get_history_item(history_id, user_id):
+    """يرجع عنصر سجل واحد يملكه المستخدم (للتأكد من الملكية قبل إعادة الإرسال)."""
+    with db_cursor() as cursor:
+        cursor.execute('''
+            SELECT url, quality, kind, title
+            FROM download_history
+            WHERE id = %s AND user_id = %s
+        ''', (history_id, user_id))
+        row = cursor.fetchone()
+    if not row:
+        return None
+    return {'url': row[0], 'quality': row[1], 'kind': row[2], 'title': row[3]}
 
 
 def get_download_stats():
