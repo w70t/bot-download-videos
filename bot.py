@@ -310,6 +310,40 @@ def _add_to_setting_list(key, value):
     return True
 
 
+def _remove_from_setting_list(key, index):
+    """يحذف عنصراً واحداً من قائمة إعداد حسب فهرسه. يرجع القيمة المحذوفة أو None."""
+    raw = subdb.get_setting(key, '') or ''
+    items = [x.strip() for x in raw.split(',') if x.strip()]
+    if 0 <= index < len(items):
+        removed = items.pop(index)
+        subdb.set_setting(key, ','.join(items))
+        return removed
+    return None
+
+
+def _blocked_list_view():
+    """يبني (نص، أزرار) القائمة المحظورة المخصصة مع زر حذف خاص لكل عنصر."""
+    domains = _custom_adult_domains()
+    keywords = _custom_adult_keywords()
+    text = "📋 **القائمة المحظورة المخصصة**\n\nاضغط 🗑️ بجانب أي عنصر لحذفه وحده.\n"
+    rows = []
+    if domains:
+        text += "\n🌐 **المواقع:**\n" + "\n".join(f"• `{d}`" for d in domains) + "\n"
+        for i, d in enumerate(domains):
+            rows.append([InlineKeyboardButton(f"🗑️ 🌐 {d[:40]}", callback_data=f"sub_deldom_{i}")])
+    if keywords:
+        text += "\n🔤 **الكلمات:**\n" + "\n".join(f"• `{k}`" for k in keywords) + "\n"
+        for i, k in enumerate(keywords):
+            rows.append([InlineKeyboardButton(f"🗑️ 🔤 {k[:40]}", callback_data=f"sub_delkw_{i}")])
+    if not domains and not keywords:
+        text += "\n— لا يوجد عناصر مخصصة —\n"
+    text += f"\n💡 النطاقات/الكلمات المدمجة مسبقاً ({len(ADULT_DOMAINS)} موقع) مفعّلة دائماً."
+    if domains or keywords:
+        rows.append([InlineKeyboardButton("🗑️ مسح الكل", callback_data="sub_clear_blocked")])
+    rows.append([InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")])
+    return text, InlineKeyboardMarkup(rows)
+
+
 def _host_is_adult(host):
     """هل المضيف ينتمي لنطاق إباحي معروف (يشمل النطاقات الفرعية)؟"""
     if not host:
@@ -4029,20 +4063,24 @@ async def handle_subscription_settings(client, callback_query):
         return
 
     if action == 'list_blocked':
-        domains = _custom_adult_domains()
-        keywords = _custom_adult_keywords()
-        text = "📋 **القائمة المحظورة المخصصة**\n\n"
-        text += "🌐 **المواقع:**\n"
-        text += ("\n".join(f"• `{d}`" for d in domains) if domains else "— لا يوجد —") + "\n\n"
-        text += "🔤 **الكلمات:**\n"
-        text += ("\n".join(f"• `{k}`" for k in keywords) if keywords else "— لا يوجد —")
-        text += "\n\n💡 النطاقات/الكلمات المدمجة مسبقاً ({} موقع) مفعّلة دائماً.".format(len(ADULT_DOMAINS))
-        kb_rows = []
-        if domains or keywords:
-            kb_rows.append([InlineKeyboardButton("🗑️ مسح القائمة المخصصة", callback_data="sub_clear_blocked")])
-        kb_rows.append([InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")])
-        await callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb_rows))
+        text, kb = _blocked_list_view()
+        await callback_query.message.edit_text(text, reply_markup=kb)
         await callback_query.answer()
+        return
+
+    if action.startswith('deldom_') or action.startswith('delkw_'):
+        key = 'adult_custom_domains' if action.startswith('deldom_') else 'adult_custom_keywords'
+        try:
+            idx = int(action.split('_', 1)[1])
+        except (ValueError, IndexError):
+            idx = -1
+        removed = _remove_from_setting_list(key, idx)
+        await callback_query.answer(f"🗑️ حُذف: {removed}" if removed else "تعذّر الحذف")
+        text, kb = _blocked_list_view()
+        try:
+            await callback_query.message.edit_text(text, reply_markup=kb)
+        except Exception:
+            pass
         return
 
     if action == 'clear_blocked':
