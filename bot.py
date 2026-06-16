@@ -344,6 +344,27 @@ def _blocked_list_view():
     return text, InlineKeyboardMarkup(rows)
 
 
+def _banned_list_view():
+    """يبني (نص، أزرار) قائمة المحظورين: لكل واحد الاسم والمعرّف والجنس + زر رفع حظر."""
+    rows_data = subdb.get_banned_users()
+    if not rows_data:
+        return ("✅ لا يوجد مستخدمون محظورون حالياً.",
+                InlineKeyboardMarkup([[InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")]]))
+    text = f"🚫 **المحظورون ({len(rows_data)})**\n\n"
+    kb = []
+    for uid, reason, strikes in rows_data[:30]:
+        u = subdb.find_user_by_id(uid)
+        name = (u[2] if u and len(u) > 2 else None) or "مستخدم"
+        gender = _gender_label(subdb.get_survey(uid).get('gender'))
+        text += f"👤 {name} | 🆔 `{uid}` | {gender} | مخالفات: {strikes}\n"
+        kb.append([InlineKeyboardButton(f"✅ رفع حظر: {name[:18]} ({uid})",
+                                        callback_data=f"sub_unbanlist_{uid}")])
+    if len(rows_data) > 30:
+        text += f"\n… و{len(rows_data) - 30} آخرين."
+    kb.append([InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")])
+    return text, InlineKeyboardMarkup(kb)
+
+
 def _host_is_adult(host):
     """هل المضيف ينتمي لنطاق إباحي معروف (يشمل النطاقات الفرعية)؟"""
     if not host:
@@ -4017,6 +4038,7 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
         [InlineKeyboardButton("📊 إحصائيات الأعضاء", callback_data="sub_member_stats")],
         [InlineKeyboardButton("🔍 بحث عن عضو", callback_data="sub_search_user")],
         [InlineKeyboardButton("🚫 معاقبة عضو (حظر/رفع)", callback_data="sub_punish_user")],
+        [InlineKeyboardButton("📛 المحظورون", callback_data="sub_banned_list")],
         [InlineKeyboardButton("✏️ ترقية عضو", callback_data="sub_promote_user")],
         [InlineKeyboardButton("❌ إلغاء ترقية", callback_data="sub_demote_user")],
         [InlineKeyboardButton("📢 إرسال رسالة جماعية", callback_data="sub_broadcast")]
@@ -4177,6 +4199,32 @@ async def handle_subscription_settings(client, callback_query):
         await callback_query.answer(
             "🔔 تم تفعيل السؤال" if new_state == '1' else "🔕 تم إيقاف السؤال",
             show_alert=True)
+        return
+
+    if action == 'banned_list':
+        text, kb = _banned_list_view()
+        await callback_query.message.edit_text(text, reply_markup=kb)
+        await callback_query.answer()
+        return
+
+    if action.startswith('unbanlist_'):
+        try:
+            uid = int(action.split('_', 1)[1])
+        except (ValueError, IndexError):
+            uid = None
+        if uid and subdb.admin_unban(uid):
+            await callback_query.answer(f"✅ رُفع الحظر عن {uid}")
+            try:
+                await client.send_message(uid, t('pledge_accepted', subdb.get_user_language(uid)))
+            except Exception:
+                pass
+        else:
+            await callback_query.answer("ℹ️ غير محظور")
+        text, kb = _banned_list_view()
+        try:
+            await callback_query.message.edit_text(text, reply_markup=kb)
+        except Exception:
+            pass
         return
 
     if action == 'punish_user':
