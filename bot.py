@@ -3162,19 +3162,33 @@ async def handle_backup_restore(client, message):
         return
     doc = message.document
     name = (getattr(doc, 'file_name', '') or '').lower()
-    if not (name.endswith('.json') and 'backup' in name):
+    is_json = name.endswith('.json') and 'backup' in name
+    is_sql = name.endswith('.sql')
+    if not (is_json or is_sql):
         return  # ليس ملف نسخة احتياطية
     status = await message.reply_text("⏳ **جاري استعادة البيانات من الملف...**")
     path = None
     try:
         path = await message.download()
         loop = asyncio.get_event_loop()
-        ok, result = await loop.run_in_executor(None, lambda: pg_backup.restore_from_json(path))
-        if ok:
-            summary = "\n".join(f"• {tbl}: {cnt} صف" for tbl, cnt in result.items()) or "—"
-            await status.edit_text(f"✅ **تمت الاستعادة بنجاح:**\n{summary}")
+        if is_sql:
+            ok, result = await loop.run_in_executor(None, lambda: pg_backup.restore_from_sql(path))
+            if ok:
+                await status.edit_text(
+                    "✅ **تم استيراد ملف SQL.**\n"
+                    "تحقّق من قائمة الأعضاء/الإحصائيات للتأكد.\n\n"
+                    f"<code>{html.escape(str(result)[:400])}</code>",
+                    parse_mode=enums.ParseMode.HTML
+                )
+            else:
+                await status.edit_text(f"❌ **فشل استيراد SQL:** {result}")
         else:
-            await status.edit_text(f"❌ **فشلت الاستعادة:** {result}")
+            ok, result = await loop.run_in_executor(None, lambda: pg_backup.restore_from_json(path))
+            if ok:
+                summary = "\n".join(f"• {tbl}: {cnt} صف" for tbl, cnt in result.items()) or "—"
+                await status.edit_text(f"✅ **تمت الاستعادة بنجاح:**\n{summary}")
+            else:
+                await status.edit_text(f"❌ **فشلت الاستعادة:** {result}")
     except Exception as e:
         logger.error(f"❌ خطأ في استعادة النسخة: {e}", exc_info=True)
         await status.edit_text(f"❌ خطأ في الاستعادة: {str(e)[:200]}")

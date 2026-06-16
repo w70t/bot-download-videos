@@ -282,11 +282,43 @@ def restore_from_json(filepath):
         return False, str(e)
 
 
+def restore_from_sql(filepath):
+    """يستورد ملف نسخة احتياطية SQL (ناتج pg_dump) عبر psql.
+    يتخطّى الأخطاء (ON_ERROR_STOP=0) فيستورد ما يمكن دون توقّف.
+
+    Returns:
+        tuple: (success: bool, message: str)
+    """
+    try:
+        env = os.environ.copy()
+        if POSTGRES_CONFIG['password']:
+            env['PGPASSWORD'] = POSTGRES_CONFIG['password']
+        cmd = [
+            'psql',
+            '-h', POSTGRES_CONFIG['host'],
+            '-p', str(POSTGRES_CONFIG['port']),
+            '-U', POSTGRES_CONFIG['user'],
+            '-d', POSTGRES_CONFIG['database'],
+            '-v', 'ON_ERROR_STOP=0',
+            '-f', filepath,
+        ]
+        logger.info(f"♻️ استيراد SQL عبر psql: {filepath}")
+        result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=300)
+        output = ((result.stdout or '') + '\n' + (result.stderr or '')).strip()
+        # psql مع ON_ERROR_STOP=0 يرجع 0 حتى مع تخطّي بعض الأخطاء
+        return True, (output[-600:] if output else 'تم تنفيذ الاستيراد')
+    except FileNotFoundError:
+        return False, "psql غير مثبّت على الجهاز"
+    except subprocess.TimeoutExpired:
+        return False, "انتهت مهلة الاستيراد"
+    except Exception as e:
+        logger.error(f"❌ خطأ في restore_from_sql: {e}")
+        return False, str(e)
+
+
 if __name__ == "__main__":
     # اختبار النظام
     logging.basicConfig(level=logging.INFO)
-    
-    print("🧪 اختبار نظام النسخ الاحتياطي...")
     success, result = create_backup()
     
     if success:
