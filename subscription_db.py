@@ -86,6 +86,7 @@ def init_db():
     _ensure_referrals_table()
     _ensure_bonus_column()
     _ensure_moderation_table()
+    _ensure_survey_table()
     logger.info("✅ تم تجهيز قاعدة البيانات بنجاح")
 
 
@@ -961,3 +962,81 @@ def get_banned_users():
             WHERE banned = TRUE ORDER BY updated_at DESC
         ''')
         return cursor.fetchall()
+
+
+# ═══════════════════════════════════════════════════════════════
+# استبيان الأعضاء - Member survey (الجنس + سؤال الأدمن نعم/لا)
+# ═══════════════════════════════════════════════════════════════
+
+def _ensure_survey_table():
+    """ينشئ جدول استبيان الأعضاء إن لم يكن موجوداً."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS member_survey (
+                user_id BIGINT PRIMARY KEY,
+                gender TEXT,
+                q_answer TEXT,
+                q_version INTEGER DEFAULT -1,
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+
+
+def get_survey(user_id):
+    """يرجع {gender, q_answer, q_version} للمستخدم (قيم افتراضية إن لم يوجد)."""
+    with db_cursor() as cursor:
+        cursor.execute(
+            'SELECT gender, q_answer, q_version FROM member_survey WHERE user_id = %s',
+            (user_id,))
+        row = cursor.fetchone()
+    if not row:
+        return {'gender': None, 'q_answer': None, 'q_version': -1}
+    return {'gender': row[0], 'q_answer': row[1],
+            'q_version': row[2] if row[2] is not None else -1}
+
+
+def set_gender(user_id, gender):
+    """يحفظ جنس المستخدم (male/female)."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            INSERT INTO member_survey (user_id, gender) VALUES (%s, %s)
+            ON CONFLICT (user_id) DO UPDATE SET gender = EXCLUDED.gender, updated_at = NOW()
+        ''', (user_id, gender))
+
+
+def set_question_answer(user_id, answer, version):
+    """يحفظ إجابة المستخدم على سؤال الأدمن مع رقم نسخة السؤال."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            INSERT INTO member_survey (user_id, q_answer, q_version) VALUES (%s, %s, %s)
+            ON CONFLICT (user_id) DO UPDATE SET
+                q_answer = EXCLUDED.q_answer, q_version = EXCLUDED.q_version, updated_at = NOW()
+        ''', (user_id, answer, version))
+
+
+def get_gender_stats():
+    """إحصائية الجنس: {'male': n, 'female': n}."""
+    with db_cursor() as cursor:
+        cursor.execute(
+            'SELECT gender, COUNT(*) FROM member_survey WHERE gender IS NOT NULL GROUP BY gender')
+        rows = cursor.fetchall()
+    d = {'male': 0, 'female': 0}
+    for g, c in rows:
+        if g in d:
+            d[g] = c
+    return d
+
+
+def get_question_stats(version):
+    """إحصائية إجابات سؤال الأدمن للنسخة الحالية: {'yes': n, 'no': n}."""
+    with db_cursor() as cursor:
+        cursor.execute('''
+            SELECT q_answer, COUNT(*) FROM member_survey
+            WHERE q_version = %s AND q_answer IS NOT NULL GROUP BY q_answer
+        ''', (version,))
+        rows = cursor.fetchall()
+    d = {'yes': 0, 'no': 0}
+    for a, c in rows:
+        if a in d:
+            d[a] = c
+    return d

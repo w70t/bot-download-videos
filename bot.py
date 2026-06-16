@@ -2348,6 +2348,86 @@ async def handle_admin_unban_btn(client, callback_query):
         await callback_query.answer(f"ℹ️ {uid} غير محظور", show_alert=True)
 
 
+# ═══════════════════════════════════════════════════════════════
+# استبيان الأعضاء الإجباري قبل التحميل (الجنس + سؤال الأدمن)
+# ═══════════════════════════════════════════════════════════════
+
+def _member_question_text():
+    return (subdb.get_setting('member_question', '') or '').strip()
+
+
+def _member_question_enabled():
+    return subdb.get_setting('member_question_enabled', '0') == '1' and bool(_member_question_text())
+
+
+def _member_question_version():
+    try:
+        return int(subdb.get_setting('member_question_version', '0'))
+    except (ValueError, TypeError):
+        return 0
+
+
+def _survey_next(user_id):
+    """يرجع 'gender' أو 'question' أو None حسب ما ينقص المستخدم للسماح بالتحميل."""
+    s = subdb.get_survey(user_id)
+    if not s.get('gender'):
+        return 'gender'
+    if _member_question_enabled() and s.get('q_version') != _member_question_version():
+        return 'question'
+    return None
+
+
+def _gender_keyboard(lang):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(t('gender_male', lang), callback_data='gender_male'),
+        InlineKeyboardButton(t('gender_female', lang), callback_data='gender_female'),
+    ]])
+
+
+def _question_keyboard(lang):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(t('answer_yes', lang), callback_data='mq_yes'),
+        InlineKeyboardButton(t('answer_no', lang), callback_data='mq_no'),
+    ]])
+
+
+async def _ask_survey_step(send_func, user_id, lang, step):
+    """يعرض خطوة الاستبيان المطلوبة (send_func = reply_text أو edit_text)."""
+    if step == 'gender':
+        await send_func(t('ask_gender', lang), reply_markup=_gender_keyboard(lang))
+    else:
+        await send_func(_member_question_text(), reply_markup=_question_keyboard(lang))
+
+
+@app.on_callback_query(filters.regex(r'^gender_(male|female)$'))
+async def handle_gender(client, callback_query):
+    """يحفظ جنس العضو ثم ينتقل للسؤال التالي أو ينهي الاستبيان."""
+    await callback_query.answer()
+    uid = callback_query.from_user.id
+    lang = subdb.get_user_language(uid)
+    subdb.set_gender(uid, 'male' if callback_query.data == 'gender_male' else 'female')
+    step = _survey_next(uid)
+    if step:
+        await _ask_survey_step(callback_query.message.edit_text, uid, lang, step)
+    else:
+        await callback_query.message.edit_text(t('survey_done', lang))
+
+
+@app.on_callback_query(filters.regex(r'^mq_(yes|no)$'))
+async def handle_member_question_answer(client, callback_query):
+    """يحفظ إجابة العضو على سؤال الأدمن ثم ينهي الاستبيان."""
+    await callback_query.answer()
+    uid = callback_query.from_user.id
+    lang = subdb.get_user_language(uid)
+    subdb.set_question_answer(uid, 'yes' if callback_query.data == 'mq_yes' else 'no',
+                              _member_question_version())
+    step = _survey_next(uid)
+    if step:
+        await _ask_survey_step(callback_query.message.edit_text, uid, lang, step)
+    else:
+        await callback_query.message.edit_text(t('survey_done', lang))
+
+
 @app.on_callback_query(filters.regex(r'^show_invite$'))
 async def handle_show_invite(client, callback_query):
     """يعرض رابط الدعوة عند الضغط على زر 'ادعُ أصدقاءك'."""
@@ -2376,6 +2456,7 @@ async def cmd_dlstats(client, message):
     lang = subdb.get_user_language(message.from_user.id)
     s = subdb.get_download_stats()
     cache = subdb.get_cache_stats()
+    gs = subdb.get_gender_stats()
     platforms = "\n".join(f"  • {p}: {c}" for p, c in s['platforms']) or "  —"
     top_users = "\n".join(
         f"  • {(name or uid)}: {c}" for uid, name, c in s['top_users']
@@ -2384,6 +2465,7 @@ async def cmd_dlstats(client, message):
         t('dlstats_title', lang, today=s['today'], total=s['total'],
           cache_hits=cache['hits'], cache_items=cache['items'],
           platforms=platforms, top_users=top_users)
+        + f"\n\n👥 **الجنس:** 👨 {gs['male']} | 👩 {gs['female']}"
     )
 
 
@@ -3220,6 +3302,13 @@ async def handle_url(client, message):
         await message.reply_text(ban_text, reply_markup=ban_kb)
         return
 
+    # 📋 استبيان إجباري قبل التحميل (الجنس + سؤال الأدمن) — الأدمن مُعفى
+    if not is_admin(user_id):
+        survey_step = _survey_next(user_id)
+        if survey_step:
+            await _ask_survey_step(message.reply_text, user_id, lang, survey_step)
+            return
+
     # 🔞 محتوى إباحي/حساب محظور → عاقِب المستخدم (حظر + تعهّد)
     if (adult_filter_enabled() and is_adult_url(url)) or is_blocked_url(url):
         logger.info(f"🔞 Adult/blocked URL from user {user_id}: {_url_host(url)}")
@@ -3823,6 +3912,7 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
             InlineKeyboardButton("➕ كلمة محظورة", callback_data="sub_add_keyword"),
         ],
         [InlineKeyboardButton("📋 القائمة المحظورة المخصصة", callback_data="sub_list_blocked")],
+        [InlineKeyboardButton("❓ سؤال للأعضاء", callback_data="sub_member_question")],
         [InlineKeyboardButton("📢 الاشتراك الإجباري", callback_data="sub_fsub")],
         [InlineKeyboardButton("👥 عرض المشتركين", callback_data="sub_view_subscribers")],
         [InlineKeyboardButton("📊 عرض آخر 50 مستخدم", callback_data="sub_recent_users")],
@@ -3924,6 +4014,52 @@ async def handle_subscription_settings(client, callback_query):
             client, callback_query.message,
             user_id=callback_query.from_user.id, edit=True
         )
+        return
+
+    if action == 'member_question':
+        q = _member_question_text()
+        enabled = _member_question_enabled()
+        state = '✅ مُفعّل' if enabled else '❌ متوقف'
+        qs = subdb.get_question_stats(_member_question_version())
+        gs = subdb.get_gender_stats()
+        text = (
+            "❓ **سؤال إجباري للأعضاء (نعم/لا)**\n\n"
+            f"الحالة: {state}\n"
+            f"السؤال الحالي: {q or '— لا يوجد —'}\n\n"
+            f"📊 إجابات السؤال: ✅ نعم {qs['yes']} | ❌ لا {qs['no']}\n"
+            f"👥 الجنس: 👨 {gs['male']} | 👩 {gs['female']}\n\n"
+            "ملاحظة: سؤال الجنس يُطرح دائماً قبل التحميل. هنا تضيف سؤالك الخاص."
+        )
+        rows = [[InlineKeyboardButton("✏️ تعيين/تغيير السؤال", callback_data="sub_setquestion")]]
+        if q:
+            rows.append([InlineKeyboardButton(
+                "🔕 إيقاف السؤال" if enabled else "🔔 تفعيل السؤال",
+                callback_data="sub_mqtoggle")])
+        rows.append([InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")])
+        await callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(rows))
+        await callback_query.answer()
+        return
+
+    if action == 'setquestion':
+        await callback_query.message.edit_text(
+            "✏️ **تعيين سؤال الأعضاء**\n\n"
+            "أرسل نص سؤالك (يُجاب عليه بنعم/لا).\n"
+            "سيُطلب من كل عضو الإجابة عليه قبل التحميل.",
+            reply_markup=_sub_settings_back_kb()
+        )
+        pending_downloads[callback_query.from_user.id] = {'waiting_for': 'set_member_question'}
+        await callback_query.answer()
+        return
+
+    if action == 'mqtoggle':
+        if not _member_question_text():
+            await callback_query.answer("لا يوجد سؤال لتفعيله", show_alert=True)
+            return
+        new_state = '0' if _member_question_enabled() else '1'
+        subdb.set_setting('member_question_enabled', new_state)
+        await callback_query.answer(
+            "🔔 تم تفعيل السؤال" if new_state == '1' else "🔕 تم إيقاف السؤال",
+            show_alert=True)
         return
 
     if action == 'fsub':
@@ -4608,6 +4744,21 @@ async def handle_admin_input(client, message):
                 )
             else:
                 await message.reply_text("ℹ️ لا كلمات جديدة (محظورة مسبقاً أو فارغة).")
+            del pending_downloads[user_id]
+
+        elif waiting_for == 'set_member_question':
+            q = (message.text or '').strip()
+            if not q:
+                await message.reply_text("❌ السؤال فارغ. أرسل نص السؤال.")
+                return
+            subdb.set_setting('member_question', q)
+            subdb.set_setting('member_question_enabled', '1')
+            new_version = int(subdb.get_setting('member_question_version', '0')) + 1
+            subdb.set_setting('member_question_version', str(new_version))
+            await message.reply_text(
+                f"✅ **تم تعيين سؤال الأعضاء وتفعيله:**\n\n{q}\n\n"
+                "سيُطلب من كل عضو الإجابة عليه (نعم/لا) قبل التحميل."
+            )
             del pending_downloads[user_id]
 
         elif waiting_for == 'add_forced_channel':
