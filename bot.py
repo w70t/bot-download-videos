@@ -4016,6 +4016,7 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
         [InlineKeyboardButton("💳 الدفوعات المعلقة", callback_data="sub_pending_payments")],
         [InlineKeyboardButton("📊 إحصائيات الأعضاء", callback_data="sub_member_stats")],
         [InlineKeyboardButton("🔍 بحث عن عضو", callback_data="sub_search_user")],
+        [InlineKeyboardButton("🚫 معاقبة عضو (حظر/رفع)", callback_data="sub_punish_user")],
         [InlineKeyboardButton("✏️ ترقية عضو", callback_data="sub_promote_user")],
         [InlineKeyboardButton("❌ إلغاء ترقية", callback_data="sub_demote_user")],
         [InlineKeyboardButton("📢 إرسال رسالة جماعية", callback_data="sub_broadcast")]
@@ -4176,6 +4177,17 @@ async def handle_subscription_settings(client, callback_query):
         await callback_query.answer(
             "🔔 تم تفعيل السؤال" if new_state == '1' else "🔕 تم إيقاف السؤال",
             show_alert=True)
+        return
+
+    if action == 'punish_user':
+        await callback_query.message.edit_text(
+            "🚫 **معاقبة عضو**\n\n"
+            "أرسل معرّف العضو (ID رقمي) أو `@username`.\n"
+            "ثم اختر: 🔨 حظر دائم / ⚠️ تحذير / ✅ رفع الحظر.",
+            reply_markup=_sub_settings_back_kb()
+        )
+        pending_downloads[callback_query.from_user.id] = {'waiting_for': 'punish_user_id'}
+        await callback_query.answer()
         return
 
     if action == 'fsub':
@@ -4901,6 +4913,30 @@ async def handle_admin_input(client, message):
                 "سيُطلب من كل عضو الإجابة عليه (نعم/لا) قبل التحميل."
             )
             del pending_downloads[user_id]
+
+        elif waiting_for == 'punish_user_id':
+            raw = (message.text or '').strip().lstrip('@')
+            del pending_downloads[user_id]
+            target_uid = None
+            if raw.isdigit():
+                target_uid = int(raw)
+            else:
+                u = subdb.find_user_by_username(raw)
+                if u:
+                    target_uid = u[0]
+            if not target_uid:
+                await message.reply_text("❌ لم أجد المستخدم. أرسل ID رقمي أو @username صحيح.")
+                return
+            info = subdb.get_ban_info(target_uid)
+            if info and info.get('banned'):
+                status = f"🚫 محظور حالياً (مخالفات: {info.get('strikes')})"
+            else:
+                status = "✅ غير محظور"
+            await message.reply_text(
+                f"👤 المستخدم: <code>{target_uid}</code>\nالحالة: {status}\n\nاختر الإجراء:",
+                parse_mode=enums.ParseMode.HTML,
+                reply_markup=_admin_ban_buttons(target_uid)
+            )
 
         elif waiting_for == 'add_forced_channel':
             await add_forced_channel_from_admin(client, message, user_id)
