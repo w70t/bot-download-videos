@@ -1108,15 +1108,19 @@ def get_questions():
 
 
 def get_unanswered_questions(user_id):
-    """أسئلة مفعّلة لم يجب عليها المستخدم بعد: (id, text)."""
+    """أسئلة مفعّلة لم يجب عليها المستخدم بعد، وأُضيفت بعد انضمامه فقط:
+    (id, text). العضو الجديد لا يُسأل الأسئلة القديمة السابقة لانضمامه."""
     with db_cursor() as cursor:
         cursor.execute('''
             SELECT q.id, q.text FROM admin_questions q
-            WHERE q.enabled = TRUE AND NOT EXISTS (
+            WHERE q.enabled = TRUE
+              AND q.created_at >= COALESCE(
+                    (SELECT created_at FROM users WHERE user_id = %s), NOW())
+              AND NOT EXISTS (
                 SELECT 1 FROM member_answers a
                 WHERE a.user_id = %s AND a.question_id = q.id)
             ORDER BY q.id
-        ''', (user_id,))
+        ''', (user_id, user_id))
         return cursor.fetchall()
 
 
