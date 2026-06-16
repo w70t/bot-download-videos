@@ -2443,6 +2443,37 @@ async def _ask_survey_step(send_func, user_id, lang, step):
         await send_func(_member_question_text(), reply_markup=_question_keyboard(lang))
 
 
+async def _post_survey_result(client, user):
+    """ينشر إجابات العضو على الاستبيان في قناة الاستبيان (إن وُجدت) مع زر رد مباشر."""
+    channel_id = get_channel_id('SURVEY_CHANNEL_ID')
+    if not channel_id:
+        return
+    uid = user.id
+    s = subdb.get_survey(uid)
+    gender_txt = ('👨 رجل' if s.get('gender') == 'male'
+                  else '👩 امرأة' if s.get('gender') == 'female' else '—')
+    name = html.escape(str(getattr(user, 'first_name', None) or 'مستخدم'))
+    uname = f"@{html.escape(user.username)}" if getattr(user, 'username', None) else '⚠️ لا يوجد'
+    lines = [
+        "📋 <b>إجابات عضو على الاستبيان</b>\n",
+        f"👤 الاسم: <a href=\"tg://user?id={uid}\">{name}</a>",
+        f"📛 اليوزر: {uname}",
+        f"🆔 ID: <code>{uid}</code>",
+        f"👥 الجنس: {gender_txt}",
+    ]
+    if _member_question_enabled() and s.get('q_answer'):
+        ans = '✅ نعم' if s['q_answer'] == 'yes' else '❌ لا'
+        lines.append(f"❓ {html.escape(_member_question_text())}: {ans}")
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("💬 رد على العضو", callback_data=f"reply_msg_{uid}")
+    ]])
+    try:
+        await client.send_message(channel_id, "\n".join(lines),
+                                  parse_mode=enums.ParseMode.HTML, reply_markup=keyboard)
+    except Exception as e:
+        logger.error(f"❌ تعذّر نشر إجابات الاستبيان للقناة: {e}")
+
+
 @app.on_callback_query(filters.regex(r'^gender_(male|female)$'))
 async def handle_gender(client, callback_query):
     """يحفظ جنس العضو ثم ينتقل للسؤال التالي أو ينهي الاستبيان."""
@@ -2455,6 +2486,7 @@ async def handle_gender(client, callback_query):
         await _ask_survey_step(callback_query.message.edit_text, uid, lang, step)
     else:
         await callback_query.message.edit_text(t('survey_done', lang))
+        await _post_survey_result(client, callback_query.from_user)
 
 
 @app.on_callback_query(filters.regex(r'^mq_(yes|no)$'))
@@ -2470,6 +2502,7 @@ async def handle_member_question_answer(client, callback_query):
         await _ask_survey_step(callback_query.message.edit_text, uid, lang, step)
     else:
         await callback_query.message.edit_text(t('survey_done', lang))
+        await _post_survey_result(client, callback_query.from_user)
 
 
 @app.on_callback_query(filters.regex(r'^show_invite$'))
@@ -4479,8 +4512,16 @@ async def handle_reply_button(client, callback_query):
     conversation_state[clicker_id] = target_id
 
     lang = subdb.get_user_language(clicker_id)
-    await callback_query.message.reply_text(t('type_your_reply', lang))
-    await callback_query.answer()
+    prompt = t('type_your_reply', lang)
+    # نرسل التنبيه في الخاص (يعمل حتى لو ضُغط الزر داخل قناة)
+    try:
+        await client.send_message(clicker_id, prompt)
+    except Exception:
+        try:
+            await callback_query.message.reply_text(prompt)
+        except Exception:
+            pass
+    await callback_query.answer("✍️ اكتب ردّك في خاص البوت", show_alert=True)
 
 
 @app.on_message(
