@@ -3114,6 +3114,93 @@ async def send_database_backup(client, message):
             pass
 
 
+async def _send_backup_to_channel(client, notify_chat=None):
+    """ينشئ نسخة احتياطية JSON كاملة ويرفعها إلى قناة النسخ الاحتياطي."""
+    channel_id = get_channel_id('BACKUP_CHANNEL_ID')
+    if not channel_id:
+        if notify_chat:
+            await client.send_message(notify_chat, "⚠️ لم يُضبط BACKUP_CHANNEL_ID في ملف .env")
+        return False
+    loop = asyncio.get_event_loop()
+    success, result = await loop.run_in_executor(None, lambda: pg_backup.create_json_backup())
+    if not success:
+        logger.error(f"❌ فشل إنشاء نسخة القناة: {result}")
+        if notify_chat:
+            await client.send_message(notify_chat, f"❌ فشل إنشاء النسخة: {result}")
+        return False
+    path = result
+    try:
+        size_kb = os.path.getsize(path) / 1024
+        caption = (
+            "💾 **نسخة احتياطية كاملة (JSON)**\n"
+            f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"💾 {size_kb:.1f} KB\n\n"
+            "♻️ للاستعادة: أعد إرسال هذا الملف إلى البوت (من الأدمن)."
+        )
+        await client.send_document(chat_id=channel_id, document=path, caption=caption)
+        logger.info("✅ تم رفع نسخة احتياطية كاملة لقناة النسخ الاحتياطي")
+        return True
+    except Exception as e:
+        logger.error(f"❌ تعذّر رفع النسخة للقناة: {e}")
+        if notify_chat:
+            await client.send_message(notify_chat, f"❌ تعذّر الرفع للقناة: {e}")
+        return False
+    finally:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+
+@app.on_message(filters.document, group=3)
+async def handle_backup_restore(client, message):
+    """استعادة البيانات عندما يرسل الأدمن ملف نسخة احتياطية JSON."""
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    # لا تتعارض مع رفع الكوكيز
+    if message.from_user.id in waiting_for_cookies:
+        return
+    doc = message.document
+    name = (getattr(doc, 'file_name', '') or '').lower()
+    if not (name.endswith('.json') and 'backup' in name):
+        return  # ليس ملف نسخة احتياطية
+    status = await message.reply_text("⏳ **جاري استعادة البيانات من الملف...**")
+    path = None
+    try:
+        path = await message.download()
+        loop = asyncio.get_event_loop()
+        ok, result = await loop.run_in_executor(None, lambda: pg_backup.restore_from_json(path))
+        if ok:
+            summary = "\n".join(f"• {tbl}: {cnt} صف" for tbl, cnt in result.items()) or "—"
+            await status.edit_text(f"✅ **تمت الاستعادة بنجاح:**\n{summary}")
+        else:
+            await status.edit_text(f"❌ **فشلت الاستعادة:** {result}")
+    except Exception as e:
+        logger.error(f"❌ خطأ في استعادة النسخة: {e}", exc_info=True)
+        await status.edit_text(f"❌ خطأ في الاستعادة: {str(e)[:200]}")
+    finally:
+        if path:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+
+async def _auto_backup_loop(client):
+    """مهمة خلفية: ترفع نسخة احتياطية لقناة النسخ تلقائياً كل فترة."""
+    interval_hours = int(os.getenv("AUTO_BACKUP_HOURS", "12"))
+    if interval_hours <= 0 or not get_channel_id('BACKUP_CHANNEL_ID'):
+        return
+    while True:
+        try:
+            await asyncio.sleep(interval_hours * 3600)
+            await _send_backup_to_channel(client)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"❌ خطأ في النسخ التلقائي: {e}")
+
+
 @app.on_message(filters.command("cookies"))
 async def cookies_panel(client, message):
     """لوحة إدارة الـ cookies (للأدمن فقط)"""
@@ -4066,6 +4153,7 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
         [InlineKeyboardButton("✉️ مراسلة عضو (عبر البوت)", callback_data="msg_direct_user")],
         [InlineKeyboardButton("🚫 معاقبة عضو (حظر/رفع)", callback_data="sub_punish_user")],
         [InlineKeyboardButton("📛 المحظورون", callback_data="sub_banned_list")],
+        [InlineKeyboardButton("💾 نسخة احتياطية للقناة", callback_data="sub_backup_channel")],
         [InlineKeyboardButton("✏️ ترقية عضو", callback_data="sub_promote_user")],
         [InlineKeyboardButton("❌ إلغاء ترقية", callback_data="sub_demote_user")],
         [InlineKeyboardButton("📢 إرسال رسالة جماعية", callback_data="sub_broadcast")]
@@ -4234,6 +4322,16 @@ async def handle_subscription_settings(client, callback_query):
         text, kb = _banned_list_view()
         await callback_query.message.edit_text(text, reply_markup=kb)
         await callback_query.answer()
+        return
+
+    if action == 'backup_channel':
+        await callback_query.answer("⏳ جاري النسخ ورفعه للقناة...", show_alert=False)
+        ok = await _send_backup_to_channel(client, notify_chat=callback_query.from_user.id)
+        if ok:
+            await callback_query.message.reply_text(
+                "✅ تم رفع نسخة احتياطية كاملة لقناة النسخ الاحتياطي.\n"
+                "♻️ للاستعادة لاحقاً: أعد إرسال الملف من القناة إلى البوت."
+            )
         return
 
     if action.startswith('unbanlist_'):
@@ -5456,6 +5554,7 @@ def main():
     loop = asyncio.get_event_loop()
     loop.create_task(daily_report_task())
     loop.create_task(daily_cleanup_task())
+    loop.create_task(_auto_backup_loop(app))  # نسخ احتياطي تلقائي لقناة النسخ
     
     try:
         app.run()

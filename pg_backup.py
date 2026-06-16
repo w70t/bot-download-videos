@@ -17,6 +17,14 @@ from psycopg2.extras import RealDictCursor
 load_dotenv()
 logger = logging.getLogger(__name__)
 
+# كل الجداول التي تُحفظ/تُسترجع (بيانات الأعضاء الكاملة).
+# الترتيب مهم للاسترجاع: users و settings أولاً (مراجع)، ثم البقية.
+BACKUP_TABLES = [
+    'users', 'settings', 'admin_questions', 'forced_channels',
+    'payments', 'daily_downloads', 'moderation', 'member_survey',
+    'member_answers', 'referrals', 'fsub_user_passed', 'media_cache',
+]
+
 # PostgreSQL Configuration
 POSTGRES_CONFIG = {
     'host': os.getenv('POSTGRES_HOST', 'localhost'),
@@ -112,8 +120,8 @@ def create_json_backup():
                 'tables': {}
             }
 
-            # قائمة الجداول المطلوب نسخها
-            tables = ['users', 'payments', 'settings', 'daily_downloads']
+            # قائمة الجداول المطلوب نسخها (كل بيانات الأعضاء)
+            tables = BACKUP_TABLES
 
             for table_name in tables:
                 try:
@@ -203,6 +211,75 @@ def cleanup_old_backups(max_age_hours=24):
             
     except Exception as e:
         logger.error(f"❌ خطأ في cleanup_old_backups: {e}")
+
+
+def restore_from_json(filepath):
+    """يسترجع البيانات من ملف نسخة احتياطية JSON إلى PostgreSQL.
+    يضيف الصفوف الناقصة فقط (ON CONFLICT DO NOTHING) فلا يمسح بيانات موجودة.
+
+    Returns:
+        tuple: (success: bool, restored_counts: dict أو رسالة خطأ)
+    """
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        tables = data.get('tables', {})
+        if not tables:
+            return False, "الملف لا يحتوي بيانات صالحة"
+
+        conn = psycopg2.connect(**POSTGRES_CONFIG)
+        conn.autocommit = True  # كل صف معاملة مستقلة فلا يُفسد الباقي
+        restored = {}
+        try:
+            cursor = conn.cursor()
+            # استرجع بالترتيب الصحيح (المراجع أولاً) وعلى الجداول المعروفة فقط
+            order = [t for t in BACKUP_TABLES if t in tables]
+            for table in order:
+                rows = tables.get(table) or []
+                count = 0
+                for row in rows:
+                    if not isinstance(row, dict) or not row:
+                        continue
+                    cols = list(row.keys())
+                    collist = ', '.join('"%s"' % c for c in cols)
+                    placeholders = ', '.join(['%s'] * len(cols))
+                    values = [row[c] for c in cols]
+                    stmt = sql.SQL('INSERT INTO {} ({}) VALUES ({}) ON CONFLICT DO NOTHING').format(
+                        sql.Identifier(table),
+                        sql.SQL(collist),
+                        sql.SQL(placeholders),
+                    )
+                    try:
+                        cursor.execute(stmt, values)
+                        count += 1
+                    except Exception as row_err:
+                        logger.warning(f"⚠️ تخطّي صف في {table}: {row_err}")
+                restored[table] = count
+                logger.info(f"♻️ استُرجع {count} صف في {table}")
+
+            # إعادة ضبط تسلسلات SERIAL حتى لا تتعارض الإدخالات الجديدة
+            for table, idcol in [('payments', 'payment_id'),
+                                 ('forced_channels', 'id'),
+                                 ('admin_questions', 'id')]:
+                try:
+                    cursor.execute(
+                        "SELECT setval(pg_get_serial_sequence(%s, %s), "
+                        "COALESCE((SELECT MAX(" + idcol + ") FROM " + table + "), 1))",
+                        (table, idcol)
+                    )
+                except Exception:
+                    pass
+        finally:
+            conn.close()
+
+        return True, restored
+    except FileNotFoundError:
+        return False, "الملف غير موجود"
+    except json.JSONDecodeError:
+        return False, "الملف ليس JSON صالحاً"
+    except Exception as e:
+        logger.error(f"❌ خطأ في restore_from_json: {e}")
+        return False, str(e)
 
 
 if __name__ == "__main__":
