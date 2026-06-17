@@ -4161,6 +4161,8 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
     price = subdb.get_setting('subscription_price', '10')
     duration_days = subdb.get_setting('subscription_duration_days', '30')
     stats = subdb.get_user_stats()
+    gs = subdb.get_gender_stats()
+    lc = subdb.get_language_counts()
     adult_on = adult_filter_enabled()
     adult_label = f"🔞 حظر المحتوى الإباحي: {'✅ مُفعّل' if adult_on else '❌ متوقف'}"
     dl_on = downloads_enabled()
@@ -4203,7 +4205,9 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
         f"📊 **الإحصائيات:**\n"
         f"• المجموع: {stats['total']} عضو\n"
         f"• المشتركون: {stats['subscribed']} 💎\n"
-        f"• العاديون: {stats['free']} 🆓\n\n"
+        f"• العاديون: {stats['free']} 🆓\n"
+        f"• 👨 رجال: {gs['male']} | 👩 نساء: {gs['female']}\n"
+        f"• 🇸🇦 عربي: {lc['ar']} | 🇬🇧 إنجليزي: {lc['en']}\n\n"
         f"**اختر الإعداد:**"
     )
 
