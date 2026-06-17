@@ -4161,8 +4161,14 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
     price = subdb.get_setting('subscription_price', '10')
     duration_days = subdb.get_setting('subscription_duration_days', '30')
     stats = subdb.get_user_stats()
-    gs = subdb.get_gender_stats()
-    lc = subdb.get_language_counts()
+    try:
+        gs = subdb.get_gender_stats()
+    except Exception:
+        gs = {'male': 0, 'female': 0}
+    try:
+        lc = subdb.get_language_counts()
+    except Exception:
+        lc = {'ar': 0, 'en': 0}
     adult_on = adult_filter_enabled()
     adult_label = f"🔞 حظر المحتوى الإباحي: {'✅ مُفعّل' if adult_on else '❌ متوقف'}"
     dl_on = downloads_enabled()
