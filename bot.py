@@ -4186,6 +4186,7 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
         [InlineKeyboardButton("✉️ مراسلة عضو (عبر البوت)", callback_data="msg_direct_user")],
         [InlineKeyboardButton("🚫 معاقبة عضو (حظر/رفع)", callback_data="sub_punish_user")],
         [InlineKeyboardButton("📛 المحظورون", callback_data="sub_banned_list")],
+        [InlineKeyboardButton("📨 تذكير غير النشطين", callback_data="sub_remind_inactive")],
         [InlineKeyboardButton("💾 نسخة احتياطية للقناة", callback_data="sub_backup_channel")],
         [InlineKeyboardButton("✏️ ترقية عضو", callback_data="sub_promote_user")],
         [InlineKeyboardButton("❌ إلغاء ترقية", callback_data="sub_demote_user")],
@@ -4373,6 +4374,64 @@ async def handle_subscription_settings(client, callback_query):
     if action == 'banned_list':
         text, kb = _banned_list_view()
         await callback_query.message.edit_text(text, reply_markup=kb)
+        await callback_query.answer()
+        return
+
+    if action == 'remind_inactive':
+        days = int(os.getenv("REMINDER_INACTIVE_DAYS", "7"))
+        inactive = subdb.get_inactive_users(days)
+        if not inactive:
+            await callback_query.answer(f"لا يوجد أعضاء خاملون منذ {days} أيام", show_alert=True)
+            return
+        await callback_query.message.edit_text(
+            f"📨 **تذكير الأعضاء غير النشطين**\n\n"
+            f"⏳ الخمول: ≥ {days} أيام\n"
+            f"👥 العدد: **{len(inactive)}** عضو\n\n"
+            "سيُرسل لكل عضو تذكيراً **بلغته**، ويُحذف تذكيره السابق تلقائياً "
+            "(يبقى الأحدث فقط).",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📨 إرسال التذكير الآن", callback_data="sub_do_remind")],
+                [InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")],
+            ])
+        )
+        await callback_query.answer()
+        return
+
+    if action == 'do_remind':
+        days = int(os.getenv("REMINDER_INACTIVE_DAYS", "7"))
+        inactive = subdb.get_inactive_users(days)
+        progress = await callback_query.message.edit_text(
+            f"📤 جاري إرسال التذكير لـ {len(inactive)} عضو..."
+        )
+        sent_n = fail_n = removed_n = 0
+        for uid, ulang, old_msg in inactive:
+            try:
+                # احذف التذكير السابق ليبقى الأحدث فقط
+                if old_msg:
+                    try:
+                        await client.delete_messages(uid, old_msg)
+                    except Exception:
+                        pass
+                m = await client.send_message(uid, t('reminder_inactive', ulang))
+                subdb.set_last_reminder(uid, m.id)
+                sent_n += 1
+                await asyncio.sleep(0.05)
+            except FloodWait as e:
+                await asyncio.sleep(getattr(e, 'value', 5))
+                fail_n += 1
+            except GONE_USER_ERRORS:
+                try:
+                    subdb.delete_user(uid)
+                    removed_n += 1
+                except Exception:
+                    pass
+                fail_n += 1
+            except Exception:
+                fail_n += 1
+        await progress.edit_text(
+            f"✅ **اكتمل إرسال التذكير**\n\n"
+            f"✅ وصلت: {sent_n}\n❌ فشلت: {fail_n}\n🗑️ حُذفوا (غادروا): {removed_n}"
+        )
         await callback_query.answer()
         return
 

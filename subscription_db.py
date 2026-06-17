@@ -88,6 +88,7 @@ def init_db():
     _ensure_moderation_table()
     _ensure_survey_table()
     _ensure_questions_tables()
+    _ensure_reminder_column()
     logger.info("✅ تم تجهيز قاعدة البيانات بنجاح")
 
 
@@ -1140,6 +1141,36 @@ def get_unanswered_questions(user_id):
             ORDER BY q.id
         ''', (user_id, user_id, user_id))
         return cursor.fetchall()
+
+
+def _ensure_reminder_column():
+    """عمود يحفظ معرّف آخر رسالة تذكير لكل مستخدم (لحذفها قبل إرسال أحدث)."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_reminder_msg_id BIGINT')
+
+
+def get_inactive_users(days=7):
+    """أعضاء خاملون: مرّ على انضمامهم ≥ days ولم يحمّلوا منذ ≥ days (أو أبداً).
+    يرجع (user_id, language, last_reminder_msg_id)."""
+    with db_cursor() as cursor:
+        cursor.execute('''
+            SELECT u.user_id, COALESCE(u.language, 'ar'), u.last_reminder_msg_id
+            FROM users u
+            LEFT JOIN (
+                SELECT user_id, MAX(created_at) AS last_dl
+                FROM download_history GROUP BY user_id
+            ) h ON u.user_id = h.user_id
+            WHERE u.created_at < NOW() - (%s * INTERVAL '1 day')
+              AND (h.last_dl IS NULL OR h.last_dl < NOW() - (%s * INTERVAL '1 day'))
+        ''', (days, days))
+        return cursor.fetchall()
+
+
+def set_last_reminder(user_id, msg_id):
+    """يحفظ معرّف آخر رسالة تذكير أُرسلت للمستخدم."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('UPDATE users SET last_reminder_msg_id = %s WHERE user_id = %s',
+                       (msg_id, user_id))
 
 
 def get_language_counts():
