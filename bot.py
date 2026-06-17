@@ -4358,32 +4358,39 @@ async def handle_admin_input(client, message):
             fail_count = 0
             removed_count = 0
 
-            for user in all_users:
+            total_users = len(all_users)
+            last_progress_edit = 0  # وقت آخر تحديث للعدّاد الحي (لتجنّب حدود تيليجرام)
+
+            for idx, user in enumerate(all_users, 1):
+                uid = user[0]
+
+                # Get each user's preferred language
+                user_lang = subdb.get_user_language(uid)
+
+                # أزرار: نعم / لا + رد للمطور
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(t('btn_yes', user_lang), callback_data=f"bcyes_{bid}"),
+                     InlineKeyboardButton(t('btn_no', user_lang), callback_data=f"bcno_{bid}")],
+                    [InlineKeyboardButton(t('reply_button', user_lang), callback_data=f"reply_msg_{user_id}")],
+                ])
+                text = f"{t('broadcast_message_prefix', user_lang)}\n\n{broadcast_text}"
+
                 try:
-                    # Get each user's preferred language
-                    user_lang = subdb.get_user_language(user[0])
-
-                    # أزرار: نعم / لا + رد للمطور
-                    kb = InlineKeyboardMarkup([
-                        [InlineKeyboardButton(t('btn_yes', user_lang), callback_data=f"bcyes_{bid}"),
-                         InlineKeyboardButton(t('btn_no', user_lang), callback_data=f"bcno_{bid}")],
-                        [InlineKeyboardButton(t('reply_button', user_lang), callback_data=f"reply_msg_{user_id}")],
-                    ])
-
-                    await client.send_message(
-                        chat_id=user[0],  # user_id
-                        text=f"{t('broadcast_message_prefix', user_lang)}\n\n{broadcast_text}",
-                        reply_markup=kb
-                    )
+                    await client.send_message(chat_id=uid, text=text, reply_markup=kb)
                     success_count += 1
                     await asyncio.sleep(0.05)  # تأخير بسيط لتجنب Flood
                 except FloodWait as e:
+                    # تيليجرام يطلب التمهّل → ننتظر ثم نُعيد المحاولة مرة واحدة
                     await asyncio.sleep(getattr(e, 'value', 5))
-                    fail_count += 1
+                    try:
+                        await client.send_message(chat_id=uid, text=text, reply_markup=kb)
+                        success_count += 1
+                    except Exception:
+                        fail_count += 1
                 except GONE_USER_ERRORS:
                     # العضو غادر/حظر البوت → احذفه من قاعدة البيانات
                     try:
-                        subdb.delete_user(user[0])
+                        subdb.delete_user(uid)
                         removed_count += 1
                     except Exception:
                         pass
@@ -4391,6 +4398,23 @@ async def handle_admin_input(client, message):
                 except Exception:
                     # خطأ مؤقت/غير معروف → نُبقي العضو
                     fail_count += 1
+
+                # عدّاد حيّ يتحدّث أثناء الإرسال (مرّة كل 3 ثوانٍ كحدّ أقصى، ودائماً في النهاية)
+                now_ts = time.time()
+                if idx == total_users or (now_ts - last_progress_edit) >= 3:
+                    last_progress_edit = now_ts
+                    done = success_count + fail_count
+                    percent = int(done * 100 / total_users) if total_users else 100
+                    try:
+                        await progress.edit_text(
+                            f"📤 **جاري الإرسال...** ({percent}%)\n\n"
+                            f"👥 المعالَجون: {done} / {total_users}\n"
+                            f"✅ وصلت: {success_count}\n"
+                            f"❌ فشلت: {fail_count}\n"
+                            f"🗑️ حُذفوا (غادروا): {removed_count}"
+                        )
+                    except Exception:
+                        pass
 
             # عدد من وصلتهم الرسالة فعلاً هو الأساس لحساب "لم يتفاعلوا"
             broadcast_polls[bid]['total'] = success_count
@@ -4407,9 +4431,10 @@ async def handle_admin_input(client, message):
             try:
                 await progress.edit_text(
                     f"✅ **اكتمل الإرسال!**\n\n"
-                    f"✅ وصلت إلى: {success_count}\n"
+                    f"👥 الإجمالي: {total_users}\n"
+                    f"✅ وصلت: {success_count}\n"
                     f"❌ فشلت: {fail_count}\n"
-                    f"🗑️ حُذف (غادروا البوت): {removed_count}"
+                    f"🗑️ حُذفوا (غادروا): {removed_count}"
                 )
             except Exception:
                 pass
