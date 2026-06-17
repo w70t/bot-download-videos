@@ -199,7 +199,8 @@ pending_downloads = {}
 pending_playlists = {}
 
 # عدد التحميلات الافتراضي عند الدعوة، وأقصى عدد مقاطع لقائمة التشغيل
-REFERRAL_BONUS = int(os.getenv("REFERRAL_BONUS", "3"))
+# كل دعوة ناجحة تزيد الحد اليومي للداعي بهذا المقدار (دائماً)
+REFERRAL_BONUS = int(os.getenv("REFERRAL_BONUS", "1"))
 PLAYLIST_MAX = int(os.getenv("PLAYLIST_MAX", "5"))
 
 # حالة المحادثة بين الأدمن والأعضاء عبر زر الرد
@@ -310,6 +311,61 @@ def _add_to_setting_list(key, value):
     return True
 
 
+def _remove_from_setting_list(key, index):
+    """يحذف عنصراً واحداً من قائمة إعداد حسب فهرسه. يرجع القيمة المحذوفة أو None."""
+    raw = subdb.get_setting(key, '') or ''
+    items = [x.strip() for x in raw.split(',') if x.strip()]
+    if 0 <= index < len(items):
+        removed = items.pop(index)
+        subdb.set_setting(key, ','.join(items))
+        return removed
+    return None
+
+
+def _blocked_list_view():
+    """يبني (نص، أزرار) القائمة المحظورة المخصصة مع زر حذف خاص لكل عنصر."""
+    domains = _custom_adult_domains()
+    keywords = _custom_adult_keywords()
+    text = "📋 **القائمة المحظورة المخصصة**\n\nاضغط 🗑️ بجانب أي عنصر لحذفه وحده.\n"
+    rows = []
+    if domains:
+        text += "\n🌐 **المواقع:**\n" + "\n".join(f"• `{d}`" for d in domains) + "\n"
+        for i, d in enumerate(domains):
+            rows.append([InlineKeyboardButton(f"🗑️ 🌐 {d[:40]}", callback_data=f"sub_deldom_{i}")])
+    if keywords:
+        text += "\n🔤 **الكلمات:**\n" + "\n".join(f"• `{k}`" for k in keywords) + "\n"
+        for i, k in enumerate(keywords):
+            rows.append([InlineKeyboardButton(f"🗑️ 🔤 {k[:40]}", callback_data=f"sub_delkw_{i}")])
+    if not domains and not keywords:
+        text += "\n— لا يوجد عناصر مخصصة —\n"
+    text += f"\n💡 النطاقات/الكلمات المدمجة مسبقاً ({len(ADULT_DOMAINS)} موقع) مفعّلة دائماً."
+    if domains or keywords:
+        rows.append([InlineKeyboardButton("🗑️ مسح الكل", callback_data="sub_clear_blocked")])
+    rows.append([InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _banned_list_view():
+    """يبني (نص، أزرار) قائمة المحظورين: لكل واحد الاسم والمعرّف والجنس + زر رفع حظر."""
+    rows_data = subdb.get_banned_users()
+    if not rows_data:
+        return ("✅ لا يوجد مستخدمون محظورون حالياً.",
+                InlineKeyboardMarkup([[InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")]]))
+    text = f"🚫 **المحظورون ({len(rows_data)})**\n\n"
+    kb = []
+    for uid, reason, strikes in rows_data[:30]:
+        u = subdb.find_user_by_id(uid)
+        name = (u[2] if u and len(u) > 2 else None) or "مستخدم"
+        gender = _gender_label(subdb.get_survey(uid).get('gender'))
+        text += f"👤 {name} | 🆔 `{uid}` | {gender} | مخالفات: {strikes}\n"
+        kb.append([InlineKeyboardButton(f"✅ رفع حظر: {name[:18]} ({uid})",
+                                        callback_data=f"sub_unbanlist_{uid}")])
+    if len(rows_data) > 30:
+        text += f"\n… و{len(rows_data) - 30} آخرين."
+    kb.append([InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")])
+    return text, InlineKeyboardMarkup(kb)
+
+
 def _host_is_adult(host):
     """هل المضيف ينتمي لنطاق إباحي معروف (يشمل النطاقات الفرعية)؟"""
     if not host:
@@ -339,7 +395,7 @@ def is_adult_url(url):
 
 
 def is_adult_info(info):
-    """فحص بيانات الفيديو بعد الاستخراج (العنوان/الوصف/الفئات)."""
+    """فحص بيانات الفيديو بعد الاستخراج (الحساسية/العنوان/الوصف/الناشر)."""
     if not info:
         return False
     try:
@@ -347,15 +403,79 @@ def is_adult_info(info):
             return True
     except (TypeError, ValueError):
         pass
-    parts = [info.get('title'), info.get('description'), info.get('uploader')]
+    # علم الحساسية في X/تويتر ومنصات أخرى
+    if info.get('possibly_sensitive') or info.get('is_nsfw') or info.get('nsfw'):
+        return True
+    parts = [info.get('title'), info.get('description'), info.get('uploader'),
+             info.get('uploader_id'), info.get('channel'), info.get('uploader_url')]
     parts.extend(info.get('categories') or [])
     parts.extend(info.get('tags') or [])
     return any(_text_has_adult_keyword(p) for p in parts)
 
 
+def _blocked_accounts():
+    """مجموعة الحسابات المحظورة (يديرها الأدمن، مفصولة بفواصل)."""
+    raw = subdb.get_setting('blocked_accounts', '') or ''
+    return {x.strip().lower().lstrip('@') for x in raw.split(',') if x.strip()}
+
+
+def _handle_from_url(url):
+    """يستخرج اسم الحساب من رابط X/تويتر (x.com/<handle>/status/...)."""
+    try:
+        p = urlparse(url if '://' in url else 'http://' + url)
+        host = (p.hostname or '').lower()
+        if not any(h in host for h in ('x.com', 'twitter.com')):
+            return None
+        parts = [x for x in p.path.split('/') if x]
+        if parts and parts[0].lower() not in ('i', 'status', 'home', 'search'):
+            return parts[0].lstrip('@').lower()
+    except Exception:
+        pass
+    return None
+
+
+def is_blocked_url(url):
+    """حظر مبكر (قبل الاستخراج) حسب اسم الحساب في رابط X/تويتر."""
+    h = _handle_from_url(url)
+    return bool(h and h in _blocked_accounts())
+
+
+def _account_identifiers(info):
+    """يجمع معرّفات الناشر الممكنة من معلومات الفيديو (للمطابقة مع قائمة الحظر)."""
+    ids = set()
+    if not info:
+        return ids
+    for key in ('uploader_id', 'uploader', 'channel_id', 'channel', 'creator',
+                'uploader_url', 'channel_url', 'webpage_url'):
+        v = info.get(key)
+        if not v:
+            continue
+        s = str(v).strip().lower().lstrip('@')
+        if s:
+            ids.add(s)
+            if '/' in s:  # استخرج اسم الحساب من نهاية الرابط
+                tail = s.rstrip('/').split('/')[-1]
+                if tail:
+                    ids.add(tail.lstrip('@'))
+    return ids
+
+
+def is_blocked_account(info):
+    """هل ناشر هذا المحتوى ضمن قائمة الحسابات المحظورة؟"""
+    blocked = _blocked_accounts()
+    if not blocked:
+        return False
+    return bool(_account_identifiers(info) & blocked)
+
+
 def adult_filter_enabled():
     """هل فلتر المحتوى الإباحي مُفعّل؟ (افتراضياً مُفعّل)."""
     return subdb.get_setting('block_adult_content', '1') == '1'
+
+
+def downloads_enabled():
+    """هل التحميل مُفعّل للأعضاء؟ (افتراضياً مُفعّل). الأدمن لا يتأثر."""
+    return subdb.get_setting('downloads_enabled', '1') == '1'
 
 
 def generate_video_thumbnail(video_path, duration=None):
@@ -909,7 +1029,16 @@ def get_file_size_mb(file_path):
 
 # عملاء يوتيوب: android_vr لا يتطلب PO token؛ نتجنّب 'tv' لأنه يبلّغ DRM زوراً بدون كوكيز
 # و'web_embedded' يسبب خطأ إعداد. formats=missing_pot يسمح باستخدام الصيغ المحجوبة بلا توكن.
-YT_PLAYER_CLIENTS = ['default', 'android_vr', 'web_safari', 'mweb']
+# عملاء يوتيوب: قابلة للضبط عبر .env (YT_PLAYER_CLIENTS) لموازنة السرعة/النجاح.
+# تقليل العدد يسرّع ظهور أزرار الجودة (كل عميل = طلب شبكة)، لكن قد يقلّل النجاح
+# لبعض الفيديوهات. الافتراضي عملاء قليلون وسريعون نسبياً.
+_yt_clients_env = os.getenv("YT_PLAYER_CLIENTS", "").strip()
+YT_PLAYER_CLIENTS = [c.strip() for c in _yt_clients_env.split(',') if c.strip()] \
+    or ['default', 'android_vr', 'web_safari', 'mweb']
+
+# عدد أجزاء التحميل المتوازية (يسرّع تحميل يوتيوب/الأجزاء). قيمة معتدلة تتفادى
+# الحظر من المنصة (>16 من نفس الـIP قد يُحظر).
+YTDLP_CONCURRENT_FRAGMENTS = max(1, int(os.getenv("YTDLP_CONCURRENT_FRAGMENTS", "4")))
 
 
 def _youtube_extractor_args():
@@ -1097,7 +1226,7 @@ async def forward_to_log_channel(client, message, sent_message, user_id, user_na
         channel_id = get_channel_id('LOG_CHANNEL_ID')
 
         if not channel_id:
-            return
+            return None
         
         # Format username
         username_text = f"@{html.escape(str(username))}" if username else "⚠️ لا يوجد يوزر"
@@ -1124,7 +1253,15 @@ async def forward_to_log_channel(client, message, sent_message, user_id, user_na
             platform, icon = 'TikTok', '🎵'
         else:
             platform, icon = 'رابط', '🔗'
-        
+
+        # حساب المصدر (الناشر) — يساعد الأدمن على حظره بـ /blockacc إن لزم
+        src_account = ''
+        if video_info:
+            acc = video_info.get('uploader_id') or video_info.get('uploader') \
+                or video_info.get('channel')
+            if acc:
+                src_account = f"\n👤 الحساب: <code>{html.escape(str(acc).lstrip('@'))}</code>"
+
         # Views formatting
         views = video_info.get('view_count', 'N/A') if video_info else 'N/A'
         if isinstance(views, int):
@@ -1149,7 +1286,7 @@ async def forward_to_log_channel(client, message, sent_message, user_id, user_na
 ╠═ اليوزر: {username_text}  
 ╚═ ID: <code>{user_id}</code>
 
-🔗 المصدر: {icon} {platform}
+🔗 المصدر: {icon} {platform}{src_account}
 📎 {html.escape(url)}
 
 🎞️ العنوان
@@ -1164,34 +1301,47 @@ async def forward_to_log_channel(client, message, sent_message, user_id, user_na
 🕐 {date_text}
 ━━━━━━━━━━━━━━━━━━━━━━"""
         
+        # أزرار تحكّم الأدمن (حظر/رفع حظر) أسفل رسالة السجل — لا تظهر للأدمن نفسه
+        admin_kb = None if is_admin(user_id) else _admin_ban_buttons(user_id)
+
         # نسخ الفيديو إلى القناة مع كل التفاصيل كوصف في رسالة واحدة مرتبة
         # (copy_message يستخدم نفس file_id فلا يعيد رفع الفيديو = فوري)
+        # نُرجع رسالة السجل لإعادة استخدام نسختها الدائمة في الكاش.
+        log_msg = None
         try:
-            await client.copy_message(
+            log_msg = await client.copy_message(
                 chat_id=channel_id,
                 from_chat_id=sent_message.chat.id,
                 message_id=sent_message.id,
                 caption=caption,
-                parse_mode=enums.ParseMode.HTML
+                parse_mode=enums.ParseMode.HTML,
+                reply_markup=admin_kb
             )
         except Exception as copy_err:
             # احتياطياً عند فشل النسخ: حوّل الفيديو ثم أرسل التفاصيل تحته
             logger.warning(f"⚠️ تعذّر نسخ الفيديو للقناة، استخدام التحويل: {copy_err}")
-            await client.forward_messages(
-                chat_id=channel_id,
-                from_chat_id=sent_message.chat.id,
-                message_ids=sent_message.id
-            )
+            try:
+                fwd = await client.forward_messages(
+                    chat_id=channel_id,
+                    from_chat_id=sent_message.chat.id,
+                    message_ids=sent_message.id
+                )
+                log_msg = fwd[0] if isinstance(fwd, list) else fwd
+            except Exception:
+                log_msg = None
             await client.send_message(
                 chat_id=channel_id,
                 text=caption,
-                parse_mode=enums.ParseMode.HTML
+                parse_mode=enums.ParseMode.HTML,
+                reply_markup=admin_kb
             )
 
         logger.info(f"✅ تم إرسال الفيديو والمعلومات إلى القناة في رسالة واحدة")
-        
+        return log_msg
+
     except Exception as e:
         logger.error(f"❌ خطأ في تحويل الفيديو إلى القناة: {str(e)}")
+        return None
 
 
 async def process_download_from_queue(task: DownloadTask):
@@ -1221,10 +1371,11 @@ async def process_download_from_queue(task: DownloadTask):
             await status.edit_text(t('invalid_url', lang))
             return
 
-        # 🔞 حظر المحتوى الإباحي بعد الاستخراج (مسار قائمة الانتظار)
-        if adult_filter_enabled() and is_adult_info(info):
-            logger.info(f"🔞 Blocked adult content (queue) from user {user_id}: {info.get('title')}")
-            await status.edit_text(t('adult_blocked', lang))
+        # 🔞 محتوى إباحي/حساب محظور بعد الاستخراج → عاقِب المستخدم (حظر + تعهّد)
+        if (adult_filter_enabled() and is_adult_info(info)) or is_blocked_account(info):
+            logger.info(f"🔞 Adult/blocked content (queue) from user {user_id}: {info.get('uploader')}")
+            ban_text, ban_kb = await _apply_adult_ban(app, user_id, lang)
+            await status.edit_text(ban_text, reply_markup=ban_kb)
             return
 
         # 📃 كشف قوائم التشغيل: عرض زر لتحميل أول N مقاطع (للمشتركين/الأدمن)
@@ -1262,27 +1413,24 @@ async def process_download_from_queue(task: DownloadTask):
         # Check subscription and video duration
         is_subscribed = subdb.is_user_subscribed(user_id)
         
-        # Check daily limit for non-subscribers
+        # Check daily limit for non-subscribers (الحد = الأساس + دعواته الدائمة)
         if not is_subscribed:
-            daily_limit = subdb.get_daily_limit()
-            
-            if daily_limit != -1:
+            base_limit = subdb.get_daily_limit()
+
+            if base_limit != -1:
+                effective_limit = base_limit + subdb.get_bonus_downloads(user_id)
                 daily_count = subdb.check_daily_limit(user_id)
-                
-                if daily_count >= daily_limit:
-                    # جرّب استهلاك رصيد إضافي من الدعوات قبل الحظر
-                    if subdb.consume_bonus_download(user_id):
-                        logger.info(f"🎟️ استُخدم رصيد دعوة إضافي للمستخدم {user_id}")
-                    else:
-                        await status.edit_text(
-                            t('daily_limit_exceeded', lang, limit=daily_limit, count=daily_count),
-                            reply_markup=InlineKeyboardMarkup([
-                                [InlineKeyboardButton(t('subscribe_now', lang), callback_data="pay_binance")],
-                                [_invite_button(lang)],
-                                [InlineKeyboardButton(t('contact_developer', lang), url=f"https://t.me/{subdb.get_setting('telegram_support', os.getenv('SUPPORT_USERNAME', ''))}")]
-                            ])
-                        )
-                        return
+
+                if daily_count >= effective_limit:
+                    await status.edit_text(
+                        t('daily_limit_exceeded', lang, limit=effective_limit, count=daily_count),
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton(t('subscribe_now', lang), callback_data="pay_binance")],
+                            [_invite_button(lang)],
+                            [InlineKeyboardButton(t('contact_developer', lang), url=f"https://t.me/{subdb.get_setting('telegram_support', os.getenv('SUPPORT_USERNAME', ''))}")]
+                        ])
+                    )
+                    return
         
         max_duration_minutes = subdb.get_max_duration()
         max_duration_seconds = max_duration_minutes * 60
@@ -1292,15 +1440,12 @@ async def process_download_from_queue(task: DownloadTask):
             await show_subscription_screen(app, status, user_id, title, duration, max_duration_minutes)
             return
         
-        # Show quality selection
+        # Show download type (video / audio)
         keyboard = [
-            [InlineKeyboardButton(t('quality_best', lang), callback_data="quality_best"),
-             InlineKeyboardButton(t('quality_medium', lang), callback_data="quality_medium")],
-            [InlineKeyboardButton(t('quality_480', lang), callback_data="quality_480"),
-             InlineKeyboardButton(t('quality_360', lang), callback_data="quality_360")],
-            [InlineKeyboardButton(t('quality_audio', lang), callback_data="quality_audio")],
+            [InlineKeyboardButton(t('btn_video', lang), callback_data="quality_best"),
+             InlineKeyboardButton(t('btn_audio', lang), callback_data="quality_audio")],
         ]
-        
+
         await status.edit_text(
             t('choose_quality', lang, title=title, duration=duration_str),
             reply_markup=InlineKeyboardMarkup(keyboard)
@@ -1388,15 +1533,18 @@ def cleanup_download_dir(dl_dir):
         logger.error(f"❌ خطأ في حذف مجلد التحميل {dl_dir}: {e}")
 
 
-def _build_media_caption(title, file_size_mb, duration, user_name):
-    """وصف الوسائط الموحّد: العنوان قابل للنسخ (monospace) + الحجم والمدة."""
+def _build_media_caption(title, file_size_mb, duration, user_name, bot_username=None):
+    """وصف الوسائط الموحّد: العنوان قابل للنسخ (monospace) + الحجم والمدة +
+    يوزر البوت (يبقى مع الفيديو عند إعادة إرساله)."""
     safe_title = (title or 'فيديو').replace('`', "'")[:300]
     dur_line = f"⏱️ {int(duration)//60}:{int(duration)%60:02d}\n" if duration else ""
+    promo = f"\n\n📥 @{bot_username}" if bot_username else ""
     return (
         f"🎬 `{safe_title}`\n\n"
         f"📊 {file_size_mb:.1f} MB\n"
         f"{dur_line}"
         f"👤 {user_name}"
+        f"{promo}"
     )
 
 
@@ -1405,12 +1553,27 @@ async def _send_daily_remaining_notice(message, user_id, lang):
     if subdb.is_user_subscribed(user_id):
         return
     subdb.increment_download_count(user_id)
-    daily_limit = subdb.get_daily_limit()
-    if daily_limit != -1:
+    base_limit = subdb.get_daily_limit()
+    if base_limit != -1:
+        effective_limit = base_limit + subdb.get_bonus_downloads(user_id)
         daily_count = subdb.check_daily_limit(user_id)
-        remaining = daily_limit - daily_count
+        remaining = effective_limit - daily_count
         if remaining > 0:
             await message.reply_text(t('downloads_remaining', lang, remaining=remaining))
+
+
+async def _edit_send_progress(msg, title, done, total, sent, fail, removed):
+    """يحدّث رسالة عدّاد الإرسال الحيّ (للبث/التذكير). يتجاهل أخطاء التعديل."""
+    try:
+        await msg.edit_text(
+            f"{title}\n\n"
+            f"📊 التقدّم: **{done}/{total}**\n"
+            f"✅ وصلت: **{sent}**\n"
+            f"❌ فشلت: **{fail}**\n"
+            f"🗑️ حُذفوا (غادروا): **{removed}**"
+        )
+    except Exception:
+        pass
 
 
 async def _try_send_from_cache(client, message, status_msg, ckey, quality,
@@ -1427,7 +1590,8 @@ async def _try_send_from_cache(client, message, status_msg, ckey, quality,
     title = cached.get('title') or 'فيديو'
     fsize = cached.get('file_size_mb') or 0.0
     cdur = cached.get('duration')
-    caption = _build_media_caption(title, fsize, cdur, user_name)
+    caption = _build_media_caption(title, fsize, cdur, user_name,
+                                   bot_username=await _get_bot_username(client))
 
     try:
         if cached['kind'] == 'audio':
@@ -1481,33 +1645,28 @@ async def _try_send_from_cache(client, message, status_msg, ckey, quality,
     return True
 
 
-async def _save_media_to_cache(client, sent_msg, ckey, quality, kind, title,
+async def _save_media_to_cache(sent_msg, log_msg, ckey, quality, kind, title,
                                file_size_mb, duration, width=None, height=None):
-    """يحفظ معرّف الملف في الكاش وينسخ الوسائط لقناة الأرشيف (إن وُجدت)."""
+    """يحفظ معرّف الملف في الكاش. يعيد استخدام نسخة قناة السجلات (log_msg)
+    كمرجع دائم إن توفّرت، وإلا يستخدم رسالة المستخدم. لا حاجة لقناة أرشيف منفصلة."""
     try:
-        media = getattr(sent_msg, 'audio', None) if kind == 'audio' \
-            else getattr(sent_msg, 'video', None)
-        file_id = getattr(media, 'file_id', None)
+        def _file_id_of(msg):
+            if not msg:
+                return None
+            media = getattr(msg, 'audio', None) if kind == 'audio' \
+                else getattr(msg, 'video', None)
+            return getattr(media, 'file_id', None)
+
+        # فضّل نسخة قناة السجلات (دائمة)، ثم رسالة المستخدم
+        storage_chat_id = storage_msg_id = None
+        file_id = _file_id_of(log_msg)
+        if file_id:
+            storage_chat_id = getattr(getattr(log_msg, 'chat', None), 'id', None)
+            storage_msg_id = getattr(log_msg, 'id', None)
+        else:
+            file_id = _file_id_of(sent_msg)
         if not file_id:
             return
-
-        storage_chat_id = storage_msg_id = None
-        storage_channel = get_channel_id('STORAGE_CHANNEL_ID')
-        if storage_channel:
-            try:
-                archived = await client.copy_message(
-                    chat_id=storage_channel,
-                    from_chat_id=sent_msg.chat.id,
-                    message_id=sent_msg.id
-                )
-                storage_chat_id = archived.chat.id
-                storage_msg_id = archived.id
-                # استخدم معرّف نسخة الأرشيف (أدوم لأنها في قناة دائمة)
-                arch_media = getattr(archived, 'audio', None) if kind == 'audio' \
-                    else getattr(archived, 'video', None)
-                file_id = getattr(arch_media, 'file_id', None) or file_id
-            except Exception as arch_err:
-                logger.warning(f"⚠️ تعذّر أرشفة الوسائط في قناة التخزين: {arch_err}")
 
         subdb.save_cached_media(
             url_key=ckey, quality=quality, kind=kind, file_id=file_id,
@@ -1535,6 +1694,17 @@ async def download_and_upload(client, message, url, quality, callback_query=None
     # Get user language
     lang = subdb.get_user_language(user_id)
     status_msg = await message.reply_text(t('processing', lang))
+
+    # ⏸️ إيقاف التحميل العام (الأدمن مُعفى)
+    if not is_admin(user_id) and not downloads_enabled():
+        await status_msg.edit_text(t('downloads_paused', lang))
+        return
+
+    # 🚫 مستخدم محظور: اعرض شاشة الحظر/التعهّد ولا تكمل (الأدمن مُعفى)
+    if not is_admin(user_id) and subdb.is_user_banned(user_id):
+        ban_text, ban_kb = _banned_block_content(user_id, lang)
+        await status_msg.edit_text(ban_text, reply_markup=ban_kb)
+        return
 
     is_audio = (quality == 'audio')
     ckey = cache_key_for_url(url)
@@ -1666,6 +1836,8 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             'merge_output_format': 'mp4',
             'retries': 15,
             'fragment_retries': 15,
+            # تحميل أجزاء DASH/HLS بالتوازي = أسرع بكثير ليوتيوب والمنصات المجزّأة
+            'concurrent_fragment_downloads': YTDLP_CONCURRENT_FRAGMENTS,
             'noplaylist': True,  # نزّل الفيديو الواحد فقط حتى لو الرابط ضمن قائمة
             'nocheckcertificate': _YTDLP_NO_CHECK_CERT,
             # لا تضبط تاريخ الملف على تاريخ رفع الفيديو الأصلي القديم
@@ -1704,24 +1876,49 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         
         is_youtube_url = any(m in url.lower() for m in PLATFORM_URL_MARKERS['youtube'])
 
-        def download(use_cookies=True):
+        def download(use_cookies=True, fmt=None):
             o = dict(ydl_opts)
+            if fmt:
+                o['format'] = fmt
             if not use_cookies:
                 o.pop('cookiefile', None)
             with yt_dlp.YoutubeDL(o) as ydl:
                 info = ydl.extract_info(url, download=True)
                 return info, ydl.prepare_filename(info)
 
+        # صيغة متساهلة احتياطية عند فشل المُحدّد الصارم (بلا فلترة ترميز/امتداد)
+        fallback_fmt = 'bestaudio/best' if is_audio else 'bv*+ba/b/best'
+
         try:
             info, file_path = await loop.run_in_executor(None, lambda: download(True))
         except Exception as dl_err:
+            msg = str(dl_err).lower()
             # يوتيوب مع الكوكيز قد يفشل بسبب حجب الصيغ → أعد المحاولة بدون كوكيز
             if ydl_opts.get('cookiefile') and is_youtube_url and _is_youtube_cookie_issue(dl_err):
                 logger.warning("⚠️ فشل تحميل يوتيوب مع الكوكيز، إعادة المحاولة بدون كوكيز...")
-                info, file_path = await loop.run_in_executor(None, lambda: download(False))
+                try:
+                    info, file_path = await loop.run_in_executor(None, lambda: download(False))
+                except Exception as e2:
+                    if 'requested format is not available' in str(e2).lower() or 'no video formats' in str(e2).lower():
+                        logger.warning("⚠️ الصيغة غير متوفرة، إعادة المحاولة بأفضل صيغة متاحة (بلا كوكيز)")
+                        info, file_path = await loop.run_in_executor(None, lambda: download(False, fallback_fmt))
+                    else:
+                        raise
+            # الصيغة المطلوبة غير متوفرة → أعد المحاولة بأفضل صيغة متاحة
+            elif 'requested format is not available' in msg or 'no video formats' in msg:
+                logger.warning("⚠️ الصيغة المطلوبة غير متوفرة، إعادة المحاولة بأفضل صيغة متاحة")
+                info, file_path = await loop.run_in_executor(None, lambda: download(True, fallback_fmt))
             else:
                 raise
-        
+
+        # 🔞 شبكة أمان: امنع المحتوى الحساس/المحظور قبل الرفع (يغطي القوائم وإعادة
+        # التحميل وأي مسار)، حتى لو فات الفحص الأول. لا نرفعه ولا نخزّنه في الكاش.
+        if (adult_filter_enabled() and is_adult_info(info)) or is_blocked_account(info):
+            logger.info(f"🚫 Blocked at download stage for user {user_id}: {info.get('uploader')}")
+            ban_text, ban_kb = await _apply_adult_ban(client, user_id, lang)
+            await status_msg.edit_text(ban_text, reply_markup=ban_kb)
+            return
+
         # ⚠️ إذا كان تحميل صوتي، FFmpegExtractAudio يغير الامتداد إلى .mp3
         # لذلك نحتاج إلى تحديث file_path للملف الحقيقي
         if is_audio:
@@ -1768,11 +1965,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
 
         # التحقق من الحجم
         if file_size_mb > 2000:
-            await status_msg.edit_text(
-                f"❌ **الملف كبير جداً!**\n\n"
-                f"📊 {file_size_mb:.1f} MB\n"
-                f"🔒 الحد الأقصى: 2000 MB"
-            )
+            await status_msg.edit_text(t('file_too_large', lang, size=f"{file_size_mb:.1f}"))
             os.remove(file_path)
             return
         # Upload
@@ -1787,12 +1980,10 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                            progress_bar='▱▱▱▱▱▱▱▱▱▱')
         await status_msg.edit_text(initial_progress)
         
-        # العنوان داخل تنسيق monospace (`...`) = يُنسخ بالضغط عليه في تيليجرام
-        caption = (
-            f"🎬 `{title}`\n\n"
-            f"📊 {file_size_mb:.1f} MB\n"
-            f"⏱️ {int(duration)//60}:{int(duration)%60:02d}\n"
-            f"👤 {user_name}"
+        # الوصف الموحّد: العنوان قابل للنسخ + يوزر البوت (يبقى مع الفيديو)
+        caption = _build_media_caption(
+            title, file_size_mb, duration, user_name,
+            bot_username=await _get_bot_username(client)
         )
         
         if is_audio:
@@ -1881,9 +2072,10 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         await status_msg.delete()
         logger.info(f"✅ نجح رفع {file_size_mb:.1f}MB للمستخدم {user_id}")
         
-        # تحويل الفيديو إلى قناة السجلات
+        # تحويل الفيديو إلى قناة السجلات (نلتقط رسالة السجل لإعادة استخدامها كمرجع كاش)
+        log_msg = None
         try:
-            await forward_to_log_channel(
+            log_msg = await forward_to_log_channel(
                 client=client,
                 message=message,
                 sent_message=sent_msg,
@@ -1899,8 +2091,9 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             logger.error(f"⚠️ خطأ في إرسال للقناة: {log_error}")
 
         # 💾 حفظ في الكاش لإعادة الإرسال الفوري مستقبلاً (بلا تحميل)
+        # نعيد استخدام نسخة قناة السجلات نفسها (لا قناة أرشيف منفصلة)
         await _save_media_to_cache(
-            client, sent_msg, ckey, quality, cache_kind, title,
+            sent_msg, log_msg, ckey, quality, cache_kind, title,
             file_size_mb, cache_dur, cache_w, cache_h
         )
 
@@ -1918,12 +2111,13 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         if not subdb.is_user_subscribed(user_id):
             subdb.increment_download_count(user_id)
             
-            # عرض رسالة التحميلات المتبقية
-            daily_limit = subdb.get_daily_limit()
-            if daily_limit != -1:  # فقط إذا لم يكن غير محدود
+            # عرض رسالة التحميلات المتبقية (الحد = الأساس + دعواته)
+            base_limit = subdb.get_daily_limit()
+            if base_limit != -1:  # فقط إذا لم يكن غير محدود
+                effective_limit = base_limit + subdb.get_bonus_downloads(user_id)
                 daily_count = subdb.check_daily_limit(user_id)
-                remaining = daily_limit - daily_count
-                
+                remaining = effective_limit - daily_count
+
                 if remaining > 0:
                     # الحصول على لغة المستخدم
                     lang = subdb.get_user_language(user_id)
@@ -2013,20 +2207,22 @@ async def _process_referral_start(client, message, new_user_id):
     if not subdb.record_referral(new_user_id, referrer_id):
         return  # دعوة مكررة أو دعوة النفس
     subdb.add_bonus_downloads(referrer_id, REFERRAL_BONUS)
-    balance = subdb.get_bonus_downloads(referrer_id)
-    logger.info(f"🎁 دعوة جديدة: {new_user_id} عبر {referrer_id} (+{REFERRAL_BONUS})")
+    # الحد اليومي الجديد للداعي = الأساس + مجموع دعواته
+    base = subdb.get_daily_limit()
+    new_limit = (base + subdb.get_bonus_downloads(referrer_id)) if base != -1 else '∞'
+    logger.info(f"🎁 دعوة جديدة: {new_user_id} عبر {referrer_id} (الحد الآن {new_limit})")
     try:
         r_lang = subdb.get_user_language(referrer_id)
         await client.send_message(
             referrer_id,
-            t('referral_granted', r_lang, bonus=REFERRAL_BONUS, balance=balance)
+            t('referral_granted', r_lang, bonus=REFERRAL_BONUS, limit=new_limit)
         )
     except Exception:
         pass
 
 
 async def _show_history(client, message):
-    """يعرض آخر تحميلات المستخدم."""
+    """يعرض آخر تحميلات المستخدم كأزرار؛ الضغط يعيد الإرسال فوراً من الكاش."""
     user_id = message.from_user.id
     lang = subdb.get_user_language(user_id)
     rows = subdb.get_user_history(user_id, 10)
@@ -2034,13 +2230,36 @@ async def _show_history(client, message):
         await message.reply_text(t('history_empty', lang))
         return
     qmap = {'best': '1080p', 'medium': '720p', '480': '480p', '360': '360p', 'audio': 'MP3'}
-    lines = [t('history_title', lang)]
-    for i, (title, quality, kind, created) in enumerate(rows, 1):
+    buttons = []
+    for hid, title, quality, kind, created, url in rows:
         qd = 'MP3' if kind == 'audio' else qmap.get(quality, quality or '')
-        date = created.strftime('%Y-%m-%d %H:%M') if hasattr(created, 'strftime') else str(created)
-        lines.append(t('history_item', lang, idx=i, title=(title or 'فيديو')[:60],
-                       date=date, quality=qd))
-    await message.reply_text("\n".join(lines))
+        label = f"{(title or 'فيديو')[:35]} • {qd}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"redl_{hid}")])
+    await message.reply_text(
+        t('history_title', lang) + "\n" + t('history_tap_hint', lang),
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+@app.on_callback_query(filters.regex(r'^redl_'))
+async def handle_redownload(client, callback_query):
+    """يعيد إرسال فيديو من السجل: فوراً من الكاش إن وُجد، وإلا يحمّله من جديد."""
+    await callback_query.answer()
+    user_id = callback_query.from_user.id
+    lang = subdb.get_user_language(user_id)
+    try:
+        history_id = int(callback_query.data.replace('redl_', ''))
+    except ValueError:
+        return
+    item = subdb.get_history_item(history_id, user_id)
+    if not item or not item.get('url'):
+        await callback_query.message.reply_text(
+            t('error_occurred', lang, error="not found")
+        )
+        return
+    # download_and_upload يفحص الكاش أولاً (إرسال فوري) وإلا يحمّل من جديد
+    await download_and_upload(client, callback_query.message,
+                             item['url'], item['quality'] or 'best', callback_query)
 
 
 async def _build_invite_text(client, user_id, lang):
@@ -2050,14 +2269,333 @@ async def _build_invite_text(client, user_id, lang):
         return None
     link = f"https://t.me/{uname}?start=ref_{user_id}"
     count = subdb.get_referral_count(user_id)
-    balance = subdb.get_bonus_downloads(user_id)
+    base = subdb.get_daily_limit()
+    limit = (base + subdb.get_bonus_downloads(user_id)) if base != -1 else '∞'
     return t('invite_info', lang, link=link, bonus=REFERRAL_BONUS,
-             count=count, balance=balance)
+             count=count, limit=limit)
 
 
 def _invite_button(lang):
     """زر الدعوة الذي يظهر عند انتهاء الحد اليومي."""
     return InlineKeyboardButton(t('btn_invite', lang), callback_data="show_invite")
+
+
+# ═══════════════════════════════════════════════════════════════
+# نظام العقوبات: حظر بسبب الإباحية + تعهّد للعودة
+# ═══════════════════════════════════════════════════════════════
+
+def _ban_screen_content(lang, ban_info):
+    """يبني (نص، أزرار) شاشة الحظر حسب الحالة (أول مخالفة أم حظر دائم)."""
+    # نقض التعهّد سابقاً (pledged) ثم حُظر مجدداً = حظر دائم (الأدمن فقط يرفعه)
+    if ban_info and ban_info.get('pledged'):
+        return t('banned_permanent', lang), InlineKeyboardMarkup([[_invite_button(lang)]])
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(t('btn_pledge', lang), callback_data='pledge_unban')],
+        [_invite_button(lang)],
+    ])
+    return t('banned_screen', lang), keyboard
+
+
+async def _apply_adult_ban(client, user_id, lang):
+    """يحظر المستخدم بسبب محاولة تحميل إباحي ويرجع (نص، أزرار) لشاشة الحظر.
+    الأدمن مُعفى (لا يُحظر، يُعرض له الرفض فقط)."""
+    if is_admin(user_id):
+        return t('adult_blocked', lang), None
+    strikes = subdb.ban_user(user_id, t('ban_reason_adult', lang))
+    logger.info(f"🚫 حظر المستخدم {user_id} بسبب الإباحية (مخالفة #{strikes})")
+    return _ban_screen_content(lang, subdb.get_ban_info(user_id))
+
+
+def _banned_block_content(user_id, lang):
+    """شاشة الحظر لمستخدم محظور أصلاً (للتذكير عند محاولته الاستخدام)."""
+    return _ban_screen_content(lang, subdb.get_ban_info(user_id))
+
+
+@app.on_callback_query(filters.regex(r'^pledge_unban$'))
+async def handle_pledge_unban(client, callback_query):
+    """رفع الحظر عبر التعهّد (مرة واحدة). نقضه لاحقاً = حظر دائم."""
+    await callback_query.answer()
+    user_id = callback_query.from_user.id
+    lang = subdb.get_user_language(user_id)
+    if subdb.pledge_unban(user_id):
+        logger.info(f"✋ المستخدم {user_id} تعهّد ورُفع حظره")
+        await callback_query.message.edit_text(t('pledge_accepted', lang))
+    else:
+        await callback_query.message.edit_text(t('pledge_denied', lang))
+
+
+@app.on_message(filters.command("unban"))
+async def cmd_unban(client, message):
+    """رفع الحظر عن مستخدم (أدمن)."""
+    if not is_admin(message.from_user.id):
+        return
+    parts = getattr(message, 'command', []) or []
+    if len(parts) < 2:
+        await message.reply_text("الاستخدام: /unban <معرّف المستخدم>")
+        return
+    try:
+        uid = int(parts[1])
+    except ValueError:
+        await message.reply_text("❌ معرّف غير صالح.")
+        return
+    if subdb.admin_unban(uid):
+        await message.reply_text(f"✅ تم رفع الحظر عن المستخدم {uid}")
+        try:
+            await client.send_message(uid, t('pledge_accepted', subdb.get_user_language(uid)))
+        except Exception:
+            pass
+    else:
+        await message.reply_text(f"ℹ️ المستخدم {uid} غير محظور.")
+
+
+@app.on_message(filters.command("banned"))
+async def cmd_banned(client, message):
+    """قائمة المحظورين (أدمن)."""
+    if not is_admin(message.from_user.id):
+        return
+    rows = subdb.get_banned_users()
+    if not rows:
+        await message.reply_text("✅ لا يوجد مستخدمون محظورون.")
+        return
+    body = "\n".join(
+        f"  • <code>{uid}</code> — {html.escape(str(reason or ''))} (مخالفات: {strikes})"
+        for uid, reason, strikes in rows
+    )
+    await message.reply_text(
+        f"🚫 <b>المحظورون ({len(rows)}):</b>\n{body}\n\nلرفع الحظر: /unban &lt;المعرّف&gt;",
+        parse_mode=enums.ParseMode.HTML
+    )
+
+
+def _admin_ban_buttons(uid):
+    """أزرار تحكّم الأدمن لحظر/رفع حظر مستخدم (تظهر في قناة السجلات)."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔨 حظر دائم", callback_data=f"permban_{uid}"),
+         InlineKeyboardButton("⚠️ تحذير", callback_data=f"warnban_{uid}")],
+        [InlineKeyboardButton("✅ رفع الحظر", callback_data=f"adminunban_{uid}")],
+    ])
+
+
+async def _notify_user_ban_state(client, uid, permanent):
+    """يُشعر المستخدم بحالته الجديدة (حظر دائم/تحذيري) مع شاشة التعهّد إن أمكن."""
+    try:
+        ulang = subdb.get_user_language(uid)
+        if permanent:
+            await client.send_message(uid, t('banned_permanent', ulang))
+        else:
+            text, kb = _banned_block_content(uid, ulang)
+            await client.send_message(uid, text, reply_markup=kb)
+    except Exception:
+        pass
+
+
+@app.on_callback_query(filters.regex(r'^permban_'))
+async def handle_admin_permban(client, callback_query):
+    """حظر دائم لمستخدم (زر أدمن في قناة السجلات)."""
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("للمشرفين فقط!", show_alert=True)
+        return
+    try:
+        uid = int(callback_query.data.split('_', 1)[1])
+    except (ValueError, IndexError):
+        return
+    subdb.admin_ban(uid, "حظر دائم من الأدمن", permanent=True)
+    logger.info(f"🔨 الأدمن حظر المستخدم {uid} حظراً دائماً")
+    await callback_query.answer(f"🔨 تم حظر {uid} حظراً دائماً", show_alert=True)
+    await _notify_user_ban_state(client, uid, permanent=True)
+
+
+@app.on_callback_query(filters.regex(r'^warnban_'))
+async def handle_admin_warnban(client, callback_query):
+    """حظر تحذيري (يستطيع المستخدم رفعه بالتعهّد) — زر أدمن."""
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("للمشرفين فقط!", show_alert=True)
+        return
+    try:
+        uid = int(callback_query.data.split('_', 1)[1])
+    except (ValueError, IndexError):
+        return
+    subdb.admin_ban(uid, "حظر تحذيري من الأدمن", permanent=False)
+    logger.info(f"⚠️ الأدمن حظر المستخدم {uid} حظراً تحذيرياً")
+    await callback_query.answer(f"⚠️ تم تحذير وحظر {uid} (يمكنه التعهّد)", show_alert=True)
+    await _notify_user_ban_state(client, uid, permanent=False)
+
+
+@app.on_callback_query(filters.regex(r'^adminunban_'))
+async def handle_admin_unban_btn(client, callback_query):
+    """رفع الحظر عن مستخدم (زر أدمن)."""
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("للمشرفين فقط!", show_alert=True)
+        return
+    try:
+        uid = int(callback_query.data.split('_', 1)[1])
+    except (ValueError, IndexError):
+        return
+    if subdb.admin_unban(uid):
+        logger.info(f"✅ الأدمن رفع الحظر عن المستخدم {uid}")
+        await callback_query.answer(f"✅ تم رفع الحظر عن {uid}", show_alert=True)
+        try:
+            await client.send_message(uid, t('pledge_accepted', subdb.get_user_language(uid)))
+        except Exception:
+            pass
+    else:
+        await callback_query.answer(f"ℹ️ {uid} غير محظور", show_alert=True)
+
+
+# ═══════════════════════════════════════════════════════════════
+# استبيان الأعضاء الإجباري قبل التحميل (الجنس + سؤال الأدمن)
+# ═══════════════════════════════════════════════════════════════
+
+def _has_active_questions():
+    return any(enabled for _id, _txt, enabled, _lang in subdb.get_questions())
+
+
+def _lang_flag(lang):
+    return {'ar': '🇸🇦', 'en': '🇬🇧'}.get(lang, '🌐')
+
+
+def _gender_keyboard(lang):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(t('gender_male', lang), callback_data='gender_male'),
+        InlineKeyboardButton(t('gender_female', lang), callback_data='gender_female'),
+    ]])
+
+
+def _question_keyboard(qid, lang):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(t('answer_yes', lang), callback_data=f'qans_{qid}_yes'),
+        InlineKeyboardButton(t('answer_no', lang), callback_data=f'qans_{qid}_no'),
+    ]])
+
+
+async def _prompt_survey_if_needed(send_func, user_id):
+    """يعرض الخطوة الناقصة من الاستبيان (الجنس ثم الأسئلة غير المُجابة).
+    يرجع True إذا عُرض سؤال (أي يجب إيقاف التحميل)، وإلا False (الاستبيان مكتمل)."""
+    lang = subdb.get_user_language(user_id)
+    if not subdb.get_survey(user_id).get('gender'):
+        await send_func(t('ask_gender', lang), reply_markup=_gender_keyboard(lang))
+        return True
+    pending = subdb.get_unanswered_questions(user_id)
+    if pending:
+        qid, qtext = pending[0]
+        await send_func(f"❓ {qtext}", reply_markup=_question_keyboard(qid, lang))
+        return True
+    return False
+
+
+def _gender_label(gender):
+    return '👨 رجل' if gender == 'male' else ('👩 امرأة' if gender == 'female' else '— غير محدد')
+
+
+def _user_link(uid, name):
+    """اسم قابل للضغط (أزرق) يفتح محادثة المستخدم حتى بلا يوزر."""
+    return f'<a href="tg://user?id={uid}">{html.escape(str(name or "مستخدم"))}</a>'
+
+
+def _member_header_html(user):
+    """رأس موحّد لرسائل العضو في القناة: الاسم + اليوزر + الجنس + المعرّف."""
+    uid = user.id
+    name = html.escape(str(getattr(user, 'first_name', None) or 'مستخدم'))
+    uname = f"@{html.escape(user.username)}" if getattr(user, 'username', None) else '⚠️ لا يوجد'
+    gender_txt = _gender_label(subdb.get_survey(uid).get('gender'))
+    return (f"👤 <a href=\"tg://user?id={uid}\">{name}</a>\n"
+            f"📛 اليوزر: {uname}\n"
+            f"👥 الجنس: {gender_txt}\n"
+            f"🆔 ID: <code>{uid}</code>")
+
+
+async def _post_survey_result(client, user):
+    """ينشر إجابات العضو على الاستبيان في قناة الاستبيان (إن وُجدت) مع زر رد مباشر."""
+    channel_id = get_channel_id('SURVEY_CHANNEL_ID')
+    if not channel_id:
+        return
+    uid = user.id
+    lines = ["📋 <b>إجابات عضو على الاستبيان</b>\n", _member_header_html(user)]
+    answers = subdb.get_member_answers(uid)
+    for qtext, ans in answers:
+        ans_txt = '✅ نعم' if ans == 'yes' else '❌ لا'
+        lines.append(f"❓ {html.escape(qtext)}: {ans_txt}")
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("💬 رد على العضو", callback_data=f"reply_msg_{uid}")
+    ]])
+    try:
+        await client.send_message(channel_id, "\n".join(lines),
+                                  parse_mode=enums.ParseMode.HTML, reply_markup=keyboard)
+    except Exception as e:
+        logger.error(f"❌ تعذّر نشر إجابات الاستبيان للقناة: {e}")
+
+
+def _questions_panel_view():
+    """يبني (نص، أزرار) لوحة إدارة أسئلة الأعضاء المتعددة (تفعيل/حذف/إضافة)."""
+    questions = subdb.get_questions()
+    gs = subdb.get_gender_stats()
+    lc = subdb.get_language_counts()
+    text = (
+        "❓ **أسئلة الأعضاء**\n\n"
+        f"👥 الجنس (يُسأل دائماً): 👨 {gs['male']} | 👩 {gs['female']}\n"
+        f"🌐 اللغة: 🇸🇦 {lc['ar']} | 🇬🇧 {lc['en']}\n"
+        f"عدد الأسئلة: {len(questions)}\n\n"
+    )
+    rows = []
+    if not questions:
+        text += ("— لا توجد أسئلة بعد. أضف سؤالاً (تفاعلي) ليُطرح على الأعضاء.\n"
+                 "ℹ️ يُطرح على الأعضاء الحاليين فقط حسب لغتهم — من ينضمّ لاحقاً لا يراه.")
+    else:
+        text += ("كل سؤال يُطرح على الموجودين وقت إضافته حسب الجمهور (🌐/🇸🇦/🇬🇧):\n\n")
+        for qid, qtext, enabled, qlang in questions:
+            st = subdb.get_question_answer_stats(qid)
+            state = '✅' if enabled else '🔕'
+            text += f"{state} {_lang_flag(qlang)} {qtext}\n   (✅ نعم {st['yes']} | ❌ لا {st['no']})\n\n"
+            rows.append([
+                InlineKeyboardButton("🔕 إيقاف" if enabled else "🔔 تفعيل",
+                                     callback_data=f"sub_qtoggle_{qid}"),
+                InlineKeyboardButton("🗑️ حذف", callback_data=f"sub_qdel_{qid}"),
+            ])
+    rows.append([InlineKeyboardButton("➕ إضافة سؤال", callback_data="sub_qadd")])
+    rows.append([InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+@app.on_callback_query(filters.regex(r'^gender_(male|female)$'))
+async def handle_gender(client, callback_query):
+    """يحفظ جنس العضو ثم ينتقل للسؤال التالي أو ينهي الاستبيان."""
+    await callback_query.answer()
+    uid = callback_query.from_user.id
+    lang = subdb.get_user_language(uid)
+    subdb.set_gender(uid, 'male' if callback_query.data == 'gender_male' else 'female')
+    if not await _prompt_survey_if_needed(callback_query.message.edit_text, uid):
+        await callback_query.message.edit_text(t('survey_done', lang))
+        await _post_survey_result(client, callback_query.from_user)
+
+
+@app.on_callback_query(filters.regex(r'^editgender_(male|female)$'))
+async def handle_edit_gender(client, callback_query):
+    """تعديل العضو لجنسه — يحدّث قاعدة البيانات فوراً (بدون متابعة الاستبيان)."""
+    await callback_query.answer()
+    uid = callback_query.from_user.id
+    lang = subdb.get_user_language(uid)
+    gender = 'male' if callback_query.data == 'editgender_male' else 'female'
+    subdb.set_gender(uid, gender)
+    await callback_query.message.edit_text(
+        f"{t('gender_updated', lang)}\n\n👥 {_gender_label(gender)}"
+    )
+
+
+@app.on_callback_query(filters.regex(r'^qans_'))
+async def handle_question_answer(client, callback_query):
+    """يحفظ إجابة العضو على سؤال محدد ثم ينتقل للسؤال التالي أو ينهي الاستبيان."""
+    await callback_query.answer()
+    uid = callback_query.from_user.id
+    lang = subdb.get_user_language(uid)
+    try:
+        _, qid_str, ans = callback_query.data.split('_', 2)
+        qid = int(qid_str)
+    except (ValueError, IndexError):
+        return
+    subdb.save_question_answer(uid, qid, 'yes' if ans == 'yes' else 'no')
+    if not await _prompt_survey_if_needed(callback_query.message.edit_text, uid):
+        await callback_query.message.edit_text(t('survey_done', lang))
+        await _post_survey_result(client, callback_query.from_user)
 
 
 @app.on_callback_query(filters.regex(r'^show_invite$'))
@@ -2088,6 +2626,7 @@ async def cmd_dlstats(client, message):
     lang = subdb.get_user_language(message.from_user.id)
     s = subdb.get_download_stats()
     cache = subdb.get_cache_stats()
+    gs = subdb.get_gender_stats()
     platforms = "\n".join(f"  • {p}: {c}" for p, c in s['platforms']) or "  —"
     top_users = "\n".join(
         f"  • {(name or uid)}: {c}" for uid, name, c in s['top_users']
@@ -2096,13 +2635,83 @@ async def cmd_dlstats(client, message):
         t('dlstats_title', lang, today=s['today'], total=s['total'],
           cache_hits=cache['hits'], cache_items=cache['items'],
           platforms=platforms, top_users=top_users)
+        + f"\n\n👥 **الجنس:** 👨 {gs['male']} | 👩 {gs['female']}"
+        + f"\n🌐 **اللغة:** 🇸🇦 {subdb.get_language_counts()['ar']} | 🇬🇧 {subdb.get_language_counts()['en']}"
     )
 
 
-@app.on_message(filters.text & filters.regex(r'^(📥 تحميلاتي|📥 My Downloads)$'))
+@app.on_message(filters.command("blockacc"))
+async def cmd_blockacc(client, message):
+    """حظر حساب (X/تويتر أو غيره) ليُرفض كل محتواه. للأدمن فقط."""
+    if not is_admin(message.from_user.id):
+        return
+    parts = getattr(message, 'command', []) or []
+    if len(parts) < 2:
+        await message.reply_text("الاستخدام: /blockacc <اسم الحساب أو معرّفه>\nمثال: /blockacc someuser")
+        return
+    acc = parts[1].strip().lstrip('@').lower()
+    added = _add_to_setting_list('blocked_accounts', acc)
+    await message.reply_text(
+        (f"✅ تم حظر الحساب: <code>{html.escape(acc)}</code>\nلن يُسمح بتحميل أي محتوى منه."
+         if added else f"ℹ️ الحساب محظور مسبقاً: <code>{html.escape(acc)}</code>"),
+        parse_mode=enums.ParseMode.HTML
+    )
+
+
+@app.on_message(filters.command("unblockacc"))
+async def cmd_unblockacc(client, message):
+    """رفع الحظر عن حساب. للأدمن فقط."""
+    if not is_admin(message.from_user.id):
+        return
+    parts = getattr(message, 'command', []) or []
+    if len(parts) < 2:
+        await message.reply_text("الاستخدام: /unblockacc <اسم الحساب>")
+        return
+    acc = parts[1].strip().lstrip('@').lower()
+    raw = subdb.get_setting('blocked_accounts', '') or ''
+    items = [x.strip() for x in raw.split(',') if x.strip()]
+    new_items = [x for x in items if x.lower().lstrip('@') != acc]
+    if len(new_items) == len(items):
+        await message.reply_text(f"ℹ️ الحساب ليس في قائمة الحظر: {acc}")
+        return
+    subdb.set_setting('blocked_accounts', ','.join(new_items))
+    await message.reply_text(f"✅ تم رفع الحظر عن: {acc}")
+
+
+@app.on_message(filters.command("blockedaccs"))
+async def cmd_blockedaccs(client, message):
+    """عرض قائمة الحسابات المحظورة. للأدمن فقط."""
+    if not is_admin(message.from_user.id):
+        return
+    accs = sorted(_blocked_accounts())
+    if not accs:
+        await message.reply_text("📋 لا توجد حسابات محظورة.\nأضِف حساباً بـ: /blockacc <الحساب>")
+        return
+    body = "\n".join(f"  • {a}" for a in accs)
+    await message.reply_text(f"📋 **الحسابات المحظورة ({len(accs)}):**\n{body}\n\nلرفع الحظر: /unblockacc <الحساب>")
+
+
+@app.on_message(filters.text & filters.regex(
+    r'^(📥 تحميلاتي|📥 My Downloads|🎁 ادعُ أصدقاءك|🎁 Invite Friends|🧍 تعديل جنسي|🧍 Edit my gender)$'))
 async def handle_feature_buttons(client, message):
-    """زر 'تحميلاتي' (عربي/إنجليزي)."""
-    await _show_history(client, message)
+    """أزرار 'تحميلاتي' و'ادعُ أصدقاءك' و'تعديل جنسي' (عربي/إنجليزي)."""
+    text = (message.text or '').strip()
+    lang = subdb.get_user_language(message.from_user.id)
+    if text in ('📥 تحميلاتي', '📥 My Downloads'):
+        await _show_history(client, message)
+    elif text in ('🧍 تعديل جنسي', '🧍 Edit my gender'):
+        await message.reply_text(
+            t('edit_gender_prompt', lang),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(t('gender_male', lang), callback_data='editgender_male'),
+                InlineKeyboardButton(t('gender_female', lang), callback_data='editgender_female'),
+            ]])
+        )
+    else:
+        txt = await _build_invite_text(client, message.from_user.id, lang)
+        await message.reply_text(
+            txt or t('error_occurred', lang, error="bot username unavailable")
+        )
 
 
 @app.on_message(filters.command("start"))
@@ -2165,13 +2774,13 @@ async def start(client, message):
             # مشترك - عرض زر الاشتراك + تحميلاتي/الدعوة + تغيير اللغة
             keyboard = ReplyKeyboardMarkup([
                 [KeyboardButton(t('btn_my_subscription', lang))],
-                [KeyboardButton(t('btn_my_downloads', lang))],
+                [KeyboardButton(t('btn_my_downloads', lang)), KeyboardButton(t('btn_invite', lang)), KeyboardButton(t('btn_edit_gender', lang))],
                 [KeyboardButton(t('btn_change_language', lang))]
             ], resize_keyboard=True)
         else:
             # غير مشترك - تحميلاتي/الدعوة + تغيير اللغة
             keyboard = ReplyKeyboardMarkup([
-                [KeyboardButton(t('btn_my_downloads', lang))],
+                [KeyboardButton(t('btn_my_downloads', lang)), KeyboardButton(t('btn_invite', lang)), KeyboardButton(t('btn_edit_gender', lang))],
                 [KeyboardButton(t('btn_change_language', lang))]
             ], resize_keyboard=True)
     
@@ -2179,6 +2788,10 @@ async def start(client, message):
         t('welcome', lang, name=message.from_user.first_name),
         reply_markup=keyboard
     )
+
+    # 📋 اسأل العضو الاستبيان (الجنس + الأسئلة) إن لم يجب بعد — الأدمن مُعفى
+    if not is_admin(user_id):
+        await _prompt_survey_if_needed(message.reply_text, user_id)
 
 
 # معالج الأزرار السريعة
@@ -2342,12 +2955,10 @@ async def handle_resolve_error(client, callback_query):
     
     # إرسال رسالة للمستخدم
     try:
+        u_lang = subdb.get_user_language(error_data['user_id'])
         await client.send_message(
             chat_id=error_data['user_id'],
-            text=f"✅ **تم إصلاح مشكلتك!**\n\n"
-                 f"المشكلة التي واجهتها مع الرابط:\n"
-                 f"`{error_data['url'][:50]}...`\n\n"
-                 f"تم حلها الآن. يمكنك المحاولة مرة أخرى! 🎉"
+            text=t('problem_fixed', u_lang, url=f"{error_data['url'][:50]}...")
         )
         logger.info(f"✅ تم إرسال إشعار الحل للمستخدم {error_data['user_id']}")
     except Exception as e:
@@ -2541,6 +3152,107 @@ async def send_database_backup(client, message):
             )
         except Exception:
             pass
+
+
+async def _send_backup_to_channel(client, notify_chat=None):
+    """ينشئ نسخة احتياطية JSON كاملة ويرفعها إلى قناة النسخ الاحتياطي."""
+    channel_id = get_channel_id('BACKUP_CHANNEL_ID')
+    if not channel_id:
+        if notify_chat:
+            await client.send_message(notify_chat, "⚠️ لم يُضبط BACKUP_CHANNEL_ID في ملف .env")
+        return False
+    loop = asyncio.get_event_loop()
+    success, result = await loop.run_in_executor(None, lambda: pg_backup.create_json_backup())
+    if not success:
+        logger.error(f"❌ فشل إنشاء نسخة القناة: {result}")
+        if notify_chat:
+            await client.send_message(notify_chat, f"❌ فشل إنشاء النسخة: {result}")
+        return False
+    path = result
+    try:
+        size_kb = os.path.getsize(path) / 1024
+        caption = (
+            "💾 **نسخة احتياطية كاملة (JSON)**\n"
+            f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"💾 {size_kb:.1f} KB\n\n"
+            "♻️ للاستعادة: أعد إرسال هذا الملف إلى البوت (من الأدمن)."
+        )
+        await client.send_document(chat_id=channel_id, document=path, caption=caption)
+        logger.info("✅ تم رفع نسخة احتياطية كاملة لقناة النسخ الاحتياطي")
+        return True
+    except Exception as e:
+        logger.error(f"❌ تعذّر رفع النسخة للقناة: {e}")
+        if notify_chat:
+            await client.send_message(notify_chat, f"❌ تعذّر الرفع للقناة: {e}")
+        return False
+    finally:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+
+@app.on_message(filters.document, group=3)
+async def handle_backup_restore(client, message):
+    """استعادة البيانات عندما يرسل الأدمن ملف نسخة احتياطية JSON."""
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    # لا تتعارض مع رفع الكوكيز
+    if message.from_user.id in waiting_for_cookies:
+        return
+    doc = message.document
+    name = (getattr(doc, 'file_name', '') or '').lower()
+    is_json = name.endswith('.json') and 'backup' in name
+    is_sql = name.endswith('.sql')
+    if not (is_json or is_sql):
+        return  # ليس ملف نسخة احتياطية
+    status = await message.reply_text("⏳ **جاري استعادة البيانات من الملف...**")
+    path = None
+    try:
+        path = await message.download()
+        loop = asyncio.get_event_loop()
+        if is_sql:
+            ok, result = await loop.run_in_executor(None, lambda: pg_backup.restore_from_sql(path))
+            if ok:
+                await status.edit_text(
+                    "✅ **تم استيراد ملف SQL.**\n"
+                    "تحقّق من قائمة الأعضاء/الإحصائيات للتأكد.\n\n"
+                    f"<code>{html.escape(str(result)[:400])}</code>",
+                    parse_mode=enums.ParseMode.HTML
+                )
+            else:
+                await status.edit_text(f"❌ **فشل استيراد SQL:** {result}")
+        else:
+            ok, result = await loop.run_in_executor(None, lambda: pg_backup.restore_from_json(path))
+            if ok:
+                summary = "\n".join(f"• {tbl}: {cnt} صف" for tbl, cnt in result.items()) or "—"
+                await status.edit_text(f"✅ **تمت الاستعادة بنجاح:**\n{summary}")
+            else:
+                await status.edit_text(f"❌ **فشلت الاستعادة:** {result}")
+    except Exception as e:
+        logger.error(f"❌ خطأ في استعادة النسخة: {e}", exc_info=True)
+        await status.edit_text(f"❌ خطأ في الاستعادة: {str(e)[:200]}")
+    finally:
+        if path:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+
+async def _auto_backup_loop(client):
+    """مهمة خلفية: ترفع نسخة احتياطية لقناة النسخ تلقائياً كل فترة."""
+    interval_hours = int(os.getenv("AUTO_BACKUP_HOURS", "12"))
+    if interval_hours <= 0 or not get_channel_id('BACKUP_CHANNEL_ID'):
+        return
+    while True:
+        try:
+            await asyncio.sleep(interval_hours * 3600)
+            await _send_backup_to_channel(client)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"❌ خطأ في النسخ التلقائي: {e}")
 
 
 @app.on_message(filters.command("cookies"))
@@ -2866,10 +3578,27 @@ async def handle_url(client, message):
     # Get user language FIRST
     lang = subdb.get_user_language(user_id)
 
-    # 🔞 حظر المحتوى الإباحي قبل أي معالجة (فحص النطاق/الرابط)
-    if adult_filter_enabled() and is_adult_url(url):
-        logger.info(f"🔞 Blocked adult URL from user {user_id}: {_url_host(url)}")
-        await message.reply_text(t('adult_blocked', lang))
+    # ⏸️ إيقاف التحميل العام (الأدمن مُعفى)
+    if not is_admin(user_id) and not downloads_enabled():
+        await message.reply_text(t('downloads_paused', lang))
+        return
+
+    # 🚫 مستخدم محظور أصلاً: اعرض شاشة الحظر/التعهّد (الأدمن مُعفى)
+    if not is_admin(user_id) and subdb.is_user_banned(user_id):
+        ban_text, ban_kb = _banned_block_content(user_id, lang)
+        await message.reply_text(ban_text, reply_markup=ban_kb)
+        return
+
+    # 📋 استبيان إجباري قبل التحميل (الجنس + الأسئلة) — الأدمن مُعفى
+    if not is_admin(user_id):
+        if await _prompt_survey_if_needed(message.reply_text, user_id):
+            return
+
+    # 🔞 محتوى إباحي/حساب محظور → عاقِب المستخدم (حظر + تعهّد)
+    if (adult_filter_enabled() and is_adult_url(url)) or is_blocked_url(url):
+        logger.info(f"🔞 Adult/blocked URL from user {user_id}: {_url_host(url)}")
+        ban_text, ban_kb = await _apply_adult_ban(client, user_id, lang)
+        await message.reply_text(ban_text, reply_markup=ban_kb)
         return
 
     # 🚫 حماية SSRF: ارفض الروابط الداخلية/غير http(s) قبل تمريرها لـ yt-dlp
@@ -2963,17 +3692,19 @@ async def handle_url(client, message):
     # فحص الحد اليومي للمستخدمين غير المشتركين
     # Check daily limit for non-subscribers
     if not is_subscribed:
-        daily_limit = subdb.get_daily_limit()
-        
+        base_limit = subdb.get_daily_limit()
+
         # فقط فحص إذا كان الحد ليس "غير محدود" (-1)
-        if daily_limit != -1:
+        if base_limit != -1:
+            effective_limit = base_limit + subdb.get_bonus_downloads(user_id)
             daily_count = subdb.check_daily_limit(user_id)
-            
-            if daily_count >= daily_limit:
+
+            if daily_count >= effective_limit:
                 await status.edit_text(
-                    t('daily_limit_exceeded', lang, limit=daily_limit, count=daily_count),
+                    t('daily_limit_exceeded', lang, limit=effective_limit, count=daily_count),
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton(t('subscribe_now', lang), callback_data="pay_binance")],
+                        [_invite_button(lang)],
                         [InlineKeyboardButton(t('contact_developer', lang), url=f"https://t.me/{subdb.get_setting('telegram_support', os.getenv('SUPPORT_USERNAME', ''))}")]
                     ])
                 )
@@ -2987,15 +3718,12 @@ async def handle_url(client, message):
         await show_subscription_screen(client, status, user_id, title, duration, max_duration_minutes)
         return
     
-    # Show quality selection
+    # Show download type (video / audio)
     keyboard = [
-        [InlineKeyboardButton(t('quality_best', lang), callback_data="quality_best"),
-         InlineKeyboardButton(t('quality_medium', lang), callback_data="quality_medium")],
-        [InlineKeyboardButton(t('quality_480', lang), callback_data="quality_480"),
-         InlineKeyboardButton(t('quality_360', lang), callback_data="quality_360")],
-        [InlineKeyboardButton(t('quality_audio', lang), callback_data="quality_audio")],
+        [InlineKeyboardButton(t('btn_video', lang), callback_data="quality_best"),
+         InlineKeyboardButton(t('btn_audio', lang), callback_data="quality_audio")],
     ]
-    
+
     await status.edit_text(
         t('choose_quality', lang, title=title, duration=duration_str),
         reply_markup=InlineKeyboardMarkup(keyboard)
@@ -3255,13 +3983,8 @@ async def handle_payment_proof(client, message):
     # حذف من pending
     del pending_downloads[user_id]
     
-    # إرسال إشعار للمستخدم
-    await message.reply_text(
-        "✅ **تم استلام إثبات الدفع!**\n\n"
-        "سيتم مراجعة دفعتك من قبل المسؤول.\n"
-        "ستصلك رسالة فور تفعيل اشتراكك! 🎉\n\n"
-        "⏳ الانتظار المتوقع: أقل من 24 ساعة"
-    )
+    # إرسال إشعار للمستخدم بلغته
+    await message.reply_text(t('payment_received', subdb.get_user_language(user_id)))
     
     # إرسال إشعار للأدمن
     admin_id = int(os.getenv("ADMIN_ID"))
@@ -3376,11 +4099,7 @@ async def handle_reject_payment(client, callback_query):
             telegram_support = subdb.get_setting('telegram_support', os.getenv('SUPPORT_USERNAME', ''))
             await client.send_message(
                 chat_id=user_id,
-                text=(
-                    "❌ **تم رفض دفعتك**\n\n"
-                    "قد يكون هناك مشكلة في إثبات الدفع.\n"
-                    f"تواصل مع المطور: @{telegram_support}"
-                )
+                text=t('payment_rejected', subdb.get_user_language(user_id), support=telegram_support)
             )
         except Exception:
             pass
@@ -3456,10 +4175,21 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
     price = subdb.get_setting('subscription_price', '10')
     duration_days = subdb.get_setting('subscription_duration_days', '30')
     stats = subdb.get_user_stats()
+    try:
+        gs = subdb.get_gender_stats()
+    except Exception:
+        gs = {'male': 0, 'female': 0}
+    try:
+        lc = subdb.get_language_counts()
+    except Exception:
+        lc = {'ar': 0, 'en': 0}
     adult_on = adult_filter_enabled()
     adult_label = f"🔞 حظر المحتوى الإباحي: {'✅ مُفعّل' if adult_on else '❌ متوقف'}"
+    dl_on = downloads_enabled()
+    dl_label = "⏸️ إيقاف التحميل للجميع" if dl_on else "▶️ تشغيل التحميل للجميع"
 
     keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(dl_label, callback_data="sub_toggle_downloads")],
         [InlineKeyboardButton("⏱️ تحديد المدة القصوى", callback_data="sub_set_duration")],
         [InlineKeyboardButton("💰 تحديد السعر", callback_data="sub_set_price")],
         [InlineKeyboardButton(adult_label, callback_data="sub_toggle_adult")],
@@ -3468,12 +4198,18 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
             InlineKeyboardButton("➕ كلمة محظورة", callback_data="sub_add_keyword"),
         ],
         [InlineKeyboardButton("📋 القائمة المحظورة المخصصة", callback_data="sub_list_blocked")],
+        [InlineKeyboardButton("❓ سؤال للأعضاء", callback_data="sub_member_question")],
         [InlineKeyboardButton("📢 الاشتراك الإجباري", callback_data="sub_fsub")],
         [InlineKeyboardButton("👥 عرض المشتركين", callback_data="sub_view_subscribers")],
         [InlineKeyboardButton("📊 عرض آخر 50 مستخدم", callback_data="sub_recent_users")],
         [InlineKeyboardButton("💳 الدفوعات المعلقة", callback_data="sub_pending_payments")],
         [InlineKeyboardButton("📊 إحصائيات الأعضاء", callback_data="sub_member_stats")],
         [InlineKeyboardButton("🔍 بحث عن عضو", callback_data="sub_search_user")],
+        [InlineKeyboardButton("✉️ مراسلة عضو (عبر البوت)", callback_data="msg_direct_user")],
+        [InlineKeyboardButton("🚫 معاقبة عضو (حظر/رفع)", callback_data="sub_punish_user")],
+        [InlineKeyboardButton("📛 المحظورون", callback_data="sub_banned_list")],
+        [InlineKeyboardButton("📨 تذكير غير النشطين", callback_data="sub_remind_inactive")],
+        [InlineKeyboardButton("💾 نسخة احتياطية للقناة", callback_data="sub_backup_channel")],
         [InlineKeyboardButton("✏️ ترقية عضو", callback_data="sub_promote_user")],
         [InlineKeyboardButton("❌ إلغاء ترقية", callback_data="sub_demote_user")],
         [InlineKeyboardButton("📢 إرسال رسالة جماعية", callback_data="sub_broadcast")]
@@ -3484,11 +4220,14 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
         f"⏱️ **الحد الأقصى للمجاني:** {max_duration} دقيقة\n"
         f"💰 **سعر الاشتراك:** ${price}\n"
         f"📅 **مدة الاشتراك:** {duration_days} يوم\n"
-        f"🔞 **حظر المحتوى الإباحي:** {'مُفعّل ✅' if adult_on else 'متوقف ❌'}\n\n"
+        f"🔞 **حظر المحتوى الإباحي:** {'مُفعّل ✅' if adult_on else 'متوقف ❌'}\n"
+        f"⏯️ **التحميل للأعضاء:** {'يعمل ▶️' if dl_on else 'متوقف ⏸️'}\n\n"
         f"📊 **الإحصائيات:**\n"
         f"• المجموع: {stats['total']} عضو\n"
         f"• المشتركون: {stats['subscribed']} 💎\n"
-        f"• العاديون: {stats['free']} 🆓\n\n"
+        f"• العاديون: {stats['free']} 🆓\n"
+        f"• 👨 رجال: {gs['male']} | 👩 نساء: {gs['female']}\n"
+        f"• 🇸🇦 عربي: {lc['ar']} | 🇬🇧 إنجليزي: {lc['en']}\n\n"
         f"**اختر الإعداد:**"
     )
 
@@ -3506,6 +4245,20 @@ async def handle_subscription_settings(client, callback_query):
         return
     
     action = callback_query.data[len('sub_'):]  # إزالة البادئة فقط (لا كل التكرارات)
+
+    if action == 'toggle_downloads':
+        new_state = '0' if downloads_enabled() else '1'
+        subdb.set_setting('downloads_enabled', new_state)
+        await callback_query.answer(
+            "▶️ تم تشغيل التحميل للجميع" if new_state == '1'
+            else "⏸️ تم إيقاف التحميل للجميع (الأدمن غير متأثر)",
+            show_alert=True
+        )
+        await subscription_settings_panel(
+            client, callback_query.message,
+            user_id=callback_query.from_user.id, edit=True
+        )
+        return
 
     if action == 'toggle_adult':
         new_state = '0' if adult_filter_enabled() else '1'
@@ -3545,20 +4298,24 @@ async def handle_subscription_settings(client, callback_query):
         return
 
     if action == 'list_blocked':
-        domains = _custom_adult_domains()
-        keywords = _custom_adult_keywords()
-        text = "📋 **القائمة المحظورة المخصصة**\n\n"
-        text += "🌐 **المواقع:**\n"
-        text += ("\n".join(f"• `{d}`" for d in domains) if domains else "— لا يوجد —") + "\n\n"
-        text += "🔤 **الكلمات:**\n"
-        text += ("\n".join(f"• `{k}`" for k in keywords) if keywords else "— لا يوجد —")
-        text += "\n\n💡 النطاقات/الكلمات المدمجة مسبقاً ({} موقع) مفعّلة دائماً.".format(len(ADULT_DOMAINS))
-        kb_rows = []
-        if domains or keywords:
-            kb_rows.append([InlineKeyboardButton("🗑️ مسح القائمة المخصصة", callback_data="sub_clear_blocked")])
-        kb_rows.append([InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")])
-        await callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb_rows))
+        text, kb = _blocked_list_view()
+        await callback_query.message.edit_text(text, reply_markup=kb)
         await callback_query.answer()
+        return
+
+    if action.startswith('deldom_') or action.startswith('delkw_'):
+        key = 'adult_custom_domains' if action.startswith('deldom_') else 'adult_custom_keywords'
+        try:
+            idx = int(action.split('_', 1)[1])
+        except (ValueError, IndexError):
+            idx = -1
+        removed = _remove_from_setting_list(key, idx)
+        await callback_query.answer(f"🗑️ حُذف: {removed}" if removed else "تعذّر الحذف")
+        text, kb = _blocked_list_view()
+        try:
+            await callback_query.message.edit_text(text, reply_markup=kb)
+        except Exception:
+            pass
         return
 
     if action == 'clear_blocked':
@@ -3569,6 +4326,183 @@ async def handle_subscription_settings(client, callback_query):
             client, callback_query.message,
             user_id=callback_query.from_user.id, edit=True
         )
+        return
+
+    if action == 'member_question':
+        text, kb = _questions_panel_view()
+        await callback_query.message.edit_text(text, reply_markup=kb)
+        await callback_query.answer()
+        return
+
+    if action == 'qadd':
+        lc = subdb.get_language_counts()
+        await callback_query.message.edit_text(
+            "➕ **إضافة سؤال — لمن يُطرح؟**\n\n"
+            f"🇸🇦 العربية: {lc['ar']} | 🇬🇧 الإنجليزية: {lc['en']}\n\n"
+            "اختر الجمهور (الإنجليزي لا يصله العربي والعكس):",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🌐 الجميع", callback_data="sub_qaddlang_all")],
+                [InlineKeyboardButton("🇸🇦 العربية", callback_data="sub_qaddlang_ar"),
+                 InlineKeyboardButton("🇬🇧 الإنجليزية", callback_data="sub_qaddlang_en")],
+                [InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")],
+            ])
+        )
+        await callback_query.answer()
+        return
+
+    if action.startswith('qaddlang_'):
+        qlang = action.split('_', 1)[1]  # all / ar / en
+        if qlang not in ('all', 'ar', 'en'):
+            qlang = 'all'
+        label = {'all': '🌐 الجميع', 'ar': '🇸🇦 العربية', 'en': '🇬🇧 الإنجليزية'}[qlang]
+        await callback_query.message.edit_text(
+            f"➕ **سؤال جديد إلى: {label}**\n\n"
+            "أرسل الآن نص السؤال (يُجاب عليه بنعم/لا).",
+            reply_markup=_sub_settings_back_kb()
+        )
+        pending_downloads[callback_query.from_user.id] = {'waiting_for': 'add_question', 'q_lang': qlang}
+        await callback_query.answer()
+        return
+
+    if action.startswith('qtoggle_'):
+        try:
+            qid = int(action.split('_', 1)[1])
+        except (ValueError, IndexError):
+            qid = None
+        if qid:
+            current = dict((q[0], q[2]) for q in subdb.get_questions()).get(qid)
+            subdb.set_question_enabled(qid, not current)
+            await callback_query.answer("تم التحديث")
+        text, kb = _questions_panel_view()
+        try:
+            await callback_query.message.edit_text(text, reply_markup=kb)
+        except Exception:
+            pass
+        return
+
+    if action.startswith('qdel_'):
+        try:
+            qid = int(action.split('_', 1)[1])
+        except (ValueError, IndexError):
+            qid = None
+        if qid:
+            subdb.delete_question(qid)
+            await callback_query.answer("🗑️ حُذف السؤال")
+        text, kb = _questions_panel_view()
+        try:
+            await callback_query.message.edit_text(text, reply_markup=kb)
+        except Exception:
+            pass
+        return
+
+    if action == 'banned_list':
+        text, kb = _banned_list_view()
+        await callback_query.message.edit_text(text, reply_markup=kb)
+        await callback_query.answer()
+        return
+
+    if action == 'remind_inactive':
+        days = int(os.getenv("REMINDER_INACTIVE_DAYS", "7"))
+        inactive = subdb.get_inactive_users(days)
+        if not inactive:
+            await callback_query.answer(f"لا يوجد أعضاء خاملون منذ {days} أيام", show_alert=True)
+            return
+        await callback_query.message.edit_text(
+            f"📨 **تذكير الأعضاء غير النشطين**\n\n"
+            f"⏳ الخمول: ≥ {days} أيام\n"
+            f"👥 العدد: **{len(inactive)}** عضو\n\n"
+            "سيُرسل لكل عضو تذكيراً **بلغته**، ويُحذف تذكيره السابق تلقائياً "
+            "(يبقى الأحدث فقط).",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📨 إرسال التذكير الآن", callback_data="sub_do_remind")],
+                [InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")],
+            ])
+        )
+        await callback_query.answer()
+        return
+
+    if action == 'do_remind':
+        days = int(os.getenv("REMINDER_INACTIVE_DAYS", "7"))
+        inactive = subdb.get_inactive_users(days)
+        progress = await callback_query.message.edit_text(
+            f"📤 جاري إرسال التذكير لـ {len(inactive)} عضو..."
+        )
+        total = len(inactive)
+        sent_n = fail_n = removed_n = 0
+        for idx, (uid, ulang, old_msg) in enumerate(inactive, 1):
+            try:
+                # احذف التذكير السابق ليبقى الأحدث فقط
+                if old_msg:
+                    try:
+                        await client.delete_messages(uid, old_msg)
+                    except Exception:
+                        pass
+                m = await client.send_message(uid, t('reminder_inactive', ulang))
+                subdb.set_last_reminder(uid, m.id)
+                sent_n += 1
+                await asyncio.sleep(0.05)
+            except FloodWait as e:
+                await asyncio.sleep(getattr(e, 'value', 5))
+                fail_n += 1
+            except GONE_USER_ERRORS:
+                try:
+                    subdb.delete_user(uid)
+                    removed_n += 1
+                except Exception:
+                    pass
+                fail_n += 1
+            except Exception:
+                fail_n += 1
+            # عدّاد حيّ يتحدّث كل 15 عضواً
+            if idx % 15 == 0:
+                await _edit_send_progress(progress, "📨 جاري إرسال التذكير...",
+                                          idx, total, sent_n, fail_n, removed_n)
+        await progress.edit_text(
+            f"✅ **اكتمل إرسال التذكير**\n\n"
+            f"✅ وصلت: {sent_n}\n❌ فشلت: {fail_n}\n🗑️ حُذفوا (غادروا): {removed_n}"
+        )
+        await callback_query.answer()
+        return
+
+    if action == 'backup_channel':
+        await callback_query.answer("⏳ جاري النسخ ورفعه للقناة...", show_alert=False)
+        ok = await _send_backup_to_channel(client, notify_chat=callback_query.from_user.id)
+        if ok:
+            await callback_query.message.reply_text(
+                "✅ تم رفع نسخة احتياطية كاملة لقناة النسخ الاحتياطي.\n"
+                "♻️ للاستعادة لاحقاً: أعد إرسال الملف من القناة إلى البوت."
+            )
+        return
+
+    if action.startswith('unbanlist_'):
+        try:
+            uid = int(action.split('_', 1)[1])
+        except (ValueError, IndexError):
+            uid = None
+        if uid and subdb.admin_unban(uid):
+            await callback_query.answer(f"✅ رُفع الحظر عن {uid}")
+            try:
+                await client.send_message(uid, t('pledge_accepted', subdb.get_user_language(uid)))
+            except Exception:
+                pass
+        else:
+            await callback_query.answer("ℹ️ غير محظور")
+        text, kb = _banned_list_view()
+        try:
+            await callback_query.message.edit_text(text, reply_markup=kb)
+        except Exception:
+            pass
+        return
+
+    if action == 'punish_user':
+        await callback_query.message.edit_text(
+            "🚫 **معاقبة عضو**\n\n"
+            "أرسل معرّف العضو (ID رقمي) أو `@username`.\n"
+            "ثم اختر: 🔨 حظر دائم / ⚠️ تحذير / ✅ رفع الحظر.",
+            reply_markup=_sub_settings_back_kb()
+        )
+        pending_downloads[callback_query.from_user.id] = {'waiting_for': 'punish_user_id'}
+        await callback_query.answer()
         return
 
     if action == 'fsub':
@@ -3651,13 +4585,12 @@ async def handle_subscription_settings(client, callback_query):
             )
             return
         
-        text = "👥 **قائمة المشتركين**\n\n"
-        
+        text = "👥 <b>قائمة المشتركين</b>\n\n"
+
         for idx, sub in enumerate(subscribers[:20], 1):  # أول 20 مشترك
             user_id, username, first_name, end_date, method = sub
-            username_str = f"@{username}" if username else "لا يوجد"
-            name = first_name or "مستخدم"
-            
+            username_str = f"@{html.escape(username)}" if username else "لا يوجد"
+
             # حساب الأيام المتبقية
             if end_date:
                 # PostgreSQL يُرجع datetime object مباشرة، بينما SQLite يُرجع string
@@ -3669,13 +4602,15 @@ async def handle_subscription_settings(client, callback_query):
                 days_str = f"{days_left} يوم" if days_left > 0 else "منتهي"
             else:
                 days_str = "مدى الحياة"
-            
-            text += f"{idx}. {name} ({username_str})\n"
-            text += f"   🆔 `{user_id}` | ⏳ {days_str}\n\n"
-        
-        text += f"\n📊 **إجمالي المشتركين:** {len(subscribers)}"
 
-        await callback_query.message.edit_text(text, reply_markup=_sub_settings_back_kb())
+            text += f"{idx}. {_user_link(user_id, first_name)} ({username_str})\n"
+            text += f"   🆔 <code>{user_id}</code> | ⏳ {days_str}\n\n"
+
+        text += f"\n📊 <b>إجمالي المشتركين:</b> {len(subscribers)}\n"
+        text += "💡 اضغط الاسم (الأزرق) لفتح محادثة المشترك."
+
+        await callback_query.message.edit_text(
+            text, reply_markup=_sub_settings_back_kb(), parse_mode=enums.ParseMode.HTML)
         
     elif action == 'pending_payments':
         payments = subdb.get_pending_payments()
@@ -3707,28 +4642,33 @@ async def handle_subscription_settings(client, callback_query):
         stats = subdb.get_user_stats()
         all_users = subdb.get_all_users()
         
-        text = "📊 **إحصائيات الأعضاء**\n\n"
-        text += f"👥 **إجمالي الأعضاء:** {stats['total']}\n"
-        text += f"💎 **المشتركون:** {stats['subscribed']}\n"
-        text += f"🆓 **العاديون:** {stats['free']}\n\n"
-        
-        # عرض بعض المشتركين مع الأيام المتبقية
+        gs = subdb.get_gender_stats()
+        lc = subdb.get_language_counts()
+        text = "📊 <b>إحصائيات الأعضاء</b>\n\n"
+        text += f"👥 <b>إجمالي الأعضاء:</b> {stats['total']}\n"
+        text += f"💎 <b>المشتركون:</b> {stats['subscribed']}\n"
+        text += f"🆓 <b>العاديون:</b> {stats['free']}\n"
+        text += f"👤 <b>الجنس:</b> 👨 {gs['male']} | 👩 {gs['female']}\n"
+        text += f"🌐 <b>اللغة:</b> 🇸🇦 {lc['ar']} | 🇬🇧 {lc['en']}\n\n"
+
+        # عرض بعض المشتركين مع الأيام المتبقية (الاسم قابل للضغط)
         if stats['subscribed'] > 0:
             text += "━━━━━━━━━━━━━━━━\n"
-            text += "**المشتركون الحاليون:**\n\n"
-            
+            text += "<b>المشتركون الحاليون:</b>\n\n"
+
             count = 0
             for user in all_users:
                 user_id, username, first_name, is_subscribed, subscription_end = user
                 if is_subscribed:
                     days_left = subdb.get_days_remaining(user_id)
-                    name = first_name or "مستخدم"
-                    text += f"• {name}: {days_left} يوم متبقية\n"
+                    text += f"• {_user_link(user_id, first_name)}: {days_left} يوم متبقية\n"
                     count += 1
                     if count >= 10:  # أول 10 مشتركين
                         break
+            text += "\n💡 اضغط الاسم (الأزرق) لفتح محادثة المشترك."
 
-        await callback_query.message.edit_text(text, reply_markup=_sub_settings_back_kb())
+        await callback_query.message.edit_text(
+            text, reply_markup=_sub_settings_back_kb(), parse_mode=enums.ParseMode.HTML)
     
     elif action == 'recent_users':
         users = subdb.get_recent_users(50)
@@ -3737,22 +4677,23 @@ async def handle_subscription_settings(client, callback_query):
             await callback_query.message.edit_text("📝 **لا يوجد مستخدمون**")
             return
         
-        text = "📊 **آخر 50 مستخدم**\n\n"
-        
+        text = "📊 <b>آخر 50 مستخدم</b>\n\n"
+
         for idx, user in enumerate(users[:50], 1):
             user_id, username, first_name, is_subscribed = user
-            username_str = f"@{username}" if username else "لا يوجد"
-            name = first_name or "مستخدم"
+            username_str = f"@{html.escape(username)}" if username else "لا يوجد"
             status = "💎" if is_subscribed else "🆓"
-            
-            text += f"{idx}. {status} {name} ({username_str})\n"
-            text += f"   🆔 `{user_id}`\n\n"
-        
-        text += f"\n📊 **إجمالي المستخدمين:** {len(users)}\n\n"
-        text += "💡 **لمراسلة أي مستخدم:**\n"
-        text += "استخدم زر 'رسالة خاصة' وأرسل ID المستخدم"
 
-        await callback_query.message.edit_text(text, reply_markup=_sub_settings_back_kb())
+            text += f"{idx}. {status} {_user_link(user_id, first_name)} ({username_str})\n"
+            text += f"   🆔 <code>{user_id}</code>\n\n"
+
+        text += f"\n📊 <b>إجمالي المستخدمين:</b> {len(users)}\n\n"
+        text += ("💡 اضغط اسم العضو (الأزرق) لفتح ملفه. وإن لم يفتح (عضو بلا يوزر):\n"
+                 "انسخ الـ🆔 (اضغط عليه) ثم استخدم زر «✉️ مراسلة عضو» لمراسلته عبر "
+                 "البوت — يعمل مع الجميع.")
+
+        await callback_query.message.edit_text(
+            text, reply_markup=_sub_settings_back_kb(), parse_mode=enums.ParseMode.HTML)
     
     elif action == 'promote_user':
         await callback_query.message.edit_text(
@@ -3870,13 +4811,33 @@ async def handle_message_type(client, callback_query):
     action = callback_query.data.replace('msg_', '')
     
     if action == 'broadcast_all':
+        ar_count = len(subdb.get_users_by_language('ar'))
+        en_count = len(subdb.get_users_by_language('en'))
+        total = ar_count + en_count
         await callback_query.message.edit_text(
-            "📢 **إرسال رسالة لجميع المستخدمين**\n\n"
-            "أرسل الرسالة التي تريد إرسالها لجميع مستخدمي البوت\n\n"
-            f"⚠️ سيتم إرسالها لـ **{subdb.get_user_stats()['total']}** مستخدم",
+            "📢 **بث جماعي — اختر الجمهور حسب اللغة**\n\n"
+            f"🌐 الجميع: {total}\n"
+            f"🇸🇦 العربية: {ar_count}\n"
+            f"🇬🇧 الإنجليزية: {en_count}\n\n"
+            "اختر لمن تُرسل (الإنجليزي لا يصله العربي والعكس):",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"🌐 الجميع ({total})", callback_data="msg_bcast_all")],
+                [InlineKeyboardButton(f"🇸🇦 العربية ({ar_count})", callback_data="msg_bcast_ar"),
+                 InlineKeyboardButton(f"🇬🇧 الإنجليزية ({en_count})", callback_data="msg_bcast_en")],
+                [InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")],
+            ])
+        )
+
+    elif action in ('bcast_all', 'bcast_ar', 'bcast_en'):
+        target = {'bcast_all': 'all', 'bcast_ar': 'ar', 'bcast_en': 'en'}[action]
+        label = {'all': '🌐 الجميع', 'ar': '🇸🇦 العربية فقط', 'en': '🇬🇧 الإنجليزية فقط'}[target]
+        count = len(subdb.get_users_by_language(None if target == 'all' else target))
+        await callback_query.message.edit_text(
+            f"📢 **بث إلى: {label}** ({count} مستخدم)\n\n"
+            "أرسل الآن نص الرسالة التي تريد بثّها.",
             reply_markup=_sub_settings_back_kb()
         )
-        pending_downloads[user_id] = {'waiting_for': 'broadcast_message'}
+        pending_downloads[user_id] = {'waiting_for': 'broadcast_message', 'target_lang': target}
 
     elif action == 'direct_user':
         await callback_query.message.edit_text(
@@ -3911,8 +4872,16 @@ async def handle_reply_button(client, callback_query):
     conversation_state[clicker_id] = target_id
 
     lang = subdb.get_user_language(clicker_id)
-    await callback_query.message.reply_text(t('type_your_reply', lang))
-    await callback_query.answer()
+    prompt = t('type_your_reply', lang)
+    # نرسل التنبيه في الخاص (يعمل حتى لو ضُغط الزر داخل قناة)
+    try:
+        await client.send_message(clicker_id, prompt)
+    except Exception:
+        try:
+            await callback_query.message.reply_text(prompt)
+        except Exception:
+            pass
+    await callback_query.answer("✍️ اكتب ردّك في خاص البوت", show_alert=True)
 
 
 @app.on_message(
@@ -3939,30 +4908,47 @@ async def handle_conversation_reply(client, message):
 
     target_lang = subdb.get_user_language(target_id)
 
-    if sender_is_admin:
-        # المطور يرد على عضو → نص "رسالة من المطور"
-        body = f"{t('direct_message_prefix', target_lang)}\n\n{reply_text}"
-    else:
-        # عضو يرد على المطور → نعرض اسمه ومعرّفه
-        sender_name = message.from_user.first_name or "عضو"
-        body = (f"{t('member_reply_prefix', target_lang, name=sender_name, user_id=sender_id)}"
-                f"\n\n{reply_text}")
-
-    # زر رد للطرف الآخر ليرد على المرسل الحالي
-    reply_kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            t('reply_button', target_lang),
-            callback_data=f"reply_msg_{sender_id}"
-        )
+    sender_lang = subdb.get_user_language(sender_id)
+    # زر "رد على العضو" دائماً يشير للمرسل الحالي (العضو) ليبقى في محادثته
+    member_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(t('reply_button', target_lang), callback_data=f"reply_msg_{sender_id}")
     ]])
 
-    sender_lang = subdb.get_user_language(sender_id)
-    try:
-        await client.send_message(chat_id=target_id, text=body, reply_markup=reply_kb)
-        await message.reply_text(t('reply_sent', sender_lang))
-    except Exception as e:
-        logger.error(f"❌ فشل تمرير الرد من {sender_id} إلى {target_id}: {e}")
-        await message.reply_text(t('reply_failed', sender_lang))
+    if sender_is_admin:
+        # الأدمن يرد على عضو → يصل العضو في الخاص، وزر الرد يعيده للقناة
+        body = f"{t('direct_message_prefix', target_lang)}\n\n{reply_text}"
+        try:
+            await client.send_message(chat_id=target_id, text=body, reply_markup=member_kb)
+            await message.reply_text(t('reply_sent', sender_lang))
+        except Exception as e:
+            logger.error(f"❌ فشل إرسال رد الأدمن إلى {target_id}: {e}")
+            await message.reply_text(t('reply_failed', sender_lang))
+    else:
+        # عضو يرد → ننشر رسالته في قناة الأعضاء (تبقى محادثة كل عضو منفصلة هناك)
+        sender_name = message.from_user.first_name or "عضو"
+        channel_id = get_channel_id('SURVEY_CHANNEL_ID')
+        if channel_id:
+            ch_body = (
+                f"💬 <b>رسالة من عضو</b>\n{_member_header_html(message.from_user)}"
+                f"\n\n{html.escape(reply_text)}"
+            )
+            try:
+                await client.send_message(channel_id, ch_body,
+                                          parse_mode=enums.ParseMode.HTML, reply_markup=member_kb)
+                await message.reply_text(t('reply_sent', sender_lang))
+            except Exception as e:
+                logger.error(f"❌ فشل نشر رد العضو في القناة: {e}")
+                await message.reply_text(t('reply_failed', sender_lang))
+        else:
+            # لا توجد قناة → السلوك القديم: يصل خاص الأدمن
+            body = (f"{t('member_reply_prefix', target_lang, name=sender_name, user_id=sender_id)}"
+                    f"\n\n{reply_text}")
+            try:
+                await client.send_message(chat_id=target_id, text=body, reply_markup=member_kb)
+                await message.reply_text(t('reply_sent', sender_lang))
+            except Exception as e:
+                logger.error(f"❌ فشل تمرير رد العضو إلى {target_id}: {e}")
+                await message.reply_text(t('reply_failed', sender_lang))
 
     raise StopPropagation
 
@@ -4255,6 +5241,44 @@ async def handle_admin_input(client, message):
                 await message.reply_text("ℹ️ لا كلمات جديدة (محظورة مسبقاً أو فارغة).")
             del pending_downloads[user_id]
 
+        elif waiting_for == 'add_question':
+            q = (message.text or '').strip()
+            if not q:
+                await message.reply_text("❌ السؤال فارغ. أرسل نص السؤال.")
+                return
+            q_lang = data.get('q_lang', 'all')
+            subdb.add_question(q, True, q_lang)
+            label = {'all': '🌐 الجميع', 'ar': '🇸🇦 العربية', 'en': '🇬🇧 الإنجليزية'}.get(q_lang, '🌐 الجميع')
+            await message.reply_text(
+                f"✅ **تمت إضافة السؤال وتفعيله** (لـ {label}):\n\n{q}\n\n"
+                "سيُطلب من كل عضو من هذا الجمهور لم يجب عليه (نعم/لا) قبل التحميل."
+            )
+            del pending_downloads[user_id]
+
+        elif waiting_for == 'punish_user_id':
+            raw = (message.text or '').strip().lstrip('@')
+            del pending_downloads[user_id]
+            target_uid = None
+            if raw.isdigit():
+                target_uid = int(raw)
+            else:
+                u = subdb.find_user_by_username(raw)
+                if u:
+                    target_uid = u[0]
+            if not target_uid:
+                await message.reply_text("❌ لم أجد المستخدم. أرسل ID رقمي أو @username صحيح.")
+                return
+            info = subdb.get_ban_info(target_uid)
+            if info and info.get('banned'):
+                status = f"🚫 محظور حالياً (مخالفات: {info.get('strikes')})"
+            else:
+                status = "✅ غير محظور"
+            await message.reply_text(
+                f"👤 المستخدم: <code>{target_uid}</code>\nالحالة: {status}\n\nاختر الإجراء:",
+                parse_mode=enums.ParseMode.HTML,
+                reply_markup=_admin_ban_buttons(target_uid)
+            )
+
         elif waiting_for == 'add_forced_channel':
             await add_forced_channel_from_admin(client, message, user_id)
 
@@ -4333,8 +5357,9 @@ async def handle_admin_input(client, message):
             global broadcast_counter
             broadcast_text = message.text.strip()
 
-            # الحصول على جميع المستخدمين
-            all_users = subdb.get_all_users()
+            # الجمهور المستهدف حسب اللغة المختارة (all/ar/en)
+            target_lang = data.get('target_lang', 'all')
+            all_users = subdb.get_users_by_language(None if target_lang == 'all' else target_lang)
 
             # إنشاء استبيان بث جديد بإحصائية حيّة
             broadcast_counter += 1
@@ -4357,11 +5382,12 @@ async def handle_admin_input(client, message):
             success_count = 0
             fail_count = 0
             removed_count = 0
+            total_targets = len(all_users)
 
-            for user in all_users:
+            for idx, uid in enumerate(all_users, 1):
                 try:
                     # Get each user's preferred language
-                    user_lang = subdb.get_user_language(user[0])
+                    user_lang = subdb.get_user_language(uid)
 
                     # أزرار: نعم / لا + رد للمطور
                     kb = InlineKeyboardMarkup([
@@ -4371,7 +5397,7 @@ async def handle_admin_input(client, message):
                     ])
 
                     await client.send_message(
-                        chat_id=user[0],  # user_id
+                        chat_id=uid,
                         text=f"{t('broadcast_message_prefix', user_lang)}\n\n{broadcast_text}",
                         reply_markup=kb
                     )
@@ -4383,7 +5409,7 @@ async def handle_admin_input(client, message):
                 except GONE_USER_ERRORS:
                     # العضو غادر/حظر البوت → احذفه من قاعدة البيانات
                     try:
-                        subdb.delete_user(user[0])
+                        subdb.delete_user(uid)
                         removed_count += 1
                     except Exception:
                         pass
@@ -4391,6 +5417,11 @@ async def handle_admin_input(client, message):
                 except Exception:
                     # خطأ مؤقت/غير معروف → نُبقي العضو
                     fail_count += 1
+                # عدّاد حيّ يتحدّث كل 15 رسالة
+                if idx % 15 == 0:
+                    await _edit_send_progress(progress, "📢 جاري البث الجماعي...",
+                                              idx, total_targets, success_count,
+                                              fail_count, removed_count)
 
             # عدد من وصلتهم الرسالة فعلاً هو الأساس لحساب "لم يتفاعلوا"
             broadcast_polls[bid]['total'] = success_count
@@ -4624,7 +5655,7 @@ async def handle_language_selection(client, callback_query):
     else:
         from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton
         keyboard = ReplyKeyboardMarkup([
-            [KeyboardButton(t('btn_my_downloads', lang))],
+            [KeyboardButton(t('btn_my_downloads', lang)), KeyboardButton(t('btn_invite', lang)), KeyboardButton(t('btn_edit_gender', lang))],
             [KeyboardButton(t('btn_change_language', lang))]
         ], resize_keyboard=True)
 
@@ -4633,7 +5664,15 @@ async def handle_language_selection(client, callback_query):
         text=t('welcome', lang, name=first_name),
         reply_markup=keyboard
     )
-    
+
+    # 📋 اسأل العضو الجديد الاستبيان (الجنس + الأسئلة) فور اختيار اللغة
+    if not is_admin(user_id):
+        await _prompt_survey_if_needed(
+            lambda text, reply_markup=None: client.send_message(
+                user_id, text, reply_markup=reply_markup),
+            user_id
+        )
+
     await callback_query.answer()
 
 @app.on_message(filters.text & ~filters.regex(r'^/'), group=10)
@@ -4686,6 +5725,7 @@ def main():
     loop = asyncio.get_event_loop()
     loop.create_task(daily_report_task())
     loop.create_task(daily_cleanup_task())
+    loop.create_task(_auto_backup_loop(app))  # نسخ احتياطي تلقائي لقناة النسخ
     
     try:
         app.run()

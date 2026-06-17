@@ -85,6 +85,10 @@ def init_db():
     _ensure_history_table()
     _ensure_referrals_table()
     _ensure_bonus_column()
+    _ensure_moderation_table()
+    _ensure_survey_table()
+    _ensure_questions_tables()
+    _ensure_reminder_column()
     logger.info("✅ تم تجهيز قاعدة البيانات بنجاح")
 
 
@@ -424,6 +428,19 @@ def get_all_users():
         ''')
         return cursor.fetchall()
 
+
+def get_users_by_language(lang=None):
+    """معرّفات المستخدمين حسب اللغة. lang='ar' يشمل من لغته غير محددة (الافتراضي
+    عربي). lang='en' للإنجليزية. None/أي قيمة أخرى = الجميع."""
+    with db_cursor() as cursor:
+        if lang == 'ar':
+            cursor.execute("SELECT user_id FROM users WHERE COALESCE(language, 'ar') = 'ar'")
+        elif lang == 'en':
+            cursor.execute("SELECT user_id FROM users WHERE language = 'en'")
+        else:
+            cursor.execute("SELECT user_id FROM users")
+        return [r[0] for r in cursor.fetchall()]
+
 def find_user_by_id(user_id: int):
     """البحث عن مستخدم بواسطة ID"""
     with db_cursor() as cursor:
@@ -711,16 +728,30 @@ def add_download_history(user_id, url, title, quality, kind, platform,
 
 
 def get_user_history(user_id, limit=10):
-    """آخر تحميلات المستخدم: (title, quality, kind, created_at)."""
+    """آخر تحميلات المستخدم: (id, title, quality, kind, created_at, url)."""
     with db_cursor() as cursor:
         cursor.execute('''
-            SELECT title, quality, kind, created_at
+            SELECT id, title, quality, kind, created_at, url
             FROM download_history
             WHERE user_id = %s
             ORDER BY id DESC
             LIMIT %s
         ''', (user_id, limit))
         return cursor.fetchall()
+
+
+def get_history_item(history_id, user_id):
+    """يرجع عنصر سجل واحد يملكه المستخدم (للتأكد من الملكية قبل إعادة الإرسال)."""
+    with db_cursor() as cursor:
+        cursor.execute('''
+            SELECT url, quality, kind, title
+            FROM download_history
+            WHERE id = %s AND user_id = %s
+        ''', (history_id, user_id))
+        row = cursor.fetchone()
+    if not row:
+        return None
+    return {'url': row[0], 'quality': row[1], 'kind': row[2], 'title': row[3]}
 
 
 def get_download_stats():
@@ -839,3 +870,351 @@ def consume_bonus_download(user_id) -> bool:
         ''', (user_id,))
         row = cursor.fetchone()
     return row is not None
+
+
+# ═══════════════════════════════════════════════════════════════
+# نظام العقوبات والحظر - Moderation / bans
+# ═══════════════════════════════════════════════════════════════
+
+def _ensure_moderation_table():
+    """ينشئ جدول العقوبات إن لم يكن موجوداً."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS moderation (
+                user_id BIGINT PRIMARY KEY,
+                banned BOOLEAN DEFAULT FALSE,
+                reason TEXT,
+                strikes INTEGER DEFAULT 0,
+                pledged BOOLEAN DEFAULT FALSE,
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+
+
+def ban_user(user_id, reason: str) -> int:
+    """يحظر المستخدم (يزيد عدّاد المخالفات). يرجع عدد المخالفات بعد الحظر."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            INSERT INTO moderation (user_id, banned, reason, strikes)
+            VALUES (%s, TRUE, %s, 1)
+            ON CONFLICT (user_id) DO UPDATE SET
+                banned = TRUE,
+                reason = EXCLUDED.reason,
+                strikes = moderation.strikes + 1,
+                updated_at = NOW()
+            RETURNING strikes
+        ''', (user_id, reason))
+        row = cursor.fetchone()
+    return row[0] if row else 1
+
+
+def is_user_banned(user_id) -> bool:
+    """هل المستخدم محظور حالياً؟"""
+    with db_cursor() as cursor:
+        cursor.execute('SELECT banned FROM moderation WHERE user_id = %s', (user_id,))
+        row = cursor.fetchone()
+    return bool(row and row[0])
+
+
+def get_ban_info(user_id):
+    """معلومات الحظر: (banned, reason, strikes, pledged) أو None."""
+    with db_cursor() as cursor:
+        cursor.execute(
+            'SELECT banned, reason, strikes, pledged FROM moderation WHERE user_id = %s',
+            (user_id,))
+        row = cursor.fetchone()
+    if not row:
+        return None
+    return {'banned': row[0], 'reason': row[1], 'strikes': row[2], 'pledged': row[3]}
+
+
+def pledge_unban(user_id) -> bool:
+    """رفع الحظر عبر التعهّد (يُسمح به مرة واحدة فقط). يرجع True عند القبول."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            UPDATE moderation SET banned = FALSE, pledged = TRUE, updated_at = NOW()
+            WHERE user_id = %s AND banned = TRUE AND pledged = FALSE
+            RETURNING user_id
+        ''', (user_id,))
+        row = cursor.fetchone()
+    return row is not None
+
+
+def admin_unban(user_id) -> bool:
+    """رفع الحظر من الأدمن (يبقي سجل المخالفات). يرجع True إن كان محظوراً."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            UPDATE moderation SET banned = FALSE, updated_at = NOW()
+            WHERE user_id = %s AND banned = TRUE
+            RETURNING user_id
+        ''', (user_id,))
+        row = cursor.fetchone()
+    return row is not None
+
+
+def admin_ban(user_id, reason: str, permanent: bool = False):
+    """حظر من الأدمن. permanent=True يجعله دائماً (لا يُرفع بالتعهّد، الأدمن فقط).
+    permanent=False = حظر تحذيري يستطيع المستخدم رفعه بالتعهّد مرة واحدة."""
+    pledged = bool(permanent)  # دائم → نعتبره "تعهّد مستهلك" فلا يُرفع بالتعهّد
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            INSERT INTO moderation (user_id, banned, reason, strikes, pledged)
+            VALUES (%s, TRUE, %s, 1, %s)
+            ON CONFLICT (user_id) DO UPDATE SET
+                banned = TRUE,
+                reason = EXCLUDED.reason,
+                strikes = moderation.strikes + 1,
+                pledged = EXCLUDED.pledged,
+                updated_at = NOW()
+        ''', (user_id, reason, pledged))
+
+
+def get_banned_users():
+    """قائمة المحظورين حالياً: (user_id, reason, strikes)."""
+    with db_cursor() as cursor:
+        cursor.execute('''
+            SELECT user_id, reason, strikes FROM moderation
+            WHERE banned = TRUE ORDER BY updated_at DESC
+        ''')
+        return cursor.fetchall()
+
+
+# ═══════════════════════════════════════════════════════════════
+# استبيان الأعضاء - Member survey (الجنس + سؤال الأدمن نعم/لا)
+# ═══════════════════════════════════════════════════════════════
+
+def _ensure_survey_table():
+    """ينشئ جدول استبيان الأعضاء إن لم يكن موجوداً."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS member_survey (
+                user_id BIGINT PRIMARY KEY,
+                gender TEXT,
+                q_answer TEXT,
+                q_version INTEGER DEFAULT -1,
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+
+
+def get_survey(user_id):
+    """يرجع {gender, q_answer, q_version} للمستخدم (قيم افتراضية إن لم يوجد)."""
+    with db_cursor() as cursor:
+        cursor.execute(
+            'SELECT gender, q_answer, q_version FROM member_survey WHERE user_id = %s',
+            (user_id,))
+        row = cursor.fetchone()
+    if not row:
+        return {'gender': None, 'q_answer': None, 'q_version': -1}
+    return {'gender': row[0], 'q_answer': row[1],
+            'q_version': row[2] if row[2] is not None else -1}
+
+
+def set_gender(user_id, gender):
+    """يحفظ جنس المستخدم (male/female)."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            INSERT INTO member_survey (user_id, gender) VALUES (%s, %s)
+            ON CONFLICT (user_id) DO UPDATE SET gender = EXCLUDED.gender, updated_at = NOW()
+        ''', (user_id, gender))
+
+
+def set_question_answer(user_id, answer, version):
+    """يحفظ إجابة المستخدم على سؤال الأدمن مع رقم نسخة السؤال."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            INSERT INTO member_survey (user_id, q_answer, q_version) VALUES (%s, %s, %s)
+            ON CONFLICT (user_id) DO UPDATE SET
+                q_answer = EXCLUDED.q_answer, q_version = EXCLUDED.q_version, updated_at = NOW()
+        ''', (user_id, answer, version))
+
+
+def get_gender_stats():
+    """إحصائية الجنس: {'male': n, 'female': n}."""
+    with db_cursor() as cursor:
+        cursor.execute(
+            'SELECT gender, COUNT(*) FROM member_survey WHERE gender IS NOT NULL GROUP BY gender')
+        rows = cursor.fetchall()
+    d = {'male': 0, 'female': 0}
+    for g, c in rows:
+        if g in d:
+            d[g] = c
+    return d
+
+
+def get_question_stats(version):
+    """(قديمة - للتوافق) إحصائية إجابات سؤال واحد حسب النسخة."""
+    with db_cursor() as cursor:
+        cursor.execute('''
+            SELECT q_answer, COUNT(*) FROM member_survey
+            WHERE q_version = %s AND q_answer IS NOT NULL GROUP BY q_answer
+        ''', (version,))
+        rows = cursor.fetchall()
+    d = {'yes': 0, 'no': 0}
+    for a, c in rows:
+        if a in d:
+            d[a] = c
+    return d
+
+
+# ═══════════════════════════════════════════════════════════════
+# أسئلة الأعضاء المتعددة - Multiple admin questions
+# ═══════════════════════════════════════════════════════════════
+
+def _ensure_questions_tables():
+    """جداول الأسئلة المتعددة وإجابات الأعضاء، مع ترحيل السؤال القديم الواحد."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS admin_questions (
+                id SERIAL PRIMARY KEY,
+                text TEXT NOT NULL,
+                enabled BOOLEAN DEFAULT TRUE,
+                lang TEXT DEFAULT 'all',
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        cursor.execute("ALTER TABLE admin_questions ADD COLUMN IF NOT EXISTS lang TEXT DEFAULT 'all'")
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS member_answers (
+                user_id BIGINT NOT NULL,
+                question_id INTEGER NOT NULL,
+                answer TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (user_id, question_id)
+            )
+        ''')
+    # ترحيل السؤال القديم الواحد (إن وُجد ولا توجد أسئلة بعد)
+    try:
+        with db_cursor() as cursor:
+            cursor.execute('SELECT COUNT(*) FROM admin_questions')
+            n = cursor.fetchone()[0]
+        if n == 0:
+            old = (get_setting('member_question', '') or '').strip()
+            if old:
+                add_question(old, get_setting('member_question_enabled', '0') == '1')
+    except Exception:
+        pass
+
+
+def add_question(text, enabled=True, lang='all'):
+    """يضيف سؤالاً جديداً (lang: all/ar/en) ويرجع معرّفه."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('INSERT INTO admin_questions (text, enabled, lang) VALUES (%s, %s, %s) RETURNING id',
+                       (text, enabled, lang))
+        return cursor.fetchone()[0]
+
+
+def delete_question(qid):
+    """يحذف سؤالاً وكل إجاباته."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('DELETE FROM admin_questions WHERE id = %s', (qid,))
+        cursor.execute('DELETE FROM member_answers WHERE question_id = %s', (qid,))
+
+
+def set_question_enabled(qid, enabled):
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('UPDATE admin_questions SET enabled = %s WHERE id = %s', (enabled, qid))
+
+
+def get_questions():
+    """كل الأسئلة: (id, text, enabled, lang)."""
+    with db_cursor() as cursor:
+        cursor.execute('SELECT id, text, enabled, lang FROM admin_questions ORDER BY id')
+        return cursor.fetchall()
+
+
+def get_unanswered_questions(user_id):
+    """أسئلة مفعّلة لم يجب عليها المستخدم بعد، أُضيفت بعد انضمامه، وتطابق لغته:
+    (id, text). السؤال الموجّه لـ ar/en يصل فئته فقط؛ all يصل الجميع."""
+    with db_cursor() as cursor:
+        cursor.execute('''
+            SELECT q.id, q.text FROM admin_questions q
+            WHERE q.enabled = TRUE
+              AND q.created_at >= COALESCE(
+                    (SELECT created_at FROM users WHERE user_id = %s), NOW())
+              AND (COALESCE(q.lang, 'all') = 'all'
+                   OR COALESCE(q.lang, 'all') = COALESCE(
+                        (SELECT language FROM users WHERE user_id = %s), 'ar'))
+              AND NOT EXISTS (
+                SELECT 1 FROM member_answers a
+                WHERE a.user_id = %s AND a.question_id = q.id)
+            ORDER BY q.id
+        ''', (user_id, user_id, user_id))
+        return cursor.fetchall()
+
+
+def _ensure_reminder_column():
+    """عمود يحفظ معرّف آخر رسالة تذكير لكل مستخدم (لحذفها قبل إرسال أحدث)."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_reminder_msg_id BIGINT')
+
+
+def get_inactive_users(days=7):
+    """أعضاء خاملون: مرّ على انضمامهم ≥ days ولم يحمّلوا منذ ≥ days (أو أبداً).
+    يرجع (user_id, language, last_reminder_msg_id)."""
+    with db_cursor() as cursor:
+        cursor.execute('''
+            SELECT u.user_id, COALESCE(u.language, 'ar'), u.last_reminder_msg_id
+            FROM users u
+            LEFT JOIN (
+                SELECT user_id, MAX(created_at) AS last_dl
+                FROM download_history GROUP BY user_id
+            ) h ON u.user_id = h.user_id
+            WHERE u.created_at < NOW() - (%s * INTERVAL '1 day')
+              AND (h.last_dl IS NULL OR h.last_dl < NOW() - (%s * INTERVAL '1 day'))
+        ''', (days, days))
+        return cursor.fetchall()
+
+
+def set_last_reminder(user_id, msg_id):
+    """يحفظ معرّف آخر رسالة تذكير أُرسلت للمستخدم."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('UPDATE users SET last_reminder_msg_id = %s WHERE user_id = %s',
+                       (msg_id, user_id))
+
+
+def get_language_counts():
+    """عدد المستخدمين حسب اللغة: {'ar': n, 'en': n} (غير المحدد يُحسب عربياً)."""
+    with db_cursor() as cursor:
+        cursor.execute("SELECT COALESCE(language, 'ar') AS l, COUNT(*) FROM users GROUP BY l")
+        rows = cursor.fetchall()
+    d = {'ar': 0, 'en': 0}
+    for l, c in rows:
+        if l == 'en':
+            d['en'] += c
+        else:
+            d['ar'] += c
+    return d
+
+
+def save_question_answer(user_id, qid, answer):
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            INSERT INTO member_answers (user_id, question_id, answer)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (user_id, question_id) DO UPDATE SET answer = EXCLUDED.answer
+        ''', (user_id, qid, answer))
+
+
+def get_question_answer_stats(qid):
+    """إحصائية إجابات سؤال محدد: {'yes': n, 'no': n}."""
+    with db_cursor() as cursor:
+        cursor.execute('SELECT answer, COUNT(*) FROM member_answers WHERE question_id = %s GROUP BY answer',
+                       (qid,))
+        rows = cursor.fetchall()
+    d = {'yes': 0, 'no': 0}
+    for a, c in rows:
+        if a in d:
+            d[a] = c
+    return d
+
+
+def get_member_answers(user_id):
+    """إجابات عضو على كل الأسئلة: (text, answer)."""
+    with db_cursor() as cursor:
+        cursor.execute('''
+            SELECT q.text, a.answer FROM member_answers a
+            JOIN admin_questions q ON a.question_id = q.id
+            WHERE a.user_id = %s ORDER BY a.question_id
+        ''', (user_id,))
+        return cursor.fetchall()
