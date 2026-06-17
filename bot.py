@@ -1562,6 +1562,20 @@ async def _send_daily_remaining_notice(message, user_id, lang):
             await message.reply_text(t('downloads_remaining', lang, remaining=remaining))
 
 
+async def _edit_send_progress(msg, title, done, total, sent, fail, removed):
+    """يحدّث رسالة عدّاد الإرسال الحيّ (للبث/التذكير). يتجاهل أخطاء التعديل."""
+    try:
+        await msg.edit_text(
+            f"{title}\n\n"
+            f"📊 التقدّم: **{done}/{total}**\n"
+            f"✅ وصلت: **{sent}**\n"
+            f"❌ فشلت: **{fail}**\n"
+            f"🗑️ حُذفوا (غادروا): **{removed}**"
+        )
+    except Exception:
+        pass
+
+
 async def _try_send_from_cache(client, message, status_msg, ckey, quality,
                                user_id, user_name, user_username, url, lang):
     """يحاول إعادة إرسال الوسائط من الكاش بلا تحميل. يرجع True إن نجح ذلك."""
@@ -4413,8 +4427,9 @@ async def handle_subscription_settings(client, callback_query):
         progress = await callback_query.message.edit_text(
             f"📤 جاري إرسال التذكير لـ {len(inactive)} عضو..."
         )
+        total = len(inactive)
         sent_n = fail_n = removed_n = 0
-        for uid, ulang, old_msg in inactive:
+        for idx, (uid, ulang, old_msg) in enumerate(inactive, 1):
             try:
                 # احذف التذكير السابق ليبقى الأحدث فقط
                 if old_msg:
@@ -4438,6 +4453,10 @@ async def handle_subscription_settings(client, callback_query):
                 fail_n += 1
             except Exception:
                 fail_n += 1
+            # عدّاد حيّ يتحدّث كل 15 عضواً
+            if idx % 15 == 0:
+                await _edit_send_progress(progress, "📨 جاري إرسال التذكير...",
+                                          idx, total, sent_n, fail_n, removed_n)
         await progress.edit_text(
             f"✅ **اكتمل إرسال التذكير**\n\n"
             f"✅ وصلت: {sent_n}\n❌ فشلت: {fail_n}\n🗑️ حُذفوا (غادروا): {removed_n}"
@@ -5363,8 +5382,9 @@ async def handle_admin_input(client, message):
             success_count = 0
             fail_count = 0
             removed_count = 0
+            total_targets = len(all_users)
 
-            for uid in all_users:
+            for idx, uid in enumerate(all_users, 1):
                 try:
                     # Get each user's preferred language
                     user_lang = subdb.get_user_language(uid)
@@ -5397,6 +5417,11 @@ async def handle_admin_input(client, message):
                 except Exception:
                     # خطأ مؤقت/غير معروف → نُبقي العضو
                     fail_count += 1
+                # عدّاد حيّ يتحدّث كل 15 رسالة
+                if idx % 15 == 0:
+                    await _edit_send_progress(progress, "📢 جاري البث الجماعي...",
+                                              idx, total_targets, success_count,
+                                              fail_count, removed_count)
 
             # عدد من وصلتهم الرسالة فعلاً هو الأساس لحساب "لم يتفاعلوا"
             broadcast_polls[bid]['total'] = success_count
