@@ -1533,15 +1533,18 @@ def cleanup_download_dir(dl_dir):
         logger.error(f"❌ خطأ في حذف مجلد التحميل {dl_dir}: {e}")
 
 
-def _build_media_caption(title, file_size_mb, duration, user_name):
-    """وصف الوسائط الموحّد: العنوان قابل للنسخ (monospace) + الحجم والمدة."""
+def _build_media_caption(title, file_size_mb, duration, user_name, bot_username=None):
+    """وصف الوسائط الموحّد: العنوان قابل للنسخ (monospace) + الحجم والمدة +
+    يوزر البوت (يبقى مع الفيديو عند إعادة إرساله)."""
     safe_title = (title or 'فيديو').replace('`', "'")[:300]
     dur_line = f"⏱️ {int(duration)//60}:{int(duration)%60:02d}\n" if duration else ""
+    promo = f"\n\n📥 @{bot_username}" if bot_username else ""
     return (
         f"🎬 `{safe_title}`\n\n"
         f"📊 {file_size_mb:.1f} MB\n"
         f"{dur_line}"
         f"👤 {user_name}"
+        f"{promo}"
     )
 
 
@@ -1573,7 +1576,8 @@ async def _try_send_from_cache(client, message, status_msg, ckey, quality,
     title = cached.get('title') or 'فيديو'
     fsize = cached.get('file_size_mb') or 0.0
     cdur = cached.get('duration')
-    caption = _build_media_caption(title, fsize, cdur, user_name)
+    caption = _build_media_caption(title, fsize, cdur, user_name,
+                                   bot_username=await _get_bot_username(client))
 
     try:
         if cached['kind'] == 'audio':
@@ -1962,12 +1966,10 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                            progress_bar='▱▱▱▱▱▱▱▱▱▱')
         await status_msg.edit_text(initial_progress)
         
-        # العنوان داخل تنسيق monospace (`...`) = يُنسخ بالضغط عليه في تيليجرام
-        caption = (
-            f"🎬 `{title}`\n\n"
-            f"📊 {file_size_mb:.1f} MB\n"
-            f"⏱️ {int(duration)//60}:{int(duration)%60:02d}\n"
-            f"👤 {user_name}"
+        # الوصف الموحّد: العنوان قابل للنسخ + يوزر البوت (يبقى مع الفيديو)
+        caption = _build_media_caption(
+            title, file_size_mb, duration, user_name,
+            bot_username=await _get_bot_username(client)
         )
         
         if is_audio:
