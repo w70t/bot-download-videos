@@ -199,7 +199,8 @@ pending_downloads = {}
 pending_playlists = {}
 
 # عدد التحميلات الافتراضي عند الدعوة، وأقصى عدد مقاطع لقائمة التشغيل
-REFERRAL_BONUS = int(os.getenv("REFERRAL_BONUS", "3"))
+# كل دعوة ناجحة تزيد الحد اليومي للداعي بهذا المقدار (دائماً)
+REFERRAL_BONUS = int(os.getenv("REFERRAL_BONUS", "1"))
 PLAYLIST_MAX = int(os.getenv("PLAYLIST_MAX", "5"))
 
 # حالة المحادثة بين الأدمن والأعضاء عبر زر الرد
@@ -1412,27 +1413,24 @@ async def process_download_from_queue(task: DownloadTask):
         # Check subscription and video duration
         is_subscribed = subdb.is_user_subscribed(user_id)
         
-        # Check daily limit for non-subscribers
+        # Check daily limit for non-subscribers (الحد = الأساس + دعواته الدائمة)
         if not is_subscribed:
-            daily_limit = subdb.get_daily_limit()
-            
-            if daily_limit != -1:
+            base_limit = subdb.get_daily_limit()
+
+            if base_limit != -1:
+                effective_limit = base_limit + subdb.get_bonus_downloads(user_id)
                 daily_count = subdb.check_daily_limit(user_id)
-                
-                if daily_count >= daily_limit:
-                    # جرّب استهلاك رصيد إضافي من الدعوات قبل الحظر
-                    if subdb.consume_bonus_download(user_id):
-                        logger.info(f"🎟️ استُخدم رصيد دعوة إضافي للمستخدم {user_id}")
-                    else:
-                        await status.edit_text(
-                            t('daily_limit_exceeded', lang, limit=daily_limit, count=daily_count),
-                            reply_markup=InlineKeyboardMarkup([
-                                [InlineKeyboardButton(t('subscribe_now', lang), callback_data="pay_binance")],
-                                [_invite_button(lang)],
-                                [InlineKeyboardButton(t('contact_developer', lang), url=f"https://t.me/{subdb.get_setting('telegram_support', os.getenv('SUPPORT_USERNAME', ''))}")]
-                            ])
-                        )
-                        return
+
+                if daily_count >= effective_limit:
+                    await status.edit_text(
+                        t('daily_limit_exceeded', lang, limit=effective_limit, count=daily_count),
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton(t('subscribe_now', lang), callback_data="pay_binance")],
+                            [_invite_button(lang)],
+                            [InlineKeyboardButton(t('contact_developer', lang), url=f"https://t.me/{subdb.get_setting('telegram_support', os.getenv('SUPPORT_USERNAME', ''))}")]
+                        ])
+                    )
+                    return
         
         max_duration_minutes = subdb.get_max_duration()
         max_duration_seconds = max_duration_minutes * 60
@@ -1552,10 +1550,11 @@ async def _send_daily_remaining_notice(message, user_id, lang):
     if subdb.is_user_subscribed(user_id):
         return
     subdb.increment_download_count(user_id)
-    daily_limit = subdb.get_daily_limit()
-    if daily_limit != -1:
+    base_limit = subdb.get_daily_limit()
+    if base_limit != -1:
+        effective_limit = base_limit + subdb.get_bonus_downloads(user_id)
         daily_count = subdb.check_daily_limit(user_id)
-        remaining = daily_limit - daily_count
+        remaining = effective_limit - daily_count
         if remaining > 0:
             await message.reply_text(t('downloads_remaining', lang, remaining=remaining))
 
@@ -2096,12 +2095,13 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         if not subdb.is_user_subscribed(user_id):
             subdb.increment_download_count(user_id)
             
-            # عرض رسالة التحميلات المتبقية
-            daily_limit = subdb.get_daily_limit()
-            if daily_limit != -1:  # فقط إذا لم يكن غير محدود
+            # عرض رسالة التحميلات المتبقية (الحد = الأساس + دعواته)
+            base_limit = subdb.get_daily_limit()
+            if base_limit != -1:  # فقط إذا لم يكن غير محدود
+                effective_limit = base_limit + subdb.get_bonus_downloads(user_id)
                 daily_count = subdb.check_daily_limit(user_id)
-                remaining = daily_limit - daily_count
-                
+                remaining = effective_limit - daily_count
+
                 if remaining > 0:
                     # الحصول على لغة المستخدم
                     lang = subdb.get_user_language(user_id)
@@ -2191,13 +2191,15 @@ async def _process_referral_start(client, message, new_user_id):
     if not subdb.record_referral(new_user_id, referrer_id):
         return  # دعوة مكررة أو دعوة النفس
     subdb.add_bonus_downloads(referrer_id, REFERRAL_BONUS)
-    balance = subdb.get_bonus_downloads(referrer_id)
-    logger.info(f"🎁 دعوة جديدة: {new_user_id} عبر {referrer_id} (+{REFERRAL_BONUS})")
+    # الحد اليومي الجديد للداعي = الأساس + مجموع دعواته
+    base = subdb.get_daily_limit()
+    new_limit = (base + subdb.get_bonus_downloads(referrer_id)) if base != -1 else '∞'
+    logger.info(f"🎁 دعوة جديدة: {new_user_id} عبر {referrer_id} (الحد الآن {new_limit})")
     try:
         r_lang = subdb.get_user_language(referrer_id)
         await client.send_message(
             referrer_id,
-            t('referral_granted', r_lang, bonus=REFERRAL_BONUS, balance=balance)
+            t('referral_granted', r_lang, bonus=REFERRAL_BONUS, limit=new_limit)
         )
     except Exception:
         pass
@@ -2251,9 +2253,10 @@ async def _build_invite_text(client, user_id, lang):
         return None
     link = f"https://t.me/{uname}?start=ref_{user_id}"
     count = subdb.get_referral_count(user_id)
-    balance = subdb.get_bonus_downloads(user_id)
+    base = subdb.get_daily_limit()
+    limit = (base + subdb.get_bonus_downloads(user_id)) if base != -1 else '∞'
     return t('invite_info', lang, link=link, bonus=REFERRAL_BONUS,
-             count=count, balance=balance)
+             count=count, limit=limit)
 
 
 def _invite_button(lang):
@@ -3673,17 +3676,19 @@ async def handle_url(client, message):
     # فحص الحد اليومي للمستخدمين غير المشتركين
     # Check daily limit for non-subscribers
     if not is_subscribed:
-        daily_limit = subdb.get_daily_limit()
-        
+        base_limit = subdb.get_daily_limit()
+
         # فقط فحص إذا كان الحد ليس "غير محدود" (-1)
-        if daily_limit != -1:
+        if base_limit != -1:
+            effective_limit = base_limit + subdb.get_bonus_downloads(user_id)
             daily_count = subdb.check_daily_limit(user_id)
-            
-            if daily_count >= daily_limit:
+
+            if daily_count >= effective_limit:
                 await status.edit_text(
-                    t('daily_limit_exceeded', lang, limit=daily_limit, count=daily_count),
+                    t('daily_limit_exceeded', lang, limit=effective_limit, count=daily_count),
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton(t('subscribe_now', lang), callback_data="pay_binance")],
+                        [_invite_button(lang)],
                         [InlineKeyboardButton(t('contact_developer', lang), url=f"https://t.me/{subdb.get_setting('telegram_support', os.getenv('SUPPORT_USERNAME', ''))}")]
                     ])
                 )
