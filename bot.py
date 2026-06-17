@@ -1080,6 +1080,16 @@ def _is_facebook_cookie_issue(err):
     return 'cannot parse data' in msg
 
 
+def _is_cookie_file_issue(err):
+    """هل الخطأ بسبب ملف كوكيز تالف/غير صالح (ليس بصيغة Netscape)؟
+
+    ملف كوكيز معطوب يجعل yt-dlp يفشل قبل بدء الاستخراج لأي منصة، فنتجاوزه
+    ونعيد المحاولة بدون كوكيز (يكفي للمحتوى العام).
+    """
+    msg = str(err).lower()
+    return 'netscape' in msg and 'cookies' in msg
+
+
 async def get_video_info(url: str):
     """استخراج معلومات الفيديو"""
     try:
@@ -1138,6 +1148,10 @@ async def get_video_info(url: str):
             # فيسبوك بكوكيز فاسدة قد يكسر استخراج المحتوى العام → أعد المحاولة بدون كوكيز
             if cookie_file and is_facebook and _is_facebook_cookie_issue(e):
                 logger.warning("⚠️ فشل فيسبوك مع الكوكيز (Cannot parse data)، إعادة المحاولة بدون كوكيز...")
+                return await loop.run_in_executor(None, lambda: extract(False))
+            # ملف كوكيز تالف (صيغة غير صحيحة) يفشل لأي منصة → أعد المحاولة بدون كوكيز
+            if cookie_file and _is_cookie_file_issue(e):
+                logger.warning(f"⚠️ ملف الكوكيز تالف/غير صالح ({cookie_file})، إعادة المحاولة بدون كوكيز...")
                 return await loop.run_in_executor(None, lambda: extract(False))
             raise
     except Exception as e:
@@ -2114,6 +2128,10 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             # فيسبوك بكوكيز فاسدة قد يكسر تحميل المحتوى العام → أعد المحاولة بدون كوكيز
             elif ydl_opts.get('cookiefile') and is_facebook_url and _is_facebook_cookie_issue(dl_err):
                 logger.warning("⚠️ فشل تحميل فيسبوك مع الكوكيز (Cannot parse data)، إعادة المحاولة بدون كوكيز...")
+                info, file_path = await loop.run_in_executor(None, lambda: download(False))
+            # ملف كوكيز تالف (صيغة غير صحيحة) يفشل لأي منصة → أعد المحاولة بدون كوكيز
+            elif ydl_opts.get('cookiefile') and _is_cookie_file_issue(dl_err):
+                logger.warning(f"⚠️ ملف الكوكيز تالف/غير صالح ({ydl_opts.get('cookiefile')})، إعادة المحاولة بدون كوكيز...")
                 info, file_path = await loop.run_in_executor(None, lambda: download(False))
             # الصيغة المطلوبة غير متوفرة → أعد المحاولة بأفضل صيغة متاحة
             elif 'requested format is not available' in msg or 'no video formats' in msg:
