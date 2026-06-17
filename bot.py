@@ -1308,15 +1308,12 @@ async def process_download_from_queue(task: DownloadTask):
             await show_subscription_screen(app, status, user_id, title, duration, max_duration_minutes)
             return
         
-        # Show quality selection
+        # Show quality selection (زرّان فقط: فيديو بأفضل جودة حتى 1080p + صوتي)
         keyboard = [
             [InlineKeyboardButton(t('quality_best', lang), callback_data="quality_best"),
-             InlineKeyboardButton(t('quality_medium', lang), callback_data="quality_medium")],
-            [InlineKeyboardButton(t('quality_480', lang), callback_data="quality_480"),
-             InlineKeyboardButton(t('quality_360', lang), callback_data="quality_360")],
-            [InlineKeyboardButton(t('quality_audio', lang), callback_data="quality_audio")],
+             InlineKeyboardButton(t('quality_audio', lang), callback_data="quality_audio")],
         ]
-        
+
         await status.edit_text(
             t('choose_quality', lang, title=title, duration=duration_str),
             reply_markup=InlineKeyboardMarkup(keyboard)
@@ -3008,15 +3005,12 @@ async def handle_url(client, message):
         await show_subscription_screen(client, status, user_id, title, duration, max_duration_minutes)
         return
     
-    # Show quality selection
+    # Show quality selection (زرّان فقط: فيديو بأفضل جودة حتى 1080p + صوتي)
     keyboard = [
         [InlineKeyboardButton(t('quality_best', lang), callback_data="quality_best"),
-         InlineKeyboardButton(t('quality_medium', lang), callback_data="quality_medium")],
-        [InlineKeyboardButton(t('quality_480', lang), callback_data="quality_480"),
-         InlineKeyboardButton(t('quality_360', lang), callback_data="quality_360")],
-        [InlineKeyboardButton(t('quality_audio', lang), callback_data="quality_audio")],
+         InlineKeyboardButton(t('quality_audio', lang), callback_data="quality_audio")],
     ]
-    
+
     await status.edit_text(
         t('choose_quality', lang, title=title, duration=duration_str),
         reply_markup=InlineKeyboardMarkup(keyboard)
