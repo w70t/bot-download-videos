@@ -1074,6 +1074,7 @@ def _ensure_questions_tables():
             )
         ''')
         cursor.execute("ALTER TABLE admin_questions ADD COLUMN IF NOT EXISTS lang TEXT DEFAULT 'all'")
+        cursor.execute("ALTER TABLE admin_questions ADD COLUMN IF NOT EXISTS gender TEXT DEFAULT 'all'")
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS member_answers (
                 user_id BIGINT NOT NULL,
@@ -1096,11 +1097,12 @@ def _ensure_questions_tables():
         pass
 
 
-def add_question(text, enabled=True, lang='all'):
-    """يضيف سؤالاً جديداً (lang: all/ar/en) ويرجع معرّفه."""
+def add_question(text, enabled=True, lang='all', gender='all'):
+    """يضيف سؤالاً جديداً (lang: all/ar/en، gender: all/male/female) ويرجع معرّفه."""
     with db_cursor(commit=True) as cursor:
-        cursor.execute('INSERT INTO admin_questions (text, enabled, lang) VALUES (%s, %s, %s) RETURNING id',
-                       (text, enabled, lang))
+        cursor.execute(
+            'INSERT INTO admin_questions (text, enabled, lang, gender) VALUES (%s, %s, %s, %s) RETURNING id',
+            (text, enabled, lang, gender))
         return cursor.fetchone()[0]
 
 
@@ -1117,15 +1119,15 @@ def set_question_enabled(qid, enabled):
 
 
 def get_questions():
-    """كل الأسئلة: (id, text, enabled, lang)."""
+    """كل الأسئلة: (id, text, enabled, lang, gender)."""
     with db_cursor() as cursor:
-        cursor.execute('SELECT id, text, enabled, lang FROM admin_questions ORDER BY id')
+        cursor.execute('SELECT id, text, enabled, lang, gender FROM admin_questions ORDER BY id')
         return cursor.fetchall()
 
 
 def get_unanswered_questions(user_id):
-    """أسئلة مفعّلة لم يجب عليها المستخدم بعد، أُضيفت بعد انضمامه، وتطابق لغته:
-    (id, text). السؤال الموجّه لـ ar/en يصل فئته فقط؛ all يصل الجميع."""
+    """أسئلة مفعّلة لم يجب عليها المستخدم، أُضيفت بعد انضمامه، وتطابق لغته وجنسه.
+    all يصل الجميع؛ ar/en و male/female يصل الفئة المطابقة فقط."""
     with db_cursor() as cursor:
         cursor.execute('''
             SELECT q.id, q.text FROM admin_questions q
@@ -1135,12 +1137,33 @@ def get_unanswered_questions(user_id):
               AND (COALESCE(q.lang, 'all') = 'all'
                    OR COALESCE(q.lang, 'all') = COALESCE(
                         (SELECT language FROM users WHERE user_id = %s), 'ar'))
+              AND (COALESCE(q.gender, 'all') = 'all'
+                   OR COALESCE(q.gender, 'all') = (
+                        SELECT gender FROM member_survey WHERE user_id = %s))
               AND NOT EXISTS (
                 SELECT 1 FROM member_answers a
                 WHERE a.user_id = %s AND a.question_id = q.id)
             ORDER BY q.id
-        ''', (user_id, user_id, user_id))
+        ''', (user_id, user_id, user_id, user_id))
         return cursor.fetchall()
+
+
+def get_target_users(gender='all', lang='all'):
+    """معرّفات المستخدمين حسب الجنس واللغة معاً (للبث المستهدف).
+    gender: all/male/female | lang: all/ar/en. العربية تشمل غير المحدد."""
+    q = ("SELECT u.user_id FROM users u "
+         "LEFT JOIN member_survey s ON u.user_id = s.user_id WHERE 1=1")
+    params = []
+    if lang == 'ar':
+        q += " AND COALESCE(u.language, 'ar') = 'ar'"
+    elif lang == 'en':
+        q += " AND u.language = 'en'"
+    if gender in ('male', 'female'):
+        q += " AND s.gender = %s"
+        params.append(gender)
+    with db_cursor() as cursor:
+        cursor.execute(q, tuple(params))
+        return [r[0] for r in cursor.fetchall()]
 
 
 def _ensure_reminder_column():
