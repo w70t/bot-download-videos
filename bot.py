@@ -4683,13 +4683,33 @@ async def handle_message_type(client, callback_query):
     action = callback_query.data.replace('msg_', '')
     
     if action == 'broadcast_all':
+        ar_count = len(subdb.get_users_by_language('ar'))
+        en_count = len(subdb.get_users_by_language('en'))
+        total = ar_count + en_count
         await callback_query.message.edit_text(
-            "📢 **إرسال رسالة لجميع المستخدمين**\n\n"
-            "أرسل الرسالة التي تريد إرسالها لجميع مستخدمي البوت\n\n"
-            f"⚠️ سيتم إرسالها لـ **{subdb.get_user_stats()['total']}** مستخدم",
+            "📢 **بث جماعي — اختر الجمهور حسب اللغة**\n\n"
+            f"🌐 الجميع: {total}\n"
+            f"🇸🇦 العربية: {ar_count}\n"
+            f"🇬🇧 الإنجليزية: {en_count}\n\n"
+            "اختر لمن تُرسل (الإنجليزي لا يصله العربي والعكس):",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"🌐 الجميع ({total})", callback_data="msg_bcast_all")],
+                [InlineKeyboardButton(f"🇸🇦 العربية ({ar_count})", callback_data="msg_bcast_ar"),
+                 InlineKeyboardButton(f"🇬🇧 الإنجليزية ({en_count})", callback_data="msg_bcast_en")],
+                [InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")],
+            ])
+        )
+
+    elif action in ('bcast_all', 'bcast_ar', 'bcast_en'):
+        target = {'bcast_all': 'all', 'bcast_ar': 'ar', 'bcast_en': 'en'}[action]
+        label = {'all': '🌐 الجميع', 'ar': '🇸🇦 العربية فقط', 'en': '🇬🇧 الإنجليزية فقط'}[target]
+        count = len(subdb.get_users_by_language(None if target == 'all' else target))
+        await callback_query.message.edit_text(
+            f"📢 **بث إلى: {label}** ({count} مستخدم)\n\n"
+            "أرسل الآن نص الرسالة التي تريد بثّها.",
             reply_markup=_sub_settings_back_kb()
         )
-        pending_downloads[user_id] = {'waiting_for': 'broadcast_message'}
+        pending_downloads[user_id] = {'waiting_for': 'broadcast_message', 'target_lang': target}
 
     elif action == 'direct_user':
         await callback_query.message.edit_text(
@@ -5207,8 +5227,9 @@ async def handle_admin_input(client, message):
             global broadcast_counter
             broadcast_text = message.text.strip()
 
-            # الحصول على جميع المستخدمين
-            all_users = subdb.get_all_users()
+            # الجمهور المستهدف حسب اللغة المختارة (all/ar/en)
+            target_lang = data.get('target_lang', 'all')
+            all_users = subdb.get_users_by_language(None if target_lang == 'all' else target_lang)
 
             # إنشاء استبيان بث جديد بإحصائية حيّة
             broadcast_counter += 1
@@ -5232,10 +5253,10 @@ async def handle_admin_input(client, message):
             fail_count = 0
             removed_count = 0
 
-            for user in all_users:
+            for uid in all_users:
                 try:
                     # Get each user's preferred language
-                    user_lang = subdb.get_user_language(user[0])
+                    user_lang = subdb.get_user_language(uid)
 
                     # أزرار: نعم / لا + رد للمطور
                     kb = InlineKeyboardMarkup([
@@ -5245,7 +5266,7 @@ async def handle_admin_input(client, message):
                     ])
 
                     await client.send_message(
-                        chat_id=user[0],  # user_id
+                        chat_id=uid,
                         text=f"{t('broadcast_message_prefix', user_lang)}\n\n{broadcast_text}",
                         reply_markup=kb
                     )
@@ -5257,7 +5278,7 @@ async def handle_admin_input(client, message):
                 except GONE_USER_ERRORS:
                     # العضو غادر/حظر البوت → احذفه من قاعدة البيانات
                     try:
-                        subdb.delete_user(user[0])
+                        subdb.delete_user(uid)
                         removed_count += 1
                     except Exception:
                         pass

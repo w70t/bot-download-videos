@@ -427,6 +427,19 @@ def get_all_users():
         ''')
         return cursor.fetchall()
 
+
+def get_users_by_language(lang=None):
+    """معرّفات المستخدمين حسب اللغة. lang='ar' يشمل من لغته غير محددة (الافتراضي
+    عربي). lang='en' للإنجليزية. None/أي قيمة أخرى = الجميع."""
+    with db_cursor() as cursor:
+        if lang == 'ar':
+            cursor.execute("SELECT user_id FROM users WHERE COALESCE(language, 'ar') = 'ar'")
+        elif lang == 'en':
+            cursor.execute("SELECT user_id FROM users WHERE language = 'en'")
+        else:
+            cursor.execute("SELECT user_id FROM users")
+        return [r[0] for r in cursor.fetchall()]
+
 def find_user_by_id(user_id: int):
     """البحث عن مستخدم بواسطة ID"""
     with db_cursor() as cursor:
