@@ -62,6 +62,10 @@ TRANSLATIONS = {
         'daily_limit_exceeded': '⚠️ **تجاوزت الحد اليومي**\n\n🔁 **الحد المسموح:** {limit} مرات في اليوم\n📊 **تحميلاتك اليوم:** {count} مرات',
         'downloads_remaining': '✅ **تم التحميل بنجاح!**\n\n📊 **باقي لك:** {remaining} تحميلات اليوم',
         'unlimited_downloads': '♾️ غير محدود',
+        'file_too_large': '❌ **الملف كبير جداً!**\n\n📊 {size} MB\n🔒 الحد الأقصى: 2000 MB',
+        'problem_fixed': '✅ **تم إصلاح مشكلتك!**\n\nالمشكلة التي واجهتها مع الرابط:\n`{url}`\n\nتم حلها الآن. يمكنك المحاولة مرة أخرى! 🎉',
+        'payment_received': '✅ **تم استلام إثبات الدفع!**\n\nسيتم مراجعة دفعتك من قبل المسؤول.\nستصلك رسالة فور تفعيل اشتراكك! 🎉\n\n⏳ الانتظار المتوقع: أقل من 24 ساعة',
+        'payment_rejected': '❌ **تم رفض دفعتك**\n\nقد يكون هناك مشكلة في إثبات الدفع.\nتواصل مع المطور: @{support}',
         
         # الأخطاء - Errors
         'error_occurred': '❌ **حدث خطأ**\n\n{error}',
@@ -210,6 +214,10 @@ TRANSLATIONS = {
         'daily_limit_exceeded': '⚠️ **Daily Limit Exceeded**\n\n🔁 **Allowed Limit:** {limit} times per day\n📊 **Your Downloads Today:** {count} times',
         'downloads_remaining': '✅ **Download Successful!**\n\n📊 **You have:** {remaining} downloads remaining today',
         'unlimited_downloads': '♾️ Unlimited',
+        'file_too_large': '❌ **File too large!**\n\n📊 {size} MB\n🔒 Maximum: 2000 MB',
+        'problem_fixed': '✅ **Your issue is fixed!**\n\nThe problem you had with the link:\n`{url}`\n\nIt has been resolved. You can try again! 🎉',
+        'payment_received': '✅ **Payment proof received!**\n\nYour payment will be reviewed by the admin.\nYou will get a message as soon as your subscription is activated! 🎉\n\n⏳ Expected wait: under 24 hours',
+        'payment_rejected': '❌ **Your payment was rejected**\n\nThere may be an issue with the payment proof.\nContact the developer: @{support}',
         
         # Errors
         'error_occurred': '❌ **An Error Occurred**\n\n{error}',

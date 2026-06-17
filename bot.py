@@ -1948,11 +1948,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
 
         # التحقق من الحجم
         if file_size_mb > 2000:
-            await status_msg.edit_text(
-                f"❌ **الملف كبير جداً!**\n\n"
-                f"📊 {file_size_mb:.1f} MB\n"
-                f"🔒 الحد الأقصى: 2000 MB"
-            )
+            await status_msg.edit_text(t('file_too_large', lang, size=f"{file_size_mb:.1f}"))
             os.remove(file_path)
             return
         # Upload
@@ -2940,12 +2936,10 @@ async def handle_resolve_error(client, callback_query):
     
     # إرسال رسالة للمستخدم
     try:
+        u_lang = subdb.get_user_language(error_data['user_id'])
         await client.send_message(
             chat_id=error_data['user_id'],
-            text=f"✅ **تم إصلاح مشكلتك!**\n\n"
-                 f"المشكلة التي واجهتها مع الرابط:\n"
-                 f"`{error_data['url'][:50]}...`\n\n"
-                 f"تم حلها الآن. يمكنك المحاولة مرة أخرى! 🎉"
+            text=t('problem_fixed', u_lang, url=f"{error_data['url'][:50]}...")
         )
         logger.info(f"✅ تم إرسال إشعار الحل للمستخدم {error_data['user_id']}")
     except Exception as e:
@@ -3968,13 +3962,8 @@ async def handle_payment_proof(client, message):
     # حذف من pending
     del pending_downloads[user_id]
     
-    # إرسال إشعار للمستخدم
-    await message.reply_text(
-        "✅ **تم استلام إثبات الدفع!**\n\n"
-        "سيتم مراجعة دفعتك من قبل المسؤول.\n"
-        "ستصلك رسالة فور تفعيل اشتراكك! 🎉\n\n"
-        "⏳ الانتظار المتوقع: أقل من 24 ساعة"
-    )
+    # إرسال إشعار للمستخدم بلغته
+    await message.reply_text(t('payment_received', subdb.get_user_language(user_id)))
     
     # إرسال إشعار للأدمن
     admin_id = int(os.getenv("ADMIN_ID"))
@@ -4089,11 +4078,7 @@ async def handle_reject_payment(client, callback_query):
             telegram_support = subdb.get_setting('telegram_support', os.getenv('SUPPORT_USERNAME', ''))
             await client.send_message(
                 chat_id=user_id,
-                text=(
-                    "❌ **تم رفض دفعتك**\n\n"
-                    "قد يكون هناك مشكلة في إثبات الدفع.\n"
-                    f"تواصل مع المطور: @{telegram_support}"
-                )
+                text=t('payment_rejected', subdb.get_user_language(user_id), support=telegram_support)
             )
         except Exception:
             pass
