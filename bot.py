@@ -2432,7 +2432,11 @@ async def handle_admin_unban_btn(client, callback_query):
 # ═══════════════════════════════════════════════════════════════
 
 def _has_active_questions():
-    return any(enabled for _id, _txt, enabled in subdb.get_questions())
+    return any(enabled for _id, _txt, enabled, _lang in subdb.get_questions())
+
+
+def _lang_flag(lang):
+    return {'ar': '🇸🇦', 'en': '🇬🇧'}.get(lang, '🌐')
 
 
 def _gender_keyboard(lang):
@@ -2510,22 +2514,23 @@ def _questions_panel_view():
     """يبني (نص، أزرار) لوحة إدارة أسئلة الأعضاء المتعددة (تفعيل/حذف/إضافة)."""
     questions = subdb.get_questions()
     gs = subdb.get_gender_stats()
+    lc = subdb.get_language_counts()
     text = (
         "❓ **أسئلة الأعضاء**\n\n"
         f"👥 الجنس (يُسأل دائماً): 👨 {gs['male']} | 👩 {gs['female']}\n"
+        f"🌐 اللغة: 🇸🇦 {lc['ar']} | 🇬🇧 {lc['en']}\n"
         f"عدد الأسئلة: {len(questions)}\n\n"
     )
     rows = []
     if not questions:
         text += ("— لا توجد أسئلة بعد. أضف سؤالاً (تفاعلي) ليُطرح على الأعضاء.\n"
-                 "ℹ️ يُطرح السؤال على الأعضاء الحاليين فقط — من ينضمّ لاحقاً لا يراه.")
+                 "ℹ️ يُطرح على الأعضاء الحاليين فقط حسب لغتهم — من ينضمّ لاحقاً لا يراه.")
     else:
-        text += ("يُطرح كل سؤال مفعّل (✅) على الأعضاء الموجودين وقت إضافته،\n"
-                 "ولا يُطرح على من ينضمّ بعده:\n\n")
-        for qid, qtext, enabled in questions:
+        text += ("كل سؤال يُطرح على الموجودين وقت إضافته حسب الجمهور (🌐/🇸🇦/🇬🇧):\n\n")
+        for qid, qtext, enabled, qlang in questions:
             st = subdb.get_question_answer_stats(qid)
             state = '✅' if enabled else '🔕'
-            text += f"{state} {qtext}\n   (✅ نعم {st['yes']} | ❌ لا {st['no']})\n\n"
+            text += f"{state} {_lang_flag(qlang)} {qtext}\n   (✅ نعم {st['yes']} | ❌ لا {st['no']})\n\n"
             rows.append([
                 InlineKeyboardButton("🔕 إيقاف" if enabled else "🔔 تفعيل",
                                      callback_data=f"sub_qtoggle_{qid}"),
@@ -2546,6 +2551,19 @@ async def handle_gender(client, callback_query):
     if not await _prompt_survey_if_needed(callback_query.message.edit_text, uid):
         await callback_query.message.edit_text(t('survey_done', lang))
         await _post_survey_result(client, callback_query.from_user)
+
+
+@app.on_callback_query(filters.regex(r'^editgender_(male|female)$'))
+async def handle_edit_gender(client, callback_query):
+    """تعديل العضو لجنسه — يحدّث قاعدة البيانات فوراً (بدون متابعة الاستبيان)."""
+    await callback_query.answer()
+    uid = callback_query.from_user.id
+    lang = subdb.get_user_language(uid)
+    gender = 'male' if callback_query.data == 'editgender_male' else 'female'
+    subdb.set_gender(uid, gender)
+    await callback_query.message.edit_text(
+        f"{t('gender_updated', lang)}\n\n👥 {_gender_label(gender)}"
+    )
 
 
 @app.on_callback_query(filters.regex(r'^qans_'))
@@ -2603,6 +2621,7 @@ async def cmd_dlstats(client, message):
           cache_hits=cache['hits'], cache_items=cache['items'],
           platforms=platforms, top_users=top_users)
         + f"\n\n👥 **الجنس:** 👨 {gs['male']} | 👩 {gs['female']}"
+        + f"\n🌐 **اللغة:** 🇸🇦 {subdb.get_language_counts()['ar']} | 🇬🇧 {subdb.get_language_counts()['en']}"
     )
 
 
@@ -2658,14 +2677,22 @@ async def cmd_blockedaccs(client, message):
 
 
 @app.on_message(filters.text & filters.regex(
-    r'^(📥 تحميلاتي|📥 My Downloads|🎁 ادعُ أصدقاءك|🎁 Invite Friends)$'))
+    r'^(📥 تحميلاتي|📥 My Downloads|🎁 ادعُ أصدقاءك|🎁 Invite Friends|🧍 تعديل جنسي|🧍 Edit my gender)$'))
 async def handle_feature_buttons(client, message):
-    """أزرار 'تحميلاتي' و'ادعُ أصدقاءك' (عربي/إنجليزي)."""
+    """أزرار 'تحميلاتي' و'ادعُ أصدقاءك' و'تعديل جنسي' (عربي/إنجليزي)."""
     text = (message.text or '').strip()
+    lang = subdb.get_user_language(message.from_user.id)
     if text in ('📥 تحميلاتي', '📥 My Downloads'):
         await _show_history(client, message)
+    elif text in ('🧍 تعديل جنسي', '🧍 Edit my gender'):
+        await message.reply_text(
+            t('edit_gender_prompt', lang),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(t('gender_male', lang), callback_data='editgender_male'),
+                InlineKeyboardButton(t('gender_female', lang), callback_data='editgender_female'),
+            ]])
+        )
     else:
-        lang = subdb.get_user_language(message.from_user.id)
         txt = await _build_invite_text(client, message.from_user.id, lang)
         await message.reply_text(
             txt or t('error_occurred', lang, error="bot username unavailable")
@@ -2732,13 +2759,13 @@ async def start(client, message):
             # مشترك - عرض زر الاشتراك + تحميلاتي/الدعوة + تغيير اللغة
             keyboard = ReplyKeyboardMarkup([
                 [KeyboardButton(t('btn_my_subscription', lang))],
-                [KeyboardButton(t('btn_my_downloads', lang)), KeyboardButton(t('btn_invite', lang))],
+                [KeyboardButton(t('btn_my_downloads', lang)), KeyboardButton(t('btn_invite', lang)), KeyboardButton(t('btn_edit_gender', lang))],
                 [KeyboardButton(t('btn_change_language', lang))]
             ], resize_keyboard=True)
         else:
             # غير مشترك - تحميلاتي/الدعوة + تغيير اللغة
             keyboard = ReplyKeyboardMarkup([
-                [KeyboardButton(t('btn_my_downloads', lang)), KeyboardButton(t('btn_invite', lang))],
+                [KeyboardButton(t('btn_my_downloads', lang)), KeyboardButton(t('btn_invite', lang)), KeyboardButton(t('btn_edit_gender', lang))],
                 [KeyboardButton(t('btn_change_language', lang))]
             ], resize_keyboard=True)
     
@@ -4291,13 +4318,32 @@ async def handle_subscription_settings(client, callback_query):
         return
 
     if action == 'qadd':
+        lc = subdb.get_language_counts()
         await callback_query.message.edit_text(
-            "➕ **إضافة سؤال للأعضاء**\n\n"
-            "أرسل نص السؤال (يُجاب عليه بنعم/لا).\n"
-            "سيُطلب من كل عضو الإجابة عليه قبل التحميل.",
+            "➕ **إضافة سؤال — لمن يُطرح؟**\n\n"
+            f"🇸🇦 العربية: {lc['ar']} | 🇬🇧 الإنجليزية: {lc['en']}\n\n"
+            "اختر الجمهور (الإنجليزي لا يصله العربي والعكس):",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🌐 الجميع", callback_data="sub_qaddlang_all")],
+                [InlineKeyboardButton("🇸🇦 العربية", callback_data="sub_qaddlang_ar"),
+                 InlineKeyboardButton("🇬🇧 الإنجليزية", callback_data="sub_qaddlang_en")],
+                [InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")],
+            ])
+        )
+        await callback_query.answer()
+        return
+
+    if action.startswith('qaddlang_'):
+        qlang = action.split('_', 1)[1]  # all / ar / en
+        if qlang not in ('all', 'ar', 'en'):
+            qlang = 'all'
+        label = {'all': '🌐 الجميع', 'ar': '🇸🇦 العربية', 'en': '🇬🇧 الإنجليزية'}[qlang]
+        await callback_query.message.edit_text(
+            f"➕ **سؤال جديد إلى: {label}**\n\n"
+            "أرسل الآن نص السؤال (يُجاب عليه بنعم/لا).",
             reply_markup=_sub_settings_back_kb()
         )
-        pending_downloads[callback_query.from_user.id] = {'waiting_for': 'add_question'}
+        pending_downloads[callback_query.from_user.id] = {'waiting_for': 'add_question', 'q_lang': qlang}
         await callback_query.answer()
         return
 
@@ -4517,11 +4563,13 @@ async def handle_subscription_settings(client, callback_query):
         all_users = subdb.get_all_users()
         
         gs = subdb.get_gender_stats()
+        lc = subdb.get_language_counts()
         text = "📊 <b>إحصائيات الأعضاء</b>\n\n"
         text += f"👥 <b>إجمالي الأعضاء:</b> {stats['total']}\n"
         text += f"💎 <b>المشتركون:</b> {stats['subscribed']}\n"
         text += f"🆓 <b>العاديون:</b> {stats['free']}\n"
-        text += f"👤 <b>الجنس:</b> 👨 {gs['male']} | 👩 {gs['female']}\n\n"
+        text += f"👤 <b>الجنس:</b> 👨 {gs['male']} | 👩 {gs['female']}\n"
+        text += f"🌐 <b>اللغة:</b> 🇸🇦 {lc['ar']} | 🇬🇧 {lc['en']}\n\n"
 
         # عرض بعض المشتركين مع الأيام المتبقية (الاسم قابل للضغط)
         if stats['subscribed'] > 0:
@@ -5118,10 +5166,12 @@ async def handle_admin_input(client, message):
             if not q:
                 await message.reply_text("❌ السؤال فارغ. أرسل نص السؤال.")
                 return
-            subdb.add_question(q, True)
+            q_lang = data.get('q_lang', 'all')
+            subdb.add_question(q, True, q_lang)
+            label = {'all': '🌐 الجميع', 'ar': '🇸🇦 العربية', 'en': '🇬🇧 الإنجليزية'}.get(q_lang, '🌐 الجميع')
             await message.reply_text(
-                f"✅ **تمت إضافة السؤال وتفعيله:**\n\n{q}\n\n"
-                "سيُطلب من كل عضو لم يجب عليه (نعم/لا) قبل التحميل."
+                f"✅ **تمت إضافة السؤال وتفعيله** (لـ {label}):\n\n{q}\n\n"
+                "سيُطلب من كل عضو من هذا الجمهور لم يجب عليه (نعم/لا) قبل التحميل."
             )
             del pending_downloads[user_id]
 
@@ -5519,7 +5569,7 @@ async def handle_language_selection(client, callback_query):
     else:
         from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton
         keyboard = ReplyKeyboardMarkup([
-            [KeyboardButton(t('btn_my_downloads', lang)), KeyboardButton(t('btn_invite', lang))],
+            [KeyboardButton(t('btn_my_downloads', lang)), KeyboardButton(t('btn_invite', lang)), KeyboardButton(t('btn_edit_gender', lang))],
             [KeyboardButton(t('btn_change_language', lang))]
         ], resize_keyboard=True)
 

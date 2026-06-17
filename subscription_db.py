@@ -1068,9 +1068,11 @@ def _ensure_questions_tables():
                 id SERIAL PRIMARY KEY,
                 text TEXT NOT NULL,
                 enabled BOOLEAN DEFAULT TRUE,
+                lang TEXT DEFAULT 'all',
                 created_at TIMESTAMP DEFAULT NOW()
             )
         ''')
+        cursor.execute("ALTER TABLE admin_questions ADD COLUMN IF NOT EXISTS lang TEXT DEFAULT 'all'")
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS member_answers (
                 user_id BIGINT NOT NULL,
@@ -1093,11 +1095,11 @@ def _ensure_questions_tables():
         pass
 
 
-def add_question(text, enabled=True):
-    """يضيف سؤالاً جديداً ويرجع معرّفه."""
+def add_question(text, enabled=True, lang='all'):
+    """يضيف سؤالاً جديداً (lang: all/ar/en) ويرجع معرّفه."""
     with db_cursor(commit=True) as cursor:
-        cursor.execute('INSERT INTO admin_questions (text, enabled) VALUES (%s, %s) RETURNING id',
-                       (text, enabled))
+        cursor.execute('INSERT INTO admin_questions (text, enabled, lang) VALUES (%s, %s, %s) RETURNING id',
+                       (text, enabled, lang))
         return cursor.fetchone()[0]
 
 
@@ -1114,27 +1116,44 @@ def set_question_enabled(qid, enabled):
 
 
 def get_questions():
-    """كل الأسئلة: (id, text, enabled)."""
+    """كل الأسئلة: (id, text, enabled, lang)."""
     with db_cursor() as cursor:
-        cursor.execute('SELECT id, text, enabled FROM admin_questions ORDER BY id')
+        cursor.execute('SELECT id, text, enabled, lang FROM admin_questions ORDER BY id')
         return cursor.fetchall()
 
 
 def get_unanswered_questions(user_id):
-    """أسئلة مفعّلة لم يجب عليها المستخدم بعد، وأُضيفت بعد انضمامه فقط:
-    (id, text). العضو الجديد لا يُسأل الأسئلة القديمة السابقة لانضمامه."""
+    """أسئلة مفعّلة لم يجب عليها المستخدم بعد، أُضيفت بعد انضمامه، وتطابق لغته:
+    (id, text). السؤال الموجّه لـ ar/en يصل فئته فقط؛ all يصل الجميع."""
     with db_cursor() as cursor:
         cursor.execute('''
             SELECT q.id, q.text FROM admin_questions q
             WHERE q.enabled = TRUE
               AND q.created_at >= COALESCE(
                     (SELECT created_at FROM users WHERE user_id = %s), NOW())
+              AND (COALESCE(q.lang, 'all') = 'all'
+                   OR COALESCE(q.lang, 'all') = COALESCE(
+                        (SELECT language FROM users WHERE user_id = %s), 'ar'))
               AND NOT EXISTS (
                 SELECT 1 FROM member_answers a
                 WHERE a.user_id = %s AND a.question_id = q.id)
             ORDER BY q.id
-        ''', (user_id, user_id))
+        ''', (user_id, user_id, user_id))
         return cursor.fetchall()
+
+
+def get_language_counts():
+    """عدد المستخدمين حسب اللغة: {'ar': n, 'en': n} (غير المحدد يُحسب عربياً)."""
+    with db_cursor() as cursor:
+        cursor.execute("SELECT COALESCE(language, 'ar') AS l, COUNT(*) FROM users GROUP BY l")
+        rows = cursor.fetchall()
+    d = {'ar': 0, 'en': 0}
+    for l, c in rows:
+        if l == 'en':
+            d['en'] += c
+        else:
+            d['ar'] += c
+    return d
 
 
 def save_question_answer(user_id, qid, answer):
