@@ -3790,8 +3790,8 @@ async def show_subscription_screen(client, message, user_id, title, duration, ma
     
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(t('binance_pay', lang), callback_data=f"pay_binance")],
-        [InlineKeyboardButton(t('visa_card', lang), callback_data=f"pay_visa")],
-        [InlineKeyboardButton(t('mastercard', lang), callback_data=f"pay_mastercard")],
+        [InlineKeyboardButton(t('visa_card', lang), callback_data=f"pay_visa"),
+         InlineKeyboardButton(t('mastercard', lang), callback_data=f"pay_mastercard")],
         [InlineKeyboardButton(t('telegram_contact', lang), url=f"https://t.me/{telegram_support}")]
     ])
     
@@ -3906,8 +3906,8 @@ async def handle_back_to_subscription(client, callback_query):
     
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(t('binance_pay', lang), callback_data="pay_binance")],
-        [InlineKeyboardButton(t('visa_card', lang), callback_data="pay_visa")],
-        [InlineKeyboardButton(t('mastercard', lang), callback_data="pay_mastercard")],
+        [InlineKeyboardButton(t('visa_card', lang), callback_data="pay_visa"),
+         InlineKeyboardButton(t('mastercard', lang), callback_data="pay_mastercard")],
         [InlineKeyboardButton(t('telegram_contact', lang), url=f"https://t.me/{telegram_support}")]
     ])
     
