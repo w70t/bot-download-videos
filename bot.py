@@ -4189,30 +4189,34 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
     dl_label = "⏸️ إيقاف التحميل للجميع" if dl_on else "▶️ تشغيل التحميل للجميع"
 
     keyboard = InlineKeyboardMarkup([
+        # — التحكم العام —
         [InlineKeyboardButton(dl_label, callback_data="sub_toggle_downloads")],
-        [InlineKeyboardButton("⏱️ تحديد المدة القصوى", callback_data="sub_set_duration")],
-        [InlineKeyboardButton("💰 تحديد السعر", callback_data="sub_set_price")],
         [InlineKeyboardButton(adult_label, callback_data="sub_toggle_adult")],
-        [
-            InlineKeyboardButton("➕ موقع محظور", callback_data="sub_add_domain"),
-            InlineKeyboardButton("➕ كلمة محظورة", callback_data="sub_add_keyword"),
-        ],
-        [InlineKeyboardButton("📋 القائمة المحظورة المخصصة", callback_data="sub_list_blocked")],
-        [InlineKeyboardButton("❓ سؤال للأعضاء", callback_data="sub_member_question")],
-        [InlineKeyboardButton("📢 الاشتراك الإجباري", callback_data="sub_fsub")],
-        [InlineKeyboardButton("👥 عرض المشتركين", callback_data="sub_view_subscribers")],
-        [InlineKeyboardButton("📊 عرض آخر 50 مستخدم", callback_data="sub_recent_users")],
-        [InlineKeyboardButton("💳 الدفوعات المعلقة", callback_data="sub_pending_payments")],
-        [InlineKeyboardButton("📊 إحصائيات الأعضاء", callback_data="sub_member_stats")],
-        [InlineKeyboardButton("🔍 بحث عن عضو", callback_data="sub_search_user")],
-        [InlineKeyboardButton("✉️ مراسلة عضو (عبر البوت)", callback_data="msg_direct_user")],
-        [InlineKeyboardButton("🚫 معاقبة عضو (حظر/رفع)", callback_data="sub_punish_user")],
-        [InlineKeyboardButton("📛 المحظورون", callback_data="sub_banned_list")],
-        [InlineKeyboardButton("📨 تذكير غير النشطين", callback_data="sub_remind_inactive")],
-        [InlineKeyboardButton("💾 نسخة احتياطية للقناة", callback_data="sub_backup_channel")],
-        [InlineKeyboardButton("✏️ ترقية عضو", callback_data="sub_promote_user")],
-        [InlineKeyboardButton("❌ إلغاء ترقية", callback_data="sub_demote_user")],
-        [InlineKeyboardButton("📢 إرسال رسالة جماعية", callback_data="sub_broadcast")]
+        # — إعدادات الاشتراك —
+        [InlineKeyboardButton("⏱️ المدة القصوى", callback_data="sub_set_duration"),
+         InlineKeyboardButton("💰 السعر", callback_data="sub_set_price")],
+        [InlineKeyboardButton("📢 الاشتراك الإجباري", callback_data="sub_fsub"),
+         InlineKeyboardButton("💳 الدفوعات", callback_data="sub_pending_payments")],
+        # — المحتوى المحظور والأسئلة —
+        [InlineKeyboardButton("➕ موقع محظور", callback_data="sub_add_domain"),
+         InlineKeyboardButton("➕ كلمة محظورة", callback_data="sub_add_keyword")],
+        [InlineKeyboardButton("📋 القائمة المحظورة", callback_data="sub_list_blocked"),
+         InlineKeyboardButton("❓ سؤال للأعضاء", callback_data="sub_member_question")],
+        # — الأعضاء —
+        [InlineKeyboardButton("👥 المشتركون", callback_data="sub_view_subscribers"),
+         InlineKeyboardButton("📊 آخر 50 عضو", callback_data="sub_recent_users")],
+        [InlineKeyboardButton("📊 إحصائيات الأعضاء", callback_data="sub_member_stats"),
+         InlineKeyboardButton("🔍 بحث عن عضو", callback_data="sub_search_user")],
+        # — الإدارة —
+        [InlineKeyboardButton("✏️ ترقية عضو", callback_data="sub_promote_user"),
+         InlineKeyboardButton("❌ إلغاء ترقية", callback_data="sub_demote_user")],
+        [InlineKeyboardButton("🚫 معاقبة عضو", callback_data="sub_punish_user"),
+         InlineKeyboardButton("📛 المحظورون", callback_data="sub_banned_list")],
+        # — التواصل والنظام —
+        [InlineKeyboardButton("✉️ مراسلة عضو", callback_data="msg_direct_user"),
+         InlineKeyboardButton("📢 بث جماعي", callback_data="sub_broadcast")],
+        [InlineKeyboardButton("📨 تذكير غير النشطين", callback_data="sub_remind_inactive"),
+         InlineKeyboardButton("💾 نسخة احتياطية", callback_data="sub_backup_channel")],
     ])
 
     text = (
