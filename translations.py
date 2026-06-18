@@ -141,8 +141,8 @@ TRANSLATIONS = {
         
         # Payment screens
         'payment_binance_title': '💳 الدفع عبر Binance Pay',
-        'payment_amount': '💰 المبلغ: $10',
-        'payment_binance_steps': 'الخطوات:\n1. افتح تطبيق Binance\n2. اذهب إلى Binance Pay\n3. أرسل $10 إلى ID: {binance_id}\n4. التقط صورة للدفعة (screenshot)\n5. أرسل الصورة هنا\n\n✅ بعد إرسال الصورة، سيتم مراجعة دفعتك وتفعيل الاشتراك',
+        'payment_amount': '💰 المبلغ: ${price}',
+        'payment_binance_steps': 'الخطوات:\n1. افتح تطبيق Binance\n2. اذهب إلى Binance Pay\n3. أرسل ${price} إلى ID: {binance_id}\n4. التقط صورة للدفعة (screenshot)\n5. أرسل الصورة هنا\n\n✅ بعد إرسال الصورة، سيتم مراجعة دفعتك وتفعيل الاشتراك',
         'payment_visa_title': '💳 الدفع عبر Visa',
         'payment_visa_instructions': 'للدفع عبر Visa، تواصل مع المطور:\n👤 @{support_username}\n\nسيتم إرشادك لإكمال عملية الدفع.',
         'payment_mastercard_title': '💳 الدفع عبر Mastercard',
@@ -299,8 +299,8 @@ TRANSLATIONS = {
         
         # Payment screens
         'payment_binance_title': '💳 Pay via Binance Pay',
-        'payment_amount': '💰 Amount: $10',
-        'payment_binance_steps': 'Steps:\n1. Open Binance app\n2. Go to Binance Pay\n3. Send $10 to ID: {binance_id}\n4. Take a screenshot of the payment\n5. Send the screenshot here\n\n✅ After sending the screenshot, your payment will be reviewed and subscription activated',
+        'payment_amount': '💰 Amount: ${price}',
+        'payment_binance_steps': 'Steps:\n1. Open Binance app\n2. Go to Binance Pay\n3. Send ${price} to ID: {binance_id}\n4. Take a screenshot of the payment\n5. Send the screenshot here\n\n✅ After sending the screenshot, your payment will be reviewed and subscription activated',
         'payment_visa_title': '💳 Pay via Visa',
         'payment_visa_instructions': 'To pay via Visa, contact the developer:\n👤 @{support_username}\n\nYou will be guided to complete the payment.',
         'payment_mastercard_title': '💳 Pay via Mastercard',

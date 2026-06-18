@@ -3868,6 +3868,7 @@ async def handle_plan_choice(client, callback_query):
         [InlineKeyboardButton(t('binance_pay', lang), callback_data="pay_binance")],
         [InlineKeyboardButton(t('visa_card', lang), callback_data="pay_visa"),
          InlineKeyboardButton(t('mastercard', lang), callback_data="pay_mastercard")],
+        [InlineKeyboardButton(t('back', lang), callback_data="show_plans")],
         [InlineKeyboardButton(t('telegram_contact', lang), url=f"https://t.me/{telegram_support}")],
     ])
     await callback_query.message.edit_text(
@@ -3899,7 +3900,7 @@ async def handle_payment_method(client, callback_query):
             f"{t('payment_binance_title', lang)}\n\n"
             f"{t('payment_amount', lang, price=price)}\n"
             f"🆔 **Binance Pay ID:** `{binance_id}`\n\n"
-            f"{t('payment_binance_steps', lang, binance_id=binance_id)}"
+            f"{t('payment_binance_steps', lang, binance_id=binance_id, price=price)}"
         )
     elif payment_method == 'visa':
         text = (
