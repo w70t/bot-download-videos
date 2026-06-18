@@ -1425,7 +1425,7 @@ async def process_download_from_queue(task: DownloadTask):
                     await status.edit_text(
                         t('daily_limit_exceeded', lang, limit=effective_limit, count=daily_count),
                         reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton(t('subscribe_now', lang), callback_data="pay_binance")],
+                            [InlineKeyboardButton(t('subscribe_now', lang), callback_data="show_plans")],
                             [_invite_button(lang)],
                             [InlineKeyboardButton(t('contact_developer', lang), url=f"https://t.me/{subdb.get_setting('telegram_support', os.getenv('SUPPORT_USERNAME', ''))}")]
                         ])
@@ -3708,7 +3708,7 @@ async def handle_url(client, message):
                 await status.edit_text(
                     t('daily_limit_exceeded', lang, limit=effective_limit, count=daily_count),
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton(t('subscribe_now', lang), callback_data="pay_binance")],
+                        [InlineKeyboardButton(t('subscribe_now', lang), callback_data="show_plans")],
                         [_invite_button(lang)],
                         [InlineKeyboardButton(t('contact_developer', lang), url=f"https://t.me/{subdb.get_setting('telegram_support', os.getenv('SUPPORT_USERNAME', ''))}")]
                     ])
@@ -3784,31 +3784,96 @@ async def handle_playlist_download(client, callback_query):
 # Subscription System Handlers
 # ═══════════════════════════════════════════════════════════════
 
-async def show_subscription_screen(client, message, user_id, title, duration, max_minutes):
-    """عرض شاشة الاشتراك للمستخدمين غير المشتركين"""
-    duration_minutes = int(duration) // 60
+def _plan_prices():
+    """يرجع (سعر الشهري، سعر السنوي) من الإعدادات (مع توافق السعر القديم)."""
+    pm = subdb.get_setting('price_monthly', subdb.get_setting('subscription_price', '10'))
+    py = subdb.get_setting('price_yearly', '100')
+    return pm, py
+
+
+def _price_value(price):
+    try:
+        return float(price)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _price_text(price, lang):
+    return t('free_label', lang) if _price_value(price) <= 0 else f"${price}"
+
+
+def _plans_keyboard(lang):
+    """أزرار خطط الاشتراك (شهري/سنوي بالأسعار) + تواصل."""
+    pm, py = _plan_prices()
     telegram_support = subdb.get_setting('telegram_support', os.getenv('SUPPORT_USERNAME', ''))
-    binance_id = subdb.get_setting('binance_pay_id', os.getenv('BINANCE_PAY_ID', ''))
-    
-    # Get user language
-    lang = subdb.get_user_language(user_id)
-    
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(t('binance_pay', lang), callback_data=f"pay_binance")],
-        [InlineKeyboardButton(t('visa_card', lang), callback_data=f"pay_visa"),
-         InlineKeyboardButton(t('mastercard', lang), callback_data=f"pay_mastercard")],
-        [InlineKeyboardButton(t('telegram_contact', lang), url=f"https://t.me/{telegram_support}")]
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{t('plan_monthly', lang)} — {_price_text(pm, lang)}",
+                              callback_data="plan_monthly")],
+        [InlineKeyboardButton(f"{t('plan_yearly', lang)} — {_price_text(py, lang)}",
+                              callback_data="plan_yearly")],
+        [InlineKeyboardButton(t('telegram_contact', lang), url=f"https://t.me/{telegram_support}")],
     ])
-    
+
+
+async def show_subscription_screen(client, message, user_id, title, duration, max_minutes):
+    """عرض شاشة الاشتراك (الخطط: شهري/سنوي) للمستخدمين غير المشتركين"""
+    duration_minutes = int(duration) // 60
+    lang = subdb.get_user_language(user_id)
+
     text = (
         t('subscription_required', lang, title=title, duration=duration_minutes, max_duration=max_minutes) +
         "\n\n━━━━━━━━━━━━━━━━\n\n" +
         t('subscription_benefits', lang) +
         "\n\n" +
-        t('choose_payment_method', lang)
+        t('choose_plan', lang)
     )
-    
-    await message.edit_text(text, reply_markup=keyboard)
+
+    await message.edit_text(text, reply_markup=_plans_keyboard(lang))
+
+
+@app.on_callback_query(filters.regex(r'^show_plans$'))
+async def handle_show_plans(client, callback_query):
+    """يعرض خطط الاشتراك (يُستخدم من زر 'اشترك الآن')."""
+    lang = subdb.get_user_language(callback_query.from_user.id)
+    text = t('subscription_benefits', lang) + "\n\n" + t('choose_plan', lang)
+    try:
+        await callback_query.message.edit_text(text, reply_markup=_plans_keyboard(lang))
+    except Exception:
+        await callback_query.message.reply_text(text, reply_markup=_plans_keyboard(lang))
+    await callback_query.answer()
+
+
+@app.on_callback_query(filters.regex(r'^plan_(monthly|yearly)$'))
+async def handle_plan_choice(client, callback_query):
+    """اختيار الخطة: إن كانت مجانية يُفعّل فوراً، وإلا يعرض طرق الدفع."""
+    await callback_query.answer()
+    user_id = callback_query.from_user.id
+    lang = subdb.get_user_language(user_id)
+    plan = 'monthly' if callback_query.data == 'plan_monthly' else 'yearly'
+    pm, py = _plan_prices()
+    price = pm if plan == 'monthly' else py
+    duration = 30 if plan == 'monthly' else 365
+
+    # خطة مجانية → تفعيل فوري بلا دفع
+    if _price_value(price) <= 0:
+        subdb.activate_subscription(user_id, duration, 'free')
+        await callback_query.message.edit_text(t('plan_activated_free', lang, days=duration))
+        return
+
+    # خطة مدفوعة → احفظ الخطة واعرض طرق الدفع
+    pending_downloads[user_id] = {'plan': plan, 'duration': duration, 'price': price}
+    telegram_support = subdb.get_setting('telegram_support', os.getenv('SUPPORT_USERNAME', ''))
+    plan_label = t('plan_monthly', lang) if plan == 'monthly' else t('plan_yearly', lang)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(t('binance_pay', lang), callback_data="pay_binance")],
+        [InlineKeyboardButton(t('visa_card', lang), callback_data="pay_visa"),
+         InlineKeyboardButton(t('mastercard', lang), callback_data="pay_mastercard")],
+        [InlineKeyboardButton(t('telegram_contact', lang), url=f"https://t.me/{telegram_support}")],
+    ])
+    await callback_query.message.edit_text(
+        f"💎 {plan_label} — ${price}\n\n{t('choose_payment_method', lang)}",
+        reply_markup=keyboard
+    )
 
 
 @app.on_callback_query(filters.regex(r'^pay_'))
@@ -3822,8 +3887,13 @@ async def handle_payment_method(client, callback_query):
     
     binance_id = subdb.get_setting('binance_pay_id', os.getenv('BINANCE_PAY_ID', ''))
     telegram_support = subdb.get_setting('telegram_support', os.getenv('SUPPORT_USERNAME', ''))
-    price = subdb.get_setting('subscription_price', '10')
-    
+    # السعر/المدة من الخطة المختارة (إن وُجدت)، وإلا الخطة الشهرية افتراضياً
+    _pdata = pending_downloads.get(user_id) if isinstance(pending_downloads.get(user_id), dict) else {}
+    pm, _py = _plan_prices()
+    price = _pdata.get('price') or pm
+    plan = _pdata.get('plan', 'monthly')
+    duration = _pdata.get('duration', 30)
+
     if payment_method == 'binance':
         text = (
             f"{t('payment_binance_title', lang)}\n\n"
@@ -3844,9 +3914,10 @@ async def handle_payment_method(client, callback_query):
             f"{t('payment_mastercard_instructions', lang, support_username=telegram_support)}"
         )
     
-    # حفظ طريقة الدفع المختارة
-    pending_downloads[user_id] = {'payment_method': payment_method}
-    
+    # حفظ طريقة الدفع المختارة مع الخطة (لتطبيق المدة الصحيحة عند القبول)
+    pending_downloads[user_id] = {'payment_method': payment_method,
+                                  'plan': plan, 'duration': duration, 'price': price}
+
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(t('contact_developer', lang), url=f"https://t.me/{telegram_support}")],
         [InlineKeyboardButton(t('back', lang), callback_data="back_to_subscription")]
@@ -3907,27 +3978,16 @@ async def handle_back_to_subscription(client, callback_query):
     # Get user language
     lang = subdb.get_user_language(user_id)
     
-    telegram_support = subdb.get_setting('telegram_support', os.getenv('SUPPORT_USERNAME', ''))
-    
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(t('binance_pay', lang), callback_data="pay_binance")],
-        [InlineKeyboardButton(t('visa_card', lang), callback_data="pay_visa"),
-         InlineKeyboardButton(t('mastercard', lang), callback_data="pay_mastercard")],
-        [InlineKeyboardButton(t('telegram_contact', lang), url=f"https://t.me/{telegram_support}")]
-    ])
-    
-    # Show subscription options
+    # الرجوع لاختيار الخطة (الشهري/السنوي)
     text = (
-        t('subscription_required', lang, title="Video", duration=10, max_duration=5) +
-        "\n\n━━━━━━━━━━━━━━━━\n\n" +
         t('subscription_benefits', lang) +
         "\n\n" +
-        t('choose_payment_method', lang)
+        t('choose_plan', lang)
     )
-    
+
     await callback_query.message.edit_text(
         text,
-        reply_markup=keyboard
+        reply_markup=_plans_keyboard(lang)
     )
     await callback_query.answer()
 
@@ -3976,13 +4036,17 @@ async def handle_payment_proof(client, message):
         return
     
     payment_method = payment_data['payment_method']
-    
-    # حفظ الدفعة في قاعدة البيانات
+    plan_duration = payment_data.get('duration', 30)
+    plan_price = payment_data.get('price')
+
+    # حفظ الدفعة في قاعدة البيانات (مع المدة والسعر حسب الخطة)
     payment_id = subdb.add_payment(
         user_id=user_id,
         payment_method=payment_method,
         proof_file_id=message.photo.file_id,
-        proof_message_id=message.id
+        proof_message_id=message.id,
+        amount=_price_value(plan_price) if plan_price else None,
+        duration_days=plan_duration
     )
     
     # حذف من pending
@@ -4177,8 +4241,9 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
         return
 
     max_duration = subdb.get_max_duration()
-    price = subdb.get_setting('subscription_price', '10')
-    duration_days = subdb.get_setting('subscription_duration_days', '30')
+    _pm, _py = _plan_prices()
+    price_m = "مجاني" if _price_value(_pm) <= 0 else f"${_pm}"
+    price_y = "مجاني" if _price_value(_py) <= 0 else f"${_py}"
     stats = subdb.get_user_stats()
     try:
         gs = subdb.get_gender_stats()
@@ -4199,7 +4264,7 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
         [InlineKeyboardButton(adult_label, callback_data="sub_toggle_adult")],
         # — إعدادات الاشتراك —
         [InlineKeyboardButton("⏱️ المدة القصوى", callback_data="sub_set_duration"),
-         InlineKeyboardButton("💰 السعر", callback_data="sub_set_price")],
+         InlineKeyboardButton("💰 الأسعار", callback_data="sub_set_price")],
         [InlineKeyboardButton("📢 الاشتراك الإجباري", callback_data="sub_fsub"),
          InlineKeyboardButton("💳 الدفوعات", callback_data="sub_pending_payments")],
         # — المحتوى المحظور والأسئلة —
@@ -4227,8 +4292,8 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
     text = (
         f"💎 **إعدادات الاشتراك**\n\n"
         f"⏱️ **الحد الأقصى للمجاني:** {max_duration} دقيقة\n"
-        f"💰 **سعر الاشتراك:** ${price}\n"
-        f"📅 **مدة الاشتراك:** {duration_days} يوم\n"
+        f"💰 **الأسعار:** شهري {price_m} | سنوي {price_y}\n"
+        f"📅 **المدد:** شهري 30 يوم | سنوي 365 يوم\n"
         f"🔞 **حظر المحتوى الإباحي:** {'مُفعّل ✅' if adult_on else 'متوقف ❌'}\n"
         f"⏯️ **التحميل للأعضاء:** {'يعمل ▶️' if dl_on else 'متوقف ⏸️'}\n\n"
         f"📊 **الإحصائيات:**\n"
@@ -4592,14 +4657,37 @@ async def handle_subscription_settings(client, callback_query):
         )
         
     elif action == 'set_price':
+        pm, py = _plan_prices()
+        pm_txt = "مجاني" if _price_value(pm) <= 0 else f"${pm}"
+        py_txt = "مجاني" if _price_value(py) <= 0 else f"${py}"
         await callback_query.message.edit_text(
-            "💰 **تحديد سعر الاشتراك**\n\n"
-            "أرسل السعر بالدولار (مثلاً: 10)\n\n"
-            "⚠️ القيمة الحالية: $" + subdb.get_setting('subscription_price', '10'),
+            "💰 **أسعار الاشتراك**\n\n"
+            f"📅 الشهري (30 يوم): **{pm_txt}**\n"
+            f"🗓️ السنوي (365 يوم): **{py_txt}**\n\n"
+            "اضغط لتعديل السعر (أرسل 0 لجعله مجانياً):",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"📅 تعديل الشهري ({pm_txt})", callback_data="sub_setprice_monthly")],
+                [InlineKeyboardButton(f"🗓️ تعديل السنوي ({py_txt})", callback_data="sub_setprice_yearly")],
+                [InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")],
+            ])
+        )
+
+    elif action == 'setprice_monthly':
+        await callback_query.message.edit_text(
+            "📅 **سعر الاشتراك الشهري**\n\n"
+            "أرسل السعر بالدولار (مثلاً: 10)، أو **0** لجعله مجانياً.",
             reply_markup=_sub_settings_back_kb()
         )
-        pending_downloads[callback_query.from_user.id] = {'waiting_for': 'subscription_price'}
-        
+        pending_downloads[callback_query.from_user.id] = {'waiting_for': 'price_monthly'}
+
+    elif action == 'setprice_yearly':
+        await callback_query.message.edit_text(
+            "🗓️ **سعر الاشتراك السنوي**\n\n"
+            "أرسل السعر بالدولار (مثلاً: 100)، أو **0** لجعله مجانياً.",
+            reply_markup=_sub_settings_back_kb()
+        )
+        pending_downloads[callback_query.from_user.id] = {'waiting_for': 'price_yearly'}
+
     elif action == 'view_subscribers':
         subscribers = subdb.get_all_subscribers()
         
@@ -5247,16 +5335,23 @@ async def handle_admin_input(client, message):
             )
             del pending_downloads[user_id]
             
-        elif waiting_for == 'subscription_price':
-            price = float(message.text.strip())
-            if price < 0:
-                await message.reply_text("❌ يجب أن يكون السعر أكبر من 0")
+        elif waiting_for in ('price_monthly', 'price_yearly', 'subscription_price'):
+            try:
+                price = float(message.text.strip())
+            except ValueError:
+                await message.reply_text("❌ أرسل رقماً صحيحاً (مثلاً 10 أو 0 للمجاني).")
                 return
-            
-            subdb.set_setting('subscription_price', str(price))
+            if price < 0:
+                await message.reply_text("❌ لا يقبل سعراً سالباً (0 = مجاني).")
+                return
+            key = 'price_yearly' if waiting_for == 'price_yearly' else 'price_monthly'
+            # نظّف الرقم (10.0 -> 10)
+            price_str = str(int(price)) if price == int(price) else str(price)
+            subdb.set_setting(key, price_str)
+            plan_name = 'السنوي' if key == 'price_yearly' else 'الشهري'
+            value_txt = "مجاني 🆓" if price <= 0 else f"${price_str}"
             await message.reply_text(
-                f"✅ **تم تحديث السعر**\n\n"
-                f"السعر الجديد: ${price}"
+                f"✅ **تم تحديث سعر الاشتراك {plan_name}**\n\nالسعر الجديد: {value_txt}"
             )
             del pending_downloads[user_id]
 

@@ -89,6 +89,7 @@ def init_db():
     _ensure_survey_table()
     _ensure_questions_tables()
     _ensure_reminder_column()
+    _ensure_payments_columns()
     logger.info("✅ تم تجهيز قاعدة البيانات بنجاح")
 
 
@@ -299,33 +300,37 @@ def mark_user_passed_channel(user_id: int, chat_id):
 # دوال الدفوعات
 # ═══════════════════════════════════════════════════════════════
 
+def _ensure_payments_columns():
+    """يضيف عمود مدة الاشتراك للدفعة (شهري=30/سنوي=365) إن لم يكن موجوداً."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('ALTER TABLE payments ADD COLUMN IF NOT EXISTS duration_days INTEGER DEFAULT 30')
+
+
 def add_payment(user_id: int, payment_method: str, proof_file_id: str = None,
-                proof_message_id: int = None, amount: float = None):
-    """إضافة دفعة جديدة معلقة"""
+                proof_message_id: int = None, amount: float = None, duration_days: int = 30):
+    """إضافة دفعة جديدة معلقة (مع مدة الاشتراك المختارة)."""
     if amount is None:
-        amount = float(get_setting('subscription_price', '10'))
+        amount = float(get_setting('price_monthly', get_setting('subscription_price', '10')))
 
     # PostgreSQL لا يدعم cursor.lastrowid؛ نستخدم RETURNING للحصول على المعرّف
     with db_cursor(commit=True) as cursor:
         cursor.execute('''
-            INSERT INTO payments (user_id, amount, payment_method, proof_file_id, proof_message_id)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO payments (user_id, amount, payment_method, proof_file_id, proof_message_id, duration_days)
+            VALUES (%s, %s, %s, %s, %s, %s)
             RETURNING payment_id
-        ''', (user_id, amount, payment_method, proof_file_id, proof_message_id))
+        ''', (user_id, amount, payment_method, proof_file_id, proof_message_id, duration_days))
         row = cursor.fetchone()
         payment_id = row[0] if row else None
 
-    logger.info(f"💰 دفعة جديدة #{payment_id} من المستخدم {user_id} عبر {payment_method}")
+    logger.info(f"💰 دفعة جديدة #{payment_id} من المستخدم {user_id} عبر {payment_method} ({duration_days} يوم)")
     return payment_id
 
 def approve_payment(payment_id: int, admin_id: int):
     """قبول الدفعة وتفعيل الاشتراك (في معاملة واحدة لضمان الذرّية)"""
-    duration_days = int(get_setting('subscription_duration_days', '30'))
-
     with db_cursor(commit=True) as cursor:
-        # الحصول على معلومات الدفعة
+        # الحصول على معلومات الدفعة (مع مدتها)
         cursor.execute('''
-            SELECT user_id, payment_method, status
+            SELECT user_id, payment_method, status, COALESCE(duration_days, 30)
             FROM payments
             WHERE payment_id = %s
         ''', (payment_id,))
@@ -334,7 +339,7 @@ def approve_payment(payment_id: int, admin_id: int):
         if not result:
             return False, "الدفعة غير موجودة"
 
-        user_id, payment_method, status = result
+        user_id, payment_method, status, duration_days = result
 
         if status == 'approved':
             return False, "تم قبول هذه الدفعة مسبقاً"
@@ -348,7 +353,7 @@ def approve_payment(payment_id: int, admin_id: int):
             WHERE payment_id = %s
         ''', (datetime.now().isoformat(), admin_id, payment_id))
 
-        # تفعيل الاشتراك ضمن نفس المعاملة
+        # تفعيل الاشتراك ضمن نفس المعاملة (بمدة الدفعة)
         end_date = datetime.now() + timedelta(days=duration_days)
         cursor.execute('''
             UPDATE users
