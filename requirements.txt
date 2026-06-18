@@ -1,5 +1,6 @@
 pyrogram
 tgcrypto
 yt-dlp
+gallery-dl
 python-dotenv
 psycopg2-binary
