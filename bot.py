@@ -1210,6 +1210,202 @@ def _download_images_with_gallery_dl(url, dest_dir, cookie_file=None):
     return files
 
 
+# ═══════════════════════════════════════════════════════════════
+# تحميل صور Threads (ثريدس) — كاروسيل/صورة واحدة
+# yt-dlp وgallery-dl لا يملكان مستخرجاً لمنصة Meta Threads، لذا نجلب صفحة
+# المنشور ونستخرج روابط الصور (وأيضاً الفيديو) من JSON المضمّن في الصفحة،
+# مع احتياطي على وسوم og:image/og:video. ثم ننزّل الصور ونرسلها كألبوم.
+# ═══════════════════════════════════════════════════════════════
+
+import re as _re
+import urllib.request as _urlreq
+import http.cookiejar as _cookiejar
+
+_THREADS_UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+               '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+
+
+def _threads_shortcode(url):
+    """يستخرج الرمز المختصر للمنشور من رابط Threads (/post/<code>)."""
+    m = _re.search(r'/post/([A-Za-z0-9_-]+)', url or '')
+    return m.group(1) if m else None
+
+
+def _fetch_threads_html(url, cookie_file=None):
+    """يجلب صفحة منشور Threads كـ HTML (مع cookies إن توفرت لمحتوى خاص)."""
+    cj = _cookiejar.MozillaCookieJar()
+    if cookie_file and os.path.exists(cookie_file):
+        try:
+            cj.load(cookie_file, ignore_discard=True, ignore_expires=True)
+        except Exception as e:
+            logger.warning(f"⚠️ تعذّر تحميل cookies لـ Threads: {e}")
+    opener = _urlreq.build_opener(_urlreq.HTTPCookieProcessor(cj))
+    req = _urlreq.Request(url, headers={
+        'User-Agent': _THREADS_UA,
+        'Accept-Language': 'en-US,en;q=0.9',
+    })
+    with opener.open(req, timeout=30) as resp:
+        raw = resp.read()
+    return raw.decode('utf-8', 'replace')
+
+
+def _threads_best_image(image_versions2):
+    """أعلى دقّة من مرشّحات الصورة (image_versions2.candidates)."""
+    best = None
+    for c in (image_versions2 or {}).get('candidates') or []:
+        u = c.get('url')
+        if not u:
+            continue
+        area = (c.get('width') or 0) * (c.get('height') or 0)
+        if best is None or area > best[0]:
+            best = (area, u)
+    return best[1] if best else None
+
+
+def _threads_best_video(video_versions):
+    """أعلى دقّة من نسخ الفيديو (video_versions)."""
+    best = None
+    for v in video_versions or []:
+        u = v.get('url')
+        if not u:
+            continue
+        area = (v.get('width') or 0) * (v.get('height') or 0)
+        if best is None or area > best[0]:
+            best = (area, u)
+    return best[1] if best else None
+
+
+def _threads_media_from_node(node):
+    """يجمع (الصور، الفيديوهات) من عقدة منشور Threads بالترتيب.
+
+    يدعم الكاروسيل (carousel_media) والوسائط المفردة. لكل عنصر نفضّل الفيديو
+    إن وُجد، وإلا الصورة بأعلى دقّة."""
+    images, videos = [], []
+    carousel = node.get('carousel_media')
+    if isinstance(carousel, list) and carousel:
+        for item in carousel:
+            if not isinstance(item, dict):
+                continue
+            v = _threads_best_video(item.get('video_versions'))
+            if v:
+                videos.append(v)
+                continue
+            img = _threads_best_image(item.get('image_versions2'))
+            if img:
+                images.append(img)
+    else:
+        v = _threads_best_video(node.get('video_versions'))
+        if v:
+            videos.append(v)
+        else:
+            img = _threads_best_image(node.get('image_versions2'))
+            if img:
+                images.append(img)
+    return images, videos
+
+
+def _find_threads_post_nodes(obj, shortcode, found, _depth=0):
+    """بحث تكراري عن عقد منشور Threads التي تحمل وسائط.
+
+    نفضّل العقدة التي يطابق رمزها (code) رمز المنشور المطلوب لتجنّب التقاط
+    منشورات/صور أخرى على الصفحة (مثل المنشورات المقترحة أو صور البروفايل)."""
+    if _depth > 40:
+        return
+    if isinstance(obj, dict):
+        has_media = ('image_versions2' in obj or 'carousel_media' in obj
+                     or 'video_versions' in obj)
+        if has_media and (shortcode is None or obj.get('code') == shortcode):
+            found.append(obj)
+        for v in obj.values():
+            _find_threads_post_nodes(v, shortcode, found, _depth + 1)
+    elif isinstance(obj, list):
+        for v in obj:
+            _find_threads_post_nodes(v, shortcode, found, _depth + 1)
+
+
+def _extract_threads_media(url, cookie_file=None):
+    """يعيد {'images': [...], 'videos': [...]} لمنشور Threads.
+
+    يعتمد أولاً على JSON المضمّن (الأدق للكاروسيل)، ثم على وسوم og: كاحتياطي
+    للمنشور ذي الوسيط الواحد. يعيد قوائم فارغة عند الفشل."""
+    images, videos = [], []
+    if not is_safe_url(url):
+        logger.warning(f"🚫 رابط Threads غير آمن مرفوض: {url[:100]}")
+        return {'images': images, 'videos': videos}
+    shortcode = _threads_shortcode(url)
+    try:
+        page = _fetch_threads_html(url, cookie_file)
+    except Exception as e:
+        logger.error(f"❌ تعذّر جلب صفحة Threads: {e}")
+        return {'images': images, 'videos': videos}
+
+    # 1) JSON المضمّن داخل وسوم <script type="application/json"> (data-sjs)
+    for m in _re.finditer(
+            r'<script type="application/json"[^>]*>(.*?)</script>', page, _re.S):
+        raw = m.group(1)
+        if ('image_versions2' not in raw and 'carousel_media' not in raw
+                and 'video_versions' not in raw):
+            continue
+        try:
+            data = json.loads(html.unescape(raw))
+        except Exception:
+            continue
+        nodes = []
+        _find_threads_post_nodes(data, shortcode, nodes)
+        for node in nodes:
+            imgs, vids = _threads_media_from_node(node)
+            for u in imgs:
+                if u not in images:
+                    images.append(u)
+            for u in vids:
+                if u not in videos:
+                    videos.append(u)
+        if images or videos:
+            break
+
+    # 2) احتياطي: وسوم og: (منشور بصورة/فيديو واحد)
+    if not images and not videos:
+        mv = _re.search(r'<meta property="og:video" content="([^"]+)"', page)
+        if mv:
+            videos.append(html.unescape(mv.group(1)))
+        mi = _re.search(r'<meta property="og:image" content="([^"]+)"', page)
+        if mi:
+            images.append(html.unescape(mi.group(1)))
+
+    return {'images': images, 'videos': videos}
+
+
+def _download_threads_images(url, dest_dir, cookie_file=None):
+    """ينزّل صور منشور Threads إلى dest_dir ويعيد قائمة المسارات مرتبة.
+
+    يطابق توقيع _download_images_with_gallery_dl ليُستخدم في مسار الصور.
+    إن لم تكن هناك صور (منشور فيديو/فشل) تعود القائمة فارغة."""
+    os.makedirs(dest_dir, exist_ok=True)
+    media = _extract_threads_media(url, cookie_file)
+    images = (media.get('images') or [])[:GALLERY_DL_MAX_IMAGES]
+    files = []
+    for i, img_url in enumerate(images, 1):
+        if not is_safe_url(img_url):
+            logger.warning("🚫 تخطّي رابط صورة Threads غير آمن")
+            continue
+        # امتداد الملف من المسار (قبل معاملات الاستعلام)
+        path_part = urlparse(img_url).path
+        ext = os.path.splitext(path_part)[1].lower()
+        if ext not in _IMAGE_EXTS:
+            ext = '.jpg'
+        dest = os.path.join(dest_dir, f"{i:02d}{ext}")
+        try:
+            req = _urlreq.Request(img_url, headers={'User-Agent': _THREADS_UA})
+            with _urlreq.urlopen(req, timeout=60) as r, open(dest, 'wb') as f:
+                shutil.copyfileobj(r, f)
+            if os.path.getsize(dest) > 0:
+                files.append(dest)
+        except Exception as e:
+            logger.warning(f"⚠️ فشل تنزيل صورة Threads: {e}")
+    files.sort()
+    return files
+
+
 async def upload_media_with_progress(client, chat_id, file_path, caption, status_msg, user_id, is_video=True):
     """Upload media with progress tracking"""
     try:
@@ -1447,10 +1643,15 @@ async def process_download_from_queue(task: DownloadTask):
         info = await get_video_info(url)
         
         if not info:
-            user_name = message.from_user.first_name or "User"
-            await send_error_to_admin(user_id, user_name, "Failed to extract video info", url)
-            await status.edit_text(t('invalid_url', lang))
-            return
+            # 🧵 Threads: قد يكون منشوراً مصوّراً (yt-dlp لا يستخرج صوره) →
+            # لا تفشل بعد؛ تابع لمسار الصور المخصّص أدناه بمعلومات فارغة.
+            if _platform_of(url) == 'threads':
+                info = {}
+            else:
+                user_name = message.from_user.first_name or "User"
+                await send_error_to_admin(user_id, user_name, "Failed to extract video info", url)
+                await status.edit_text(t('invalid_url', lang))
+                return
 
         # 🔞 محتوى إباحي/حساب محظور بعد الاستخراج → عاقِب المستخدم (حظر + تعهّد)
         if (adult_filter_enabled() and is_adult_info(info)) or is_blocked_account(info):
@@ -1514,8 +1715,8 @@ async def process_download_from_queue(task: DownloadTask):
                     )
                     return
         
-        # 🖼️ منشور مصوّر بلا فيديو (كاروسيل إنستغرام / سلايدشو تيك توك) → ألبوم صور
-        if _platform_of(url) in ('instagram', 'tiktok') and not _info_has_video(info):
+        # 🖼️ منشور مصوّر بلا فيديو (كاروسيل إنستغرام/تيك توك/ثريدس) → ألبوم صور
+        if _platform_of(url) in ('instagram', 'tiktok', 'threads') and not _info_has_video(info):
             img_user_name = message.from_user.first_name or "User"
             handled = await download_and_send_images(
                 app, message, url, status, user_id, img_user_name,
@@ -1787,9 +1988,15 @@ async def download_and_send_images(client, message, url, status_msg,
         await status_msg.edit_text(t('downloading_images', lang))
         cookie_file = get_cookie_file_for_url(url)
         loop = asyncio.get_event_loop()
-        files = await loop.run_in_executor(
-            None, lambda: _download_images_with_gallery_dl(url, dl_dir, cookie_file)
-        )
+        # Threads لا يدعمه gallery-dl → مستخرج مخصص؛ بقية المنصات عبر gallery-dl
+        if _platform_of(url) == 'threads':
+            files = await loop.run_in_executor(
+                None, lambda: _download_threads_images(url, dl_dir, cookie_file)
+            )
+        else:
+            files = await loop.run_in_executor(
+                None, lambda: _download_images_with_gallery_dl(url, dl_dir, cookie_file)
+            )
 
         if not files:
             return False  # ليست صوراً → ارجع لمسار الفيديو
@@ -3860,14 +4067,19 @@ async def handle_url(client, message):
     
     try:
         info = await get_video_info(url)
-        
+
         if not info:
-            # Send alert to admin
-            user_name = message.from_user.first_name or "User"
-            
-            await send_error_to_admin(user_id, user_name, "Failed to extract video info", url)
-            await status.edit_text(t('invalid_url', lang))
-            return
+            # 🧵 Threads: قد يكون منشوراً مصوّراً (yt-dlp لا يستخرج صوره) →
+            # لا تفشل بعد؛ تابع لمسار الصور المخصّص أدناه بمعلومات فارغة.
+            if _platform_of(url) == 'threads':
+                info = {}
+            else:
+                # Send alert to admin
+                user_name = message.from_user.first_name or "User"
+
+                await send_error_to_admin(user_id, user_name, "Failed to extract video info", url)
+                await status.edit_text(t('invalid_url', lang))
+                return
     except Exception as e:
         # Unexpected error
         user_name = message.from_user.first_name or "User"
@@ -3914,10 +4126,10 @@ async def handle_url(client, message):
                 )
                 return
     
-    # 🖼️ منشور مصوّر بلا فيديو (كاروسيل إنستغرام / سلايدشو تيك توك) → أرسل الصور
-    #    كألبوم عبر gallery-dl. المنشورات المختلطة (صور+فيديو) تبقى على مسار الفيديو
-    #    المعتاد دون أي تغيير في سلوكه.
-    if _platform_of(url) in ('instagram', 'tiktok') and not _info_has_video(info):
+    # 🖼️ منشور مصوّر بلا فيديو (كاروسيل إنستغرام/تيك توك/ثريدس) → أرسل الصور
+    #    كألبوم (gallery-dl للإنستغرام/تيك توك، مستخرج مخصّص لثريدس). المنشورات
+    #    المختلطة (صور+فيديو) تبقى على مسار الفيديو المعتاد دون أي تغيير في سلوكه.
+    if _platform_of(url) in ('instagram', 'tiktok', 'threads') and not _info_has_video(info):
         img_user_name = message.from_user.first_name or "User"
         handled = await download_and_send_images(
             client, message, url, status, user_id, img_user_name, username, lang, info
