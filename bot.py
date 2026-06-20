@@ -203,6 +203,11 @@ pending_playlists = {}
 REFERRAL_BONUS = int(os.getenv("REFERRAL_BONUS", "1"))
 PLAYLIST_MAX = int(os.getenv("PLAYLIST_MAX", "5"))
 
+# أقصى عدد صور تُحمَّل من منشور إنستغرام/تيك توك (كاروسيل/سلايدشو)
+GALLERY_DL_MAX_IMAGES = int(os.getenv("GALLERY_DL_MAX_IMAGES", "30"))
+# امتدادات الصور التي نرسلها كألبوم
+_IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.webp', '.heic', '.gif')
+
 # حالة المحادثة بين الأدمن والأعضاء عبر زر الرد
 # {user_id: target_user_id} أي أن user_id ينتظر كتابة رد ليُرسَل إلى target_user_id
 conversation_state = {}
@@ -1129,6 +1134,82 @@ async def get_video_info(url: str):
         return None
 
 
+# ═══════════════════════════════════════════════════════════════
+# تحميل صور إنستغرام/تيك توك (كاروسيل/سلايدشو) عبر gallery-dl
+# yt-dlp يتجاهل الصور (يسقط الصيغ والمصغّرات للمنشورات المصوّرة)، لذا
+# نستخدم gallery-dl المتخصص في معارض الصور ثم نرسلها كألبوم في تلجرام.
+# ═══════════════════════════════════════════════════════════════
+
+def _fmts_have_video(formats):
+    """هل ضمن الصيغ صيغةُ فيديو؟
+
+    نعتبر أي صيغة فيديو إلا إذا كانت صوتاً صريحاً (vcodec=='none')، لأن بعض
+    منصات الفيديو (مثل ريلز إنستغرام) قد لا تضبط vcodec فتظهر None. أما
+    منشورات الصور فلا تملك صيغاً إطلاقاً (إنستغرام) أو صيغة صوت سلايدشو فقط
+    (تيك توك، vcodec=='none')، فيرجع False ونوجّهها لمسار الصور.
+    """
+    for f in formats or []:
+        vcodec = (f.get('vcodec') or '').lower()
+        if vcodec == 'none':
+            continue  # صوت صريح فقط (مثل صوت سلايدشو تيك توك)
+        return True
+    return False
+
+
+def _info_has_video(info):
+    """يحدّد إن كان منشور yt-dlp يحتوي فيديو فعلياً.
+
+    للمنشورات المصوّرة فقط (سلايدشو تيك توك / كاروسيل صور إنستغرام) لا توجد
+    صيغة فيديو، فنوجّهها لمسار الصور. أما المنشورات المختلطة (صور+فيديو) فتبقى
+    على مسار الفيديو الحالي دون تغيير في السلوك.
+    """
+    if not info:
+        return False
+    entries = info.get('entries')
+    if entries:
+        for e in entries:
+            if e and _fmts_have_video(e.get('formats')):
+                return True
+        return False
+    return _fmts_have_video(info.get('formats'))
+
+
+def _download_images_with_gallery_dl(url, dest_dir, cookie_file=None):
+    """ينزّل صور المنشور عبر gallery-dl إلى dest_dir (بشكل مسطّح) ويعيد قائمة
+    مسارات الصور مرتبة. الفيديو/الصوت/الأغلفة معطّلة فنحصل على الصور فقط؛
+    إن لم تكن هناك صور (منشور فيديو) تعود القائمة فارغة."""
+    os.makedirs(dest_dir, exist_ok=True)
+    cmd = [
+        sys.executable, '-m', 'gallery_dl',
+        '--quiet', '--no-mtime',
+        '--directory', dest_dir,        # ضع كل الملفات مباشرة هنا (مسطّح)
+        '--range', f'1-{GALLERY_DL_MAX_IMAGES}',
+        '-o', 'tiktok.videos=false',
+        '-o', 'tiktok.audio=false',
+        '-o', 'tiktok.covers=false',
+        '-o', 'instagram.videos=false',
+    ]
+    if cookie_file:
+        cmd += ['--cookies', cookie_file]
+    cmd.append(url)
+    try:
+        subprocess.run(cmd, timeout=180, capture_output=True)
+    except subprocess.TimeoutExpired:
+        logger.warning("⏱️ انتهت مهلة gallery-dl أثناء تحميل الصور")
+    except Exception as e:
+        logger.error(f"❌ خطأ في تشغيل gallery-dl: {e}")
+    try:
+        files = [
+            os.path.join(dest_dir, f) for f in os.listdir(dest_dir)
+            if f.lower().endswith(_IMAGE_EXTS)
+            and os.path.isfile(os.path.join(dest_dir, f))
+        ]
+    except FileNotFoundError:
+        files = []
+    files.sort()
+    return files
+
+
 async def upload_media_with_progress(client, chat_id, file_path, caption, status_msg, user_id, is_video=True):
     """Upload media with progress tracking"""
     try:
@@ -1379,8 +1460,9 @@ async def process_download_from_queue(task: DownloadTask):
             return
 
         # 📃 كشف قوائم التشغيل: عرض زر لتحميل أول N مقاطع (للمشتركين/الأدمن)
+        # كاروسيل الصور (بلا فيديو) يُستثنى هنا ليُعالَج كألبوم صور لاحقاً.
         entries = [e for e in (info.get('entries') or []) if e]
-        if entries:
+        if entries and _info_has_video(info):
             if not (subdb.is_user_subscribed(user_id) or is_admin(user_id)):
                 await status.edit_text(t('playlist_subscribers_only', lang))
                 return
@@ -1432,9 +1514,21 @@ async def process_download_from_queue(task: DownloadTask):
                     )
                     return
         
+        # 🖼️ منشور مصوّر بلا فيديو (كاروسيل إنستغرام / سلايدشو تيك توك) → ألبوم صور
+        if _platform_of(url) in ('instagram', 'tiktok') and not _info_has_video(info):
+            img_user_name = message.from_user.first_name or "User"
+            handled = await download_and_send_images(
+                app, message, url, status, user_id, img_user_name,
+                message.from_user.username, lang, info
+            )
+            if handled:
+                return
+            await status.edit_text(t('no_media_found', lang))
+            return
+
         max_duration_minutes = subdb.get_max_duration()
         max_duration_seconds = max_duration_minutes * 60
-        
+
         # If not subscribed and exceeds max duration
         if not is_subscribed and duration and duration > max_duration_seconds:
             await show_subscription_screen(app, status, user_id, title, duration, max_duration_minutes)
@@ -1677,6 +1771,102 @@ async def _save_media_to_cache(sent_msg, log_msg, ckey, quality, kind, title,
         logger.info(f"💾 حُفظ في الكاش: {ckey} ({quality})")
     except Exception as e:
         logger.warning(f"⚠️ تعذّر حفظ الكاش: {e}")
+
+
+async def download_and_send_images(client, message, url, status_msg,
+                                   user_id, user_name, user_username, lang, info=None):
+    """ينزّل صور منشور إنستغرام/تيك توك (كاروسيل/سلايدشو) ويرسلها كألبوم.
+
+    يعيد True إذا عُثر على صور وأُرسلت، وFalse إن لم يكن منشوراً مصوّراً
+    (فيرجع المتصل لمسار الفيديو المعتاد). لا يكسر أي سلوك للفيديو القائم.
+    """
+    from pyrogram.types import InputMediaPhoto
+
+    dl_dir = os.path.join('videos', 'img_' + uuid.uuid4().hex)
+    try:
+        await status_msg.edit_text(t('downloading_images', lang))
+        cookie_file = get_cookie_file_for_url(url)
+        loop = asyncio.get_event_loop()
+        files = await loop.run_in_executor(
+            None, lambda: _download_images_with_gallery_dl(url, dl_dir, cookie_file)
+        )
+
+        if not files:
+            return False  # ليست صوراً → ارجع لمسار الفيديو
+
+        title = ((info or {}).get('title') or 'صور').replace('`', "'")[:200]
+        bot_username = await _get_bot_username(client)
+        caption = t('images_caption', lang,
+                    title=title, count=len(files), user=user_name,
+                    promo=(f"\n\n📥 @{bot_username}" if bot_username else ""))
+
+        sent_messages = []
+        # تلجرام يسمح بحد أقصى 10 وسائط في الألبوم الواحد
+        chunks = [files[i:i + 10] for i in range(0, len(files), 10)]
+        for ci, chunk in enumerate(chunks):
+            if len(chunks) > 1:
+                try:
+                    await status_msg.edit_text(t('uploading_images', lang,
+                                                 current=ci + 1, total=len(chunks)))
+                except Exception:
+                    pass
+            if len(chunk) == 1 and len(chunks) == 1:
+                # صورة واحدة: أرسلها مباشرة مع الكابشن
+                msg = await client.send_photo(
+                    chat_id=message.chat.id, photo=chunk[0], caption=caption
+                )
+                sent_messages.append(msg)
+            else:
+                # الكابشن على أول صورة من أول ألبوم فقط
+                media = []
+                for fi, fpath in enumerate(chunk):
+                    cap = caption if (ci == 0 and fi == 0) else None
+                    media.append(InputMediaPhoto(fpath, caption=cap))
+                msgs = await client.send_media_group(
+                    chat_id=message.chat.id, media=media
+                )
+                sent_messages.extend(msgs if isinstance(msgs, list) else [msgs])
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        logger.info(f"✅ تم إرسال {len(files)} صورة للمستخدم {user_id}")
+
+        # تحويل أول صورة لقناة السجلات للأرشفة (اختياري، لا يفشل العملية)
+        if sent_messages:
+            try:
+                await forward_to_log_channel(
+                    client=client, message=message, sent_message=sent_messages[0],
+                    user_id=user_id, user_name=user_name, username=user_username,
+                    url=url, video_info=(info or {'title': title}),
+                    duration=0, file_size_mb=0
+                )
+            except Exception as log_error:
+                logger.error(f"⚠️ خطأ في إرسال الصور للقناة: {log_error}")
+
+        # تسجيل في سجل التحميلات (للإحصائيات و"تحميلاتي")
+        try:
+            subdb.add_download_history(user_id, url, title, 'best', 'image',
+                                       _platform_of(url), 0, from_cache=False)
+        except Exception:
+            pass
+
+        # عدّاد الحد اليومي + رسالة المتبقي (لغير المشتركين)
+        await _send_daily_remaining_notice(message, user_id, lang)
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ خطأ في تحميل الصور: {e}")
+        error_traceback = traceback.format_exc()
+        await send_error_to_admin(user_id, user_name, str(e), url, error_traceback)
+        try:
+            await status_msg.edit_text(t('download_failed', lang))
+        except Exception:
+            pass
+        return True  # عولج (بخطأ) — لا تكمل لمسار الفيديو
+    finally:
+        cleanup_download_dir(dl_dir)
 
 
 async def download_and_upload(client, message, url, quality, callback_query=None):
@@ -2255,6 +2445,15 @@ async def handle_redownload(client, callback_query):
     if not item or not item.get('url'):
         await callback_query.message.reply_text(
             t('error_occurred', lang, error="not found")
+        )
+        return
+    # 🖼️ عنصر صور: أعد تحميله عبر مسار الصور (gallery-dl) لا مسار الفيديو
+    if item.get('kind') == 'image':
+        u = callback_query.from_user
+        status = await callback_query.message.reply_text(t('processing', lang))
+        await download_and_send_images(
+            client, callback_query.message, item['url'], status,
+            user_id, u.first_name or "User", u.username, lang, None
         )
         return
     # download_and_upload يفحص الكاش أولاً (إرسال فوري) وإلا يحمّل من جديد
@@ -3715,9 +3914,24 @@ async def handle_url(client, message):
                 )
                 return
     
+    # 🖼️ منشور مصوّر بلا فيديو (كاروسيل إنستغرام / سلايدشو تيك توك) → أرسل الصور
+    #    كألبوم عبر gallery-dl. المنشورات المختلطة (صور+فيديو) تبقى على مسار الفيديو
+    #    المعتاد دون أي تغيير في سلوكه.
+    if _platform_of(url) in ('instagram', 'tiktok') and not _info_has_video(info):
+        img_user_name = message.from_user.first_name or "User"
+        handled = await download_and_send_images(
+            client, message, url, status, user_id, img_user_name, username, lang, info
+        )
+        pending_downloads.pop(user_id, None)
+        if handled:
+            return
+        # لا فيديو ولا صور صالحة في الرابط
+        await status.edit_text(t('no_media_found', lang))
+        return
+
     max_duration_minutes = subdb.get_max_duration()
     max_duration_seconds = max_duration_minutes * 60
-    
+
     # If not subscribed and exceeds max duration
     if not is_subscribed and duration and duration > max_duration_seconds:
         await show_subscription_screen(client, status, user_id, title, duration, max_duration_minutes)
