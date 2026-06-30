@@ -3187,26 +3187,71 @@ async def send_daily_report(client, admin_id):
 
 
 # مهمة خلفية للتقرير اليومي
+# أسماء المنصات مع أيقوناتها لعرض لوحة الصحّة
+_PLATFORM_LABEL = {
+    'facebook': '📘 فيسبوك', 'instagram': '📷 إنستغرام', 'tiktok': '🎵 تيك توك',
+    'youtube': '📺 يوتيوب', 'twitter': '🐦 تويتر/X', 'threads': '🧵 ثريدز',
+    'reddit': '👽 ريديت', 'snapchat': '👻 سناب', 'pinterest': '📌 بينتريست',
+    'other': '🌐 أخرى',
+}
+
+
+def _error_category(msg: str):
+    """يصنّف رسالة الخطأ إلى نوع مختصر + تلميح للسبب الجذري (أو None)."""
+    low = (msg or '').lower()
+    if 'cannot parse data' in low:
+        return 'Cannot parse data', 'ثبّت curl_cffi وحدّث كوكيز فيسبوك'
+    if 'no video formats' in low or 'failed to extract video info' in low:
+        return 'لا صيغة فيديو / فشل الاستخراج', 'قد يكون منشور صور أو خاص أو منصة غير مدعومة'
+    if any(k in low for k in ('sign in', 'log in', 'login required', 'private', 'rate-limit', 'rate limit', 'cookies')):
+        return 'يتطلب تسجيل دخول / كوكيز', 'حدّث كوكيز المنصة'
+    if 'unsupported url' in low:
+        return 'رابط غير مدعوم', 'المنصة غير مدعومة في yt-dlp'
+    if 'unavailable' in low or 'not available' in low or 'deleted' in low:
+        return 'المحتوى غير متاح', 'حُذف المنشور أو مقيّد جغرافياً'
+    return (msg or 'خطأ').split('\n')[0][:45], None
+
+
 async def show_errors(client, message):
-    """عرض قائمة الأخطاء للأدمن"""
-    pending_errors = {k: v for k, v in user_errors.items() if v['status'] == 'pending'}
-    
-    if not pending_errors:
-        await message.reply_text("✅ **لا توجد أخطاء معلقة!**\n\nجميع المشاكل تم حلها.")
+    """لوحة صحّة المنصات: تجمع الأخطاء المعلقة حسب المنصة + نوع الخطأ مع
+    تلميح للسبب الجذري، فيرى الأدمن النمط بنظرة واحدة بدل أخطاء فردية."""
+    pending = {k: v for k, v in user_errors.items() if v['status'] == 'pending'}
+
+    if not pending:
+        await message.reply_text("✅ **لا توجد أخطاء معلقة!**\n\nكل المنصات تعمل بشكل سليم.")
         return
-    
-    text = "🔔 **قائمة الأخطاء المعلقة**\n\n"
-    
-    for error_id, error_data in list(pending_errors.items())[:10]:  # آخر 10 أخطاء
-        text += f"━━━━━━━━━━━━━━━━\n"
-        text += f"🆔 **ID:** `{error_id}`\n"
-        text += f"👤 **المستخدم:** {error_data['user_name']} (`{error_data['user_id']}`)\n"
-        text += f"🕐 **الوقت:** {error_data['time']}\n"
-        text += f"🔗 **الرابط:** `{error_data['url'][:40]}...`\n\n"
-    
-    text += f"\n📝 **إجمالي الأخطاء المعلقة:** {len(pending_errors)}"
-    
-    await message.reply_text(text)
+
+    # تجميع حسب المنصة ثم نوع الخطأ
+    groups = {}
+    for e in pending.values():
+        plat = _platform_of(e.get('url', ''))
+        cat, hint = _error_category(e.get('error', ''))
+        g = groups.setdefault(plat, {'count': 0, 'types': {}, 'hints': set(), 'sample': None})
+        g['count'] += 1
+        g['types'][cat] = g['types'].get(cat, 0) + 1
+        if hint:
+            g['hints'].add(hint)
+        g['sample'] = e.get('url')  # أحدث رابط كمثال (كامل، قابل للنسخ)
+
+    text = "🩺 **لوحة صحّة المنصات**\n\n"
+    for plat, g in sorted(groups.items(), key=lambda kv: kv[1]['count'], reverse=True):
+        dot = '🔴' if g['count'] >= 3 else '🟡'
+        label = _PLATFORM_LABEL.get(plat, f'🌐 {plat}')
+        text += f"{dot} **{label}** — {g['count']} خطأ\n"
+        for cat, n in sorted(g['types'].items(), key=lambda kv: kv[1], reverse=True):
+            text += f"   • {cat} ×{n}\n"
+        for hint in g['hints']:
+            text += f"   💡 {hint}\n"
+        if g['sample']:
+            text += f"   مثال: `{g['sample']}`\n"
+        text += "\n"
+
+    text += f"📊 **الإجمالي:** {len(pending)} خطأ معلّق"
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑 مسح كل الأخطاء", callback_data="clear_errors")]
+    ])
+    await message.reply_text(text, reply_markup=kb)
 
 
 @app.on_callback_query(filters.regex(r'^resolve_'))
@@ -3249,6 +3294,24 @@ async def handle_resolve_error(client, callback_query):
     )
     
     await callback_query.answer("✅ تم إرسال إشعار للمستخدم", show_alert=True)
+
+
+@app.on_callback_query(filters.regex(r'^clear_errors$'))
+async def handle_clear_errors(client, callback_query):
+    """مسح كل الأخطاء المعلقة دفعة واحدة من لوحة صحّة المنصات."""
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("❌ للمشرفين فقط!", show_alert=True)
+        return
+    n = 0
+    for v in user_errors.values():
+        if v['status'] == 'pending':
+            v['status'] = 'resolved'
+            n += 1
+    await callback_query.message.edit_text(
+        f"✅ **تم مسح {n} خطأ معلّق.**\n\nاللوحة الآن نظيفة.",
+        reply_markup=None
+    )
+    await callback_query.answer(f"🗑 تم مسح {n} خطأ", show_alert=True)
 
 
 # تقرير يومي تلقائي
