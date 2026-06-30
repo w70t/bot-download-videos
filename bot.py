@@ -1478,6 +1478,15 @@ async def process_download_from_queue(task: DownloadTask):
         
         if not info:
             user_name = message.from_user.first_name or "User"
+            # 🖼️ قد يفشل yt-dlp تماماً في استخراج سلايدشو تيك توك / كاروسيل إنستغرام
+            #    (منشور صور بلا فيديو، خاصة روابط vm.tiktok.com المختصرة) فيرجع None.
+            #    جرّب مسار الصور عبر gallery-dl قبل اعتبار الرابط فاشلاً.
+            if _platform_of(url) in ('instagram', 'tiktok'):
+                if await download_and_send_images(
+                    app, message, url, status, user_id, user_name,
+                    message.from_user.username, lang
+                ):
+                    return
             await send_error_to_admin(user_id, user_name, "Failed to extract video info", url)
             await status.edit_text(t('invalid_url', lang))
             return
@@ -3907,7 +3916,16 @@ async def handle_url(client, message):
         if not info:
             # Send alert to admin
             user_name = message.from_user.first_name or "User"
-            
+            # 🖼️ قد يفشل yt-dlp تماماً في استخراج سلايدشو تيك توك / كاروسيل إنستغرام
+            #    (منشور صور بلا فيديو، خاصة روابط vm.tiktok.com المختصرة) فيرجع None.
+            #    جرّب مسار الصور عبر gallery-dl قبل اعتبار الرابط فاشلاً.
+            if _platform_of(url) in ('instagram', 'tiktok'):
+                if await download_and_send_images(
+                    client, message, url, status, user_id, user_name,
+                    message.from_user.username, lang
+                ):
+                    pending_downloads.pop(user_id, None)
+                    return
             await send_error_to_admin(user_id, user_name, "Failed to extract video info", url)
             await status.edit_text(t('invalid_url', lang))
             return
