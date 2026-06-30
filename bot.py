@@ -1218,6 +1218,7 @@ def _download_images_with_gallery_dl(url, dest_dir, cookie_file=None):
         '-o', 'tiktok.audio=false',
         '-o', 'tiktok.covers=false',
         '-o', 'instagram.videos=false',
+        '-o', 'threads.videos=false',
     ]
     if cookie_file:
         cmd += ['--cookies', cookie_file]
@@ -1481,7 +1482,7 @@ async def process_download_from_queue(task: DownloadTask):
             # 🖼️ قد يفشل yt-dlp تماماً في استخراج سلايدشو تيك توك / كاروسيل إنستغرام
             #    (منشور صور بلا فيديو، خاصة روابط vm.tiktok.com المختصرة) فيرجع None.
             #    جرّب مسار الصور عبر gallery-dl قبل اعتبار الرابط فاشلاً.
-            if _platform_of(url) in ('instagram', 'tiktok'):
+            if _platform_of(url) in ('instagram', 'tiktok', 'threads'):
                 if await download_and_send_images(
                     app, message, url, status, user_id, user_name,
                     message.from_user.username, lang
@@ -1554,7 +1555,7 @@ async def process_download_from_queue(task: DownloadTask):
                     return
         
         # 🖼️ منشور مصوّر بلا فيديو (كاروسيل إنستغرام / سلايدشو تيك توك) → ألبوم صور
-        if _platform_of(url) in ('instagram', 'tiktok') and not _info_has_video(info):
+        if _platform_of(url) in ('instagram', 'tiktok', 'threads') and not _info_has_video(info):
             img_user_name = message.from_user.first_name or "User"
             handled = await download_and_send_images(
                 app, message, url, status, user_id, img_user_name,
@@ -3919,7 +3920,7 @@ async def handle_url(client, message):
             # 🖼️ قد يفشل yt-dlp تماماً في استخراج سلايدشو تيك توك / كاروسيل إنستغرام
             #    (منشور صور بلا فيديو، خاصة روابط vm.tiktok.com المختصرة) فيرجع None.
             #    جرّب مسار الصور عبر gallery-dl قبل اعتبار الرابط فاشلاً.
-            if _platform_of(url) in ('instagram', 'tiktok'):
+            if _platform_of(url) in ('instagram', 'tiktok', 'threads'):
                 if await download_and_send_images(
                     client, message, url, status, user_id, user_name,
                     message.from_user.username, lang
@@ -3978,7 +3979,7 @@ async def handle_url(client, message):
     # 🖼️ منشور مصوّر بلا فيديو (كاروسيل إنستغرام / سلايدشو تيك توك) → أرسل الصور
     #    كألبوم عبر gallery-dl. المنشورات المختلطة (صور+فيديو) تبقى على مسار الفيديو
     #    المعتاد دون أي تغيير في سلوكه.
-    if _platform_of(url) in ('instagram', 'tiktok') and not _info_has_video(info):
+    if _platform_of(url) in ('instagram', 'tiktok', 'threads') and not _info_has_video(info):
         img_user_name = message.from_user.first_name or "User"
         handled = await download_and_send_images(
             client, message, url, status, user_id, img_user_name, username, lang, info
