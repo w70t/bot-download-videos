@@ -9,6 +9,7 @@ Telegram Video Downloader Bot - Standalone Version
 """
 
 import os
+import re  # استخراج الرابط النظيف من نص الرسالة
 import sys
 import glob  # للبحث عن الملفات وحذفها
 import time  # Added import os
@@ -187,6 +188,27 @@ def _platform_of(url: str) -> str:
         if any(m in low for m in markers):
             return platform
     return 'other'
+
+
+# نمط استخراج الرابط من نص الرسالة: محصور بمحارف الرابط (ASCII) فقط، فيتوقّف
+# تلقائياً عند المسافة أو الإيموجي أو الحروف العربية الملاصقة.
+_URL_IN_TEXT_RE = re.compile(r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+")
+
+
+def extract_first_url(text: str):
+    """يستخرج أول رابط http(s) من نص الرسالة ويزيل اللواصق الشائعة عند النسخ.
+
+    تختلف الأجهزة/التطبيقات في طريقة نسخ/مشاركة الروابط: أحياناً يأتي الرابط
+    وحده، وأحياناً مع نص أو إيموجي أو في سطر منفصل، أو تتبعه علامة ترقيم.
+    أخذ نص الرسالة كاملاً كرابط كان يكسر الاستخراج (Failed to extract video info).
+    هنا نلتقط الرابط فقط وننظّف علامات الترقيم/الأقواس الملاصقة في نهايته."""
+    if not text:
+        return None
+    m = _URL_IN_TEXT_RE.search(text)
+    if not m:
+        return None
+    url = m.group(0).rstrip(".,;:!?)]}>'\"`،؛؟")
+    return url or None
 
 
 # Initialize Queue Manager
@@ -3820,8 +3842,15 @@ async def handle_url(client, message):
     if not message.from_user:
         return
     
-    url = message.text.strip()
+    # استخرج الرابط النظيف من النص (قد يحتوي كلاماً/إيموجي/أسطراً حول الرابط)
+    url = extract_first_url(message.text)
     user_id = message.from_user.id
+
+    # لم يُعثر على رابط صالح داخل النص → لا تكمل بنص غير صالح
+    if not url:
+        lang = subdb.get_user_language(user_id)
+        await message.reply_text(t('invalid_url', lang))
+        return
 
     # إن كان الأدمن في وضع إضافة قناة اشتراك إجباري وأرسل رابط t.me، عالِجه هنا
     # (لأن معالج الروابط يلتقط أي رسالة فيها http قبل معالج إدخال الأدمن)
