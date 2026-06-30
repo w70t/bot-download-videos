@@ -1069,6 +1069,27 @@ def _is_youtube_cookie_issue(err):
     return any(s in msg for s in signs)
 
 
+def _is_facebook_cookie_issue(err):
+    """هل خطأ فيسبوك ناتج عن كوكيز فاسدة/منتهية تكسر استخراج المحتوى العام؟
+
+    فيسبوك بكوكيز منتهية يقدّم صفحة تسجيل دخول/تحقّق لا يستطيع yt-dlp قراءتها
+    فيظهر 'Cannot parse data'. المحتوى العام (الريلز) يُستخرج بدون كوكيز، لذا
+    نعيد المحاولة بدونها.
+    """
+    msg = str(err).lower()
+    return 'cannot parse data' in msg
+
+
+def _is_cookie_file_issue(err):
+    """هل الخطأ بسبب ملف كوكيز تالف/غير صالح (ليس بصيغة Netscape)؟
+
+    ملف كوكيز معطوب يجعل yt-dlp يفشل قبل بدء الاستخراج لأي منصة، فنتجاوزه
+    ونعيد المحاولة بدون كوكيز (يكفي للمحتوى العام).
+    """
+    msg = str(err).lower()
+    return 'netscape' in msg and 'cookies' in msg
+
+
 async def get_video_info(url: str):
     """استخراج معلومات الفيديو"""
     try:
@@ -1079,6 +1100,7 @@ async def get_video_info(url: str):
         # اختيار ملف cookies المطابق لمنصة الرابط (مهم للستوري الخاص)
         cookie_file = get_cookie_file_for_url(url)
         is_youtube = any(m in url.lower() for m in PLATFORM_URL_MARKERS['youtube'])
+        is_facebook = any(m in url.lower() for m in PLATFORM_URL_MARKERS['facebook'])
 
         ydl_opts = {
             'quiet': True,
@@ -1122,6 +1144,14 @@ async def get_video_info(url: str):
             # يوتيوب مع الكوكيز قد يفشل بسبب حجب الصيغ → أعد المحاولة بدون كوكيز
             if cookie_file and is_youtube and _is_youtube_cookie_issue(e):
                 logger.warning("⚠️ فشل يوتيوب مع الكوكيز، إعادة المحاولة بدون كوكيز...")
+                return await loop.run_in_executor(None, lambda: extract(False))
+            # فيسبوك بكوكيز فاسدة قد يكسر استخراج المحتوى العام → أعد المحاولة بدون كوكيز
+            if cookie_file and is_facebook and _is_facebook_cookie_issue(e):
+                logger.warning("⚠️ فشل فيسبوك مع الكوكيز (Cannot parse data)، إعادة المحاولة بدون كوكيز...")
+                return await loop.run_in_executor(None, lambda: extract(False))
+            # ملف كوكيز تالف (صيغة غير صحيحة) يفشل لأي منصة → أعد المحاولة بدون كوكيز
+            if cookie_file and _is_cookie_file_issue(e):
+                logger.warning(f"⚠️ ملف الكوكيز تالف/غير صالح ({cookie_file})، إعادة المحاولة بدون كوكيز...")
                 return await loop.run_in_executor(None, lambda: extract(False))
             raise
     except Exception as e:
@@ -2018,7 +2048,11 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         
         ydl_opts = {
             'format': quality_formats.get(quality, 'best'),
-            'outtmpl': os.path.join(dl_dir, '%(title)s.%(ext)s'),
+            # حدّ طول العنوان بالبايت (B) لا بالأحرف: الأحرف العربية/الإيموجي
+            # تأخذ عدة بايتات، وحدّ اسم الملف في لينكس 255 بايت. 150B يترك
+            # مساحة كافية للاحقات yt-dlp المؤقتة (.fXXX/.part) والامتداد.
+            # [%(id)s] يضمن اسماً صالحاً وفريداً حتى لو كان العنوان فارغاً.
+            'outtmpl': os.path.join(dl_dir, '%(title).150B [%(id)s].%(ext)s'),
             'progress_hooks': [download_progress_hook],
             'postprocessor_hooks': [postprocessor_hook],  # تتبع مرحلة المعالجة
             'quiet': True,
@@ -2065,6 +2099,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         await status_msg.edit_text(t('start_downloading', lang))
         
         is_youtube_url = any(m in url.lower() for m in PLATFORM_URL_MARKERS['youtube'])
+        is_facebook_url = any(m in url.lower() for m in PLATFORM_URL_MARKERS['facebook'])
 
         def download(use_cookies=True, fmt=None):
             o = dict(ydl_opts)
@@ -2094,6 +2129,14 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                         info, file_path = await loop.run_in_executor(None, lambda: download(False, fallback_fmt))
                     else:
                         raise
+            # فيسبوك بكوكيز فاسدة قد يكسر تحميل المحتوى العام → أعد المحاولة بدون كوكيز
+            elif ydl_opts.get('cookiefile') and is_facebook_url and _is_facebook_cookie_issue(dl_err):
+                logger.warning("⚠️ فشل تحميل فيسبوك مع الكوكيز (Cannot parse data)، إعادة المحاولة بدون كوكيز...")
+                info, file_path = await loop.run_in_executor(None, lambda: download(False))
+            # ملف كوكيز تالف (صيغة غير صحيحة) يفشل لأي منصة → أعد المحاولة بدون كوكيز
+            elif ydl_opts.get('cookiefile') and _is_cookie_file_issue(dl_err):
+                logger.warning(f"⚠️ ملف الكوكيز تالف/غير صالح ({ydl_opts.get('cookiefile')})، إعادة المحاولة بدون كوكيز...")
+                info, file_path = await loop.run_in_executor(None, lambda: download(False))
             # الصيغة المطلوبة غير متوفرة → أعد المحاولة بأفضل صيغة متاحة
             elif 'requested format is not available' in msg or 'no video formats' in msg:
                 logger.warning("⚠️ الصيغة المطلوبة غير متوفرة، إعادة المحاولة بأفضل صيغة متاحة")
