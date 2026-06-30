@@ -211,6 +211,45 @@ def extract_first_url(text: str):
     return url or None
 
 
+# روابط المشاركة/الاختصار التي تحتاج حلّ إعادة التوجيه للوصول للرابط الحقيقي.
+# مثال: facebook.com/share/v/... و /share/r/... و fb.watch هي روابط تحويل،
+# وبعض صيغها لا يحلّها مستخرج yt-dlp مباشرة بينما الرابط الكنسي يعمل بثقة.
+_REDIRECT_URL_MARKERS = ('facebook.com/share/', 'fb.watch')
+
+
+def resolve_share_url(url: str, timeout: int = 15) -> str:
+    """يتبع إعادة التوجيه لروابط المشاركة للوصول إلى الرابط الحقيقي القابل
+    للتحميل، ثم يعيده. عند أي فشل يعيد الرابط الأصلي دون كسر أي سلوك قائم."""
+    low = (url or '').lower()
+    if not any(m in low for m in _REDIRECT_URL_MARKERS):
+        return url
+    import urllib.request
+    from http.cookiejar import MozillaCookieJar
+    try:
+        cj = MozillaCookieJar()
+        cookie_file = get_cookie_file_for_url(url)
+        if cookie_file and os.path.exists(cookie_file):
+            try:
+                cj.load(cookie_file, ignore_discard=True, ignore_expires=True)
+            except Exception:
+                pass
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+        opener.addheaders = [
+            ('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                           'AppleWebKit/537.36 (KHTML, like Gecko) '
+                           'Chrome/120.0.0.0 Safari/537.36'),
+            ('Accept-Language', 'en-US,en;q=0.9'),
+        ]
+        with opener.open(url, timeout=timeout) as resp:
+            final = resp.geturl()
+        if final and final != url and is_safe_url(final):
+            logger.info(f"🔗 حُلّ رابط المشاركة: {url[:60]} → {final[:90]}")
+            return final
+    except Exception as e:
+        logger.warning(f"⚠️ تعذّر حلّ رابط المشاركة ({url[:60]}): {e}")
+    return url
+
+
 # Initialize Queue Manager
 queue_manager = DownloadQueueManager(cooldown_seconds=10)
 
@@ -3891,6 +3930,12 @@ async def handle_url(client, message):
         logger.warning(f"🚫 Blocked unsafe/internal URL from user {user_id}: {url[:100]}")
         await message.reply_text(t('invalid_url', lang))
         return
+
+    # 🔗 حلّ روابط المشاركة (فيسبوك /share/ و fb.watch) للرابط الحقيقي قبل
+    #    التحميل — بعض صيغها لا يحلّها yt-dlp مباشرة. يُنفَّذ خارج حلقة الأحداث
+    #    لأنه طلب شبكي متزامن.
+    if any(m in url.lower() for m in _REDIRECT_URL_MARKERS):
+        url = await asyncio.get_event_loop().run_in_executor(None, resolve_share_url, url)
 
     # 📢 الاشتراك الإجباري بالقنوات قبل أي تحميل (تحقق حقيقي)
     if await enforce_forced_subscription(client, message, user_id, lang):
