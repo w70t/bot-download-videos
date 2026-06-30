@@ -242,9 +242,26 @@ def resolve_share_url(url: str, timeout: int = 15) -> str:
         ]
         with opener.open(url, timeout=timeout) as resp:
             final = resp.geturl()
-        if final and final != url and is_safe_url(final):
-            logger.info(f"🔗 حُلّ رابط المشاركة: {url[:60]} → {final[:90]}")
+            body = resp.read(400000)  # أول ~400KB تكفي لوسوم <head>
+
+        # 1) إعادة توجيه HTTP مباشرة لرابط غير share → استخدمه
+        if final and '/share/' not in final.lower() and final != url and is_safe_url(final):
+            logger.info(f"🔗 حُلّ رابط المشاركة (توجيه): {url[:50]} → {final[:90]}")
             return final
+
+        # 2) استخرج الرابط الكنسي من HTML الصفحة (og:url / canonical / watch|reel|videos)
+        html_text = body.decode('utf-8', 'ignore')
+        for pat in (
+            r'rel=["\']canonical["\'][^>]*href=["\']([^"\']+)["\']',
+            r'property=["\']og:url["\'][^>]*content=["\']([^"\']+)["\']',
+            r'(https://(?:www|m|web)\.facebook\.com/(?:watch/?\?v=\d+|reel/\d+|[^"\'/]+/videos/\d+)[^"\'\\]*)',
+        ):
+            m = re.search(pat, html_text)
+            if m:
+                cand = m.group(1).replace('&amp;', '&')
+                if '/share/' not in cand.lower() and is_safe_url(cand):
+                    logger.info(f"🔗 حُلّ رابط المشاركة (HTML): {url[:50]} → {cand[:90]}")
+                    return cand
     except Exception as e:
         logger.warning(f"⚠️ تعذّر حلّ رابط المشاركة ({url[:60]}): {e}")
     return url
