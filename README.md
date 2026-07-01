@@ -387,12 +387,20 @@ pip install -r requirements.txt
 
 ---
 
-## 🚀 تشغيل مستمر (systemd)
+## 🚀 التشغيل الدائم على Raspberry Pi (systemd)
 
-**إنشاء خدمة:**
+هذا القسم يضمن أن البوت:
+- ✅ **يشتغل تلقائياً عند إقلاع الجهاز** (حتى لو انقطعت الكهرباء ورجعت)
+- ✅ **يعيد تشغيل نفسه تلقائياً** إذا انهار أو توقف لأي سبب
+- ✅ **ينتظر الشبكة وقاعدة البيانات** قبل أن يبدأ (لا يفشل عند الإقلاع)
+
+> 💡 في الأمثلة أدناه اسم الخدمة `bot7` والمستخدم `YOUR_USERNAME` ومجلد
+> المشروع `~/bot7` — **عدّلها حسب جهازك**.
+
+### 1. إنشاء ملف الخدمة
 
 ```bash
-sudo nano /etc/systemd/system/telegram-bot.service
+sudo nano /etc/systemd/system/bot7.service
 ```
 
 **المحتوى:**
@@ -400,29 +408,95 @@ sudo nano /etc/systemd/system/telegram-bot.service
 ```ini
 [Unit]
 Description=Telegram Video Downloader Bot
-After=network.target postgresql.service
+# لا تبدأ إلا بعد جاهزية الشبكة وقاعدة البيانات
+After=network-online.target postgresql.service
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=YOUR_USERNAME
-WorkingDirectory=/home/YOUR_USERNAME/telegram-downloader-bot
-Environment="PATH=/home/YOUR_USERNAME/telegram-downloader-bot/venv/bin"
-ExecStart=/home/YOUR_USERNAME/telegram-downloader-bot/venv/bin/python3 bot.py
+WorkingDirectory=/home/YOUR_USERNAME/bot7
+# يفضَّل التشغيل من البيئة الافتراضية (venv) حتى تنطبق الإصدارات
+# المثبّتة في requirements.txt على البوت فعلياً
+ExecStart=/home/YOUR_USERNAME/bot7/venv/bin/python bot.py
+# إعادة تشغيل تلقائية عند أي انهيار أو توقف، بعد انتظار 10 ثوانٍ
 Restart=always
 RestartSec=10
+# لا تستسلم مهما تكررت الأعطال (افتراضياً systemd يتوقف بعد 5 محاولات سريعة)
+StartLimitIntervalSec=0
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-**تفعيل:**
+### 2. التفعيل (مرة واحدة فقط)
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable telegram-bot
-sudo systemctl start telegram-bot
-sudo systemctl status telegram-bot
+sudo systemctl daemon-reload      # اقرأ ملف الخدمة الجديد/المعدّل
+sudo systemctl enable bot7        # ⬅️ التشغيل التلقائي عند كل إقلاع
+sudo systemctl start bot7         # شغّله الآن
+sudo systemctl status bot7        # تأكد أنه "active (running)"
 ```
+
+> ⚠️ بدون `systemctl enable` البوت **لن يشتغل** بعد إعادة تشغيل الجهاز!
+> تأكد أنه مفعّل: `systemctl is-enabled bot7` → يجب أن تطبع `enabled`.
+
+### 3. أوامر التشغيل اليومية
+
+| الأمر | الوظيفة |
+|---|---|
+| `sudo systemctl status bot7` | حالة البوت الآن |
+| `sudo systemctl restart bot7` | إعادة تشغيل يدوية |
+| `sudo systemctl stop bot7` | إيقاف مؤقت |
+| `sudo systemctl start bot7` | تشغيل بعد الإيقاف |
+| `journalctl -u bot7 -n 30 --no-pager` | آخر 30 سطراً من السجلات |
+| `journalctl -u bot7 -f` | متابعة السجلات مباشرة (اخرج بـ Ctrl+C) |
+| `systemctl is-enabled bot7` | هل التشغيل التلقائي عند الإقلاع مفعّل؟ |
+
+### 4. اختبار أن كل شيء يعمل
+
+```bash
+# جرّب إعادة تشغيل الجهاز كاملاً
+sudo reboot
+
+# بعد أن يرجع الجهاز (دقيقة تقريباً) اتصل به وتأكد
+sudo systemctl status bot7
+```
+
+إذا ظهر `active (running)` فالبوت رجع لوحده بنجاح ✅
+
+---
+
+## 🔄 التحديث التلقائي لـ yt-dlp
+
+`yt-dlp` يحتاج تحديثاً دورياً لمواكبة تغييرات المنصات (يوتيوب/تيك توك...).
+السكربت `update_ytdlp.sh` المرفق يتكفّل بذلك:
+
+- يكتشف بيئة بايثون التي يعمل بها البوت **فعلياً** ويحدّثها
+- يعيد تشغيل البوت **فقط إذا نزل إصدار جديد** (لا يقطع تحميلات جارية بلا داعٍ)
+- يرسل **إشعار تلجرام للأدمن** بنتيجة كل تحديث (نجاح/فشل)
+
+**التفعيل (فحص كل 6 ساعات):**
+
+```bash
+chmod +x ~/bot7/update_ytdlp.sh
+( sudo crontab -l 2>/dev/null | grep -v 'yt-dlp' ; \
+  echo '0 */6 * * * /home/YOUR_USERNAME/bot7/update_ytdlp.sh >> /home/YOUR_USERNAME/bot7/ytdlp_update.log 2>&1' \
+) | sudo crontab -
+sudo crontab -l   # للتأكد من الحفظ
+```
+
+**مراقبة سجل التحديثات:**
+
+```bash
+tail -20 ~/bot7/ytdlp_update.log
+```
+
+**تحديث فوري بدون انتظار:** من داخل البوت اضغط زر `🔄 تحديث yt-dlp`
+في لوحة الأدمن (أو أرسل `/update`) — يحدّث فعلياً ويعيد التشغيل عند الحاجة.
+
+> 💡 السكربت صامت عندما لا يوجد تحديث جديد. لو تريد إشعاراً في كل فحص
+> حتى بدون جديد، أضف `NOTIFY_NO_CHANGE=1` قبل مسار السكربت في سطر cron.
 
 ---
 
@@ -430,19 +504,28 @@ sudo systemctl status telegram-bot
 
 ```
 .
-├── bot.py                          # الملف الرئيسي للبوت
+├── bot.py                          # الملف الرئيسي: المعالجات ومسار التحميل والرفع
+├── url_utils.py                    # أدوات الروابط (SSRF، كاش، استخراج، منصات)
+├── link_resolvers.py               # سناب سبوت لايت + روابط الأغاني
+├── content_filter.py               # فلتر المحتوى الإباحي وحظر الحسابات
+├── cookies_manager.py              # اختيار ملفات الكوكيز والتحقق منها
+├── video_processing.py             # ffmpeg/ffprobe (مصغّرات وتجهيز الفيديو)
+├── download_errors.py              # تصنيف أخطاء yt-dlp
 ├── subscription_db.py              # إدارة قاعدة البيانات (اشتراكات، كاش، استبيان، حظر)
 ├── translations.py                 # نظام الترجمة (عربي/إنجليزي)
 ├── queue_manager.py                # نظام الطوابير
 ├── pg_backup.py                    # النسخ الاحتياطي
 ├── setup_postgres.py               # إعداد قاعدة البيانات
-├── requirements.txt                # المكتبات المطلوبة
+├── update_ytdlp.sh                 # التحديث التلقائي لـ yt-dlp (cron)
+├── requirements.txt                # المكتبات المطلوبة (إصدارات مثبّتة)
+├── requirements-dev.txt            # أدوات التطوير والاختبار
 ├── env.example                     # مثال ملف البيئة
 ├── run.sh                          # سكربت تشغيل مختصر
 ├── .gitignore                      # ملفات محمية
 ├── README.md                       # هذا الملف
 ├── QUICK_START.md                  # دليل البدء السريع
 ├── INSTALLATION_GUIDE.md           # دليل التثبيت الكامل
+├── tests/                          # اختبارات الوحدات (pytest)
 ├── videos/                         # مجلد الوسائط المؤقتة (فيديو/صور)
 └── cookies/                        # مجلد ملفات Cookies للمنصات
 ```
