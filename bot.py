@@ -4069,11 +4069,17 @@ async def handle_quality(client, callback_query):
     url = pending_downloads[user_id]
     lang = subdb.get_user_language(user_id)
     await _edit_preview(callback_query.message, t('start_download', lang))
-    
+
     await download_and_upload(client, callback_query.message, url, quality, callback_query)
 
     # Safe deletion - prevents KeyError if user clicks multiple quality buttons
     pending_downloads.pop(user_id, None)
+
+    # نظافة المحادثة: احذف رسالة المعاينة (المصغّرة/النص) بعد اكتمال العملية
+    try:
+        await callback_query.message.delete()
+    except Exception:
+        pass
 
 
 @app.on_callback_query(filters.regex(r'^playlist_dl$'))
