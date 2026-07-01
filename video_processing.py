@@ -10,7 +10,6 @@ import os
 import json
 import logging
 import subprocess
-from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +77,9 @@ def finalize_video(video_path):
     - يضمن ترميز H.264/AAC: ينسخ إن كان متوافقاً، وإلا يُعيد الترميز (سبب
       تجمّد الصورة في فيسبوك/منصات أخرى تستخدم VP9/AV1).
     - +faststart: نقل moov atom للبداية ليُعاين ويُشغّل فوراً.
-    - creation_time = الآن ليظهر المقطع بترتيب وقت التحميل في المعرض.
+    - حذف بيانات creation_time الوصفية: بوجودها يؤرشف المعرض (خاصة iOS)
+      المقطع بوقت التحميل على الخادم؛ بحذفها يعتمد الجهاز وقت حفظ المستخدم
+      الفعلي فيظهر المقطع في أعلى المعرض.
     """
     vcodec, acodec, width, height, duration = probe_video(video_path)
 
@@ -93,11 +94,12 @@ def finalize_video(video_path):
 
     tmp = os.path.splitext(video_path)[0] + '.fixed.mp4'
     try:
-        now_iso = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
         cmd = (
             ['ffmpeg', '-y', '-i', video_path, '-map', '0:v?', '-map', '0:a?']
             + v_args + a_args
-            + ['-movflags', '+faststart', '-metadata', f'creation_time={now_iso}', tmp]
+            # -map_metadata -1: حذف البيانات الوصفية (منها creation_time) حتى
+            # يؤرشف معرض الجوال المقطع بوقت حفظ المستخدم لا بوقت التحميل
+            + ['-movflags', '+faststart', '-map_metadata', '-1', tmp]
         )
         # إعادة الترميز قد تستغرق وقتاً أطول من النسخ
         timeout = 3600 if not v_compatible else 900
