@@ -74,6 +74,7 @@ TRANSLATIONS = {
         # الأخطاء - Errors
         'error_occurred': '❌ **حدث خطأ**\n\n{error}',
         'invalid_url': '❌ **رابط غير صحيح**\n\nأرسل رابط فيديو صالح',
+        'content_restricted': '⚠️ **محتوى مقيّد**\n\nهذا المنشور مقيّد بالعمر أو مصنّف كمحتوى حسّاس على المنصة، ويتعذّر تحميله حالياً.',
         'adult_blocked': '🔞 **محتوى محظور**\n\nهذا البوت لا يسمح بتحميل المحتوى الإباحي أو غير اللائق.',
         'banned_screen': '🚫 **تم حظرك من البوت**\n\n📌 **السبب:** تم تحميل مقاطع إباحية.\n\nيمكنك العودة بالتعهّد بعدم تكرار ذلك. أي مخالفة بعد التعهّد = حظر دائم.',
         'banned_permanent': '🚫 **أنت محظور نهائياً**\n\n📌 **السبب:** تكرار تحميل محتوى إباحي بعد التعهّد.\n\nالحظر دائم — تواصل مع الأدمن لمراجعة حالتك.',
@@ -236,6 +237,7 @@ TRANSLATIONS = {
         # Errors
         'error_occurred': '❌ **An Error Occurred**\n\n{error}',
         'invalid_url': '❌ **Invalid URL**\n\nPlease send a valid video link',
+        'content_restricted': '⚠️ **Restricted Content**\n\nThis post is age-restricted or flagged as sensitive on the platform, and cannot be downloaded right now.',
         'adult_blocked': '🔞 **Blocked Content**\n\nThis bot does not allow downloading adult or inappropriate content.',
         'banned_screen': '🚫 **You have been banned**\n\n📌 **Reason:** attempting to download adult content.\n\nYou may return by pledging not to repeat it. Any violation after the pledge = permanent ban.',
         'banned_permanent': '🚫 **You are permanently banned**\n\n📌 **Reason:** repeated adult content downloads after pledging.\n\nThe ban is permanent — contact the admin to review your case.',
