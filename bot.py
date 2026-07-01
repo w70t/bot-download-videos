@@ -9,16 +9,12 @@ Telegram Video Downloader Bot - Standalone Version
 """
 
 import os
-import re  # استخراج الرابط النظيف من نص الرسالة
 import sys
 import glob  # للبحث عن الملفات وحذفها
 import time  # Added import os
-import json  # قراءة مخرجات ffprobe
 import html  # تأمين النصوص داخل رسائل HTML للقناة
 import uuid  # مجلد مؤقت فريد لكل عملية تحميل
 import shutil  # حذف مجلد التحميل المؤقت بالكامل
-import socket  # التحقق من عناوين IP للروابط (حماية SSRF)
-import ipaddress  # كشف العناوين الداخلية/الخاصة
 import subprocess  # توليد المصغّر وضبط تاريخ الفيديو عبر ffmpeg
 import logging
 import asyncio
@@ -26,7 +22,6 @@ import yt_dlp
 import traceback
 import contextvars  # نقل سبب فشل الاستخراج (محتوى مقيّد) للمستدعي بأمان مع التزامن
 from datetime import datetime
-from urllib.parse import urlparse, parse_qsl, urlencode
 from pyrogram import Client, filters, enums, StopPropagation
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.errors import (
@@ -45,9 +40,30 @@ from translations import t
 from queue_manager import DownloadQueueManager, DownloadTask
 import pg_backup
 
-# ... (rest of imports/logging/config remains same until download_and_upload)
-
-# ... inside download_and_upload ...
+from url_utils import (
+    PLATFORM_URL_MARKERS, is_safe_url, cache_key_for_url,
+    _platform_of, extract_first_url, _url_host,
+)
+from cookies_manager import (
+    COOKIES_PLATFORMS, get_cookie_file_for_url, validate_platform_cookies,
+)
+from link_resolvers import (
+    resolve_snapchat_spotlight, _is_music_link, resolve_music_link,
+)
+from content_filter import (
+    ADULT_DOMAINS, _custom_adult_domains, _custom_adult_keywords,
+    _add_to_setting_list, _remove_from_setting_list,
+    is_adult_url, is_adult_info, _blocked_accounts,
+    is_blocked_url, is_blocked_account,
+    adult_filter_enabled, downloads_enabled,
+)
+from video_processing import (
+    get_file_size_mb, generate_video_thumbnail, finalize_video,
+)
+from download_errors import (
+    _is_drm_error, _is_geo_restricted_error, _is_youtube_cookie_issue,
+    _is_facebook_cookie_issue, _is_cookie_file_issue, _is_restricted_content_error,
+)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -115,279 +131,6 @@ def is_admin(user_id) -> bool:
     return bool(admin_id) and str(user_id) == str(admin_id)
 
 
-def _is_private_host(host: str) -> bool:
-    """هل المضيف عنوان داخلي/خاص/loopback أو غير قابل للحل؟ (حماية SSRF)
-    يرجع True لمنع التحميل (أي العنوان غير آمن)."""
-    if not host:
-        return True
-    host = host.strip().strip('[]').lower()
-    # احجب أسماء المضيف المحلية الواضحة
-    if host in ('localhost', 'localhost.localdomain') or host.endswith('.local') \
-            or host.endswith('.internal'):
-        return True
-    # حل اسم المضيف إلى عناوين IP وافحص كل عنوان
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except Exception:
-        # تعذّر الحل → اعتبره غير آمن
-        return True
-    for info in infos:
-        addr = info[4][0]
-        try:
-            ip = ipaddress.ip_address(addr.split('%')[0])
-        except ValueError:
-            return True
-        if (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
-            return True
-    return False
-
-
-def is_safe_url(url: str) -> bool:
-    """يتحقق أن الرابط http/https ولا يشير إلى عنوان داخلي (حماية SSRF)."""
-    try:
-        parsed = urlparse(url if '://' in url else 'http://' + url)
-    except Exception:
-        return False
-    if parsed.scheme not in ('http', 'https'):
-        return False
-    if _is_private_host(parsed.hostname or ''):
-        return False
-    return True
-
-
-# معاملات تتبّع تُحذف عند توليد مفتاح الكاش (لا تغيّر الفيديو المقصود)
-_TRACKING_PARAMS = {
-    'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
-    'si', 'feature', 'fbclid', 'igshid', 'igsh', 'spm', 'ref', 'ref_src', '_nc',
-}
-
-
-def cache_key_for_url(url: str) -> str:
-    """يولّد مفتاحاً موحّداً للرابط لاستخدامه في الكاش: حذف الجزء (#) ومعاملات
-    التتبّع، وتوحيد المضيف والمسار. يبقى دقيقاً (لا يدمج فيديوهات مختلفة)."""
-    try:
-        p = urlparse(url.strip())
-        host = (p.hostname or '').lower().lstrip('.')
-        if host.startswith('www.'):
-            host = host[4:]
-        q = sorted((k, v) for k, v in parse_qsl(p.query)
-                   if k.lower() not in _TRACKING_PARAMS)
-        path = p.path.rstrip('/')
-        key = f"{host}{path}"
-        if q:
-            key += '?' + urlencode(q)
-        return key.lower()
-    except Exception:
-        return url.strip().lower()
-
-
-def _platform_of(url: str) -> str:
-    """يرجع اسم المنصة من الرابط (للإحصائيات والسجل)."""
-    low = (url or '').lower()
-    for platform, markers in PLATFORM_URL_MARKERS.items():
-        if any(m in low for m in markers):
-            return platform
-    return 'other'
-
-
-# نمط استخراج الرابط من نص الرسالة: محصور بمحارف الرابط (ASCII) فقط، فيتوقّف
-# تلقائياً عند المسافة أو الإيموجي أو الحروف العربية الملاصقة.
-_URL_IN_TEXT_RE = re.compile(r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+")
-
-
-def extract_first_url(text: str):
-    """يستخرج أول رابط http(s) من نص الرسالة ويزيل اللواصق الشائعة عند النسخ.
-
-    تختلف الأجهزة/التطبيقات في طريقة نسخ/مشاركة الروابط: أحياناً يأتي الرابط
-    وحده، وأحياناً مع نص أو إيموجي أو في سطر منفصل، أو تتبعه علامة ترقيم.
-    أخذ نص الرسالة كاملاً كرابط كان يكسر الاستخراج (Failed to extract video info).
-    هنا نلتقط الرابط فقط وننظّف علامات الترقيم/الأقواس الملاصقة في نهايته."""
-    if not text:
-        return None
-    m = _URL_IN_TEXT_RE.search(text)
-    if not m:
-        return None
-    url = m.group(0).rstrip(".,;:!?)]}>'\"`،؛؟")
-    return url or None
-
-
-def resolve_snapchat_spotlight(url: str, timeout: int = 20) -> str:
-    """يجلب صفحة سناب سبوت لايت ويستخرج رابط الفيديو الخام المباشر (أنظف نسخة
-    متاحة، غالباً بلا لوقو لأن اللوقو طبقة واجهة لا جزء من الملف) من وسم
-    og:video أو من رابط CDN داخل الصفحة، فيُحمّل مباشرة بدل مسار سناب الضعيف
-    في yt-dlp. يعمل للسبوت لايت العام فقط؛ عند أي فشل يعيد الرابط الأصلي.
-    يقبل روابط المشاركة snapchat.com/t/... (يتبع التوجيه للصفحة الحقيقية)."""
-    low = (url or '').lower()
-    if 'snapchat.com' not in low:
-        return url
-    import urllib.request
-    from http.cookiejar import MozillaCookieJar
-    try:
-        cj = MozillaCookieJar()
-        cookie_file = get_cookie_file_for_url(url)
-        if cookie_file and os.path.exists(cookie_file):
-            try:
-                cj.load(cookie_file, ignore_discard=True, ignore_expires=True)
-            except Exception:
-                pass
-        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
-        opener.addheaders = [
-            ('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                           'AppleWebKit/537.36 (KHTML, like Gecko) '
-                           'Chrome/120.0.0.0 Safari/537.36'),
-            ('Accept-Language', 'en-US,en;q=0.9'),
-        ]
-        with opener.open(url, timeout=timeout) as resp:
-            html_text = resp.read(1500000).decode('utf-8', 'ignore')
-
-        # 1) og:video — الأنسب لأن معاينات الروابط تعتمد عليه فيبقى مستقراً
-        for pat in (
-            r'property=["\']og:video(?::secure_url)?["\'][^>]*content=["\']([^"\']+\.mp4[^"\']*)["\']',
-            r'content=["\']([^"\']+\.mp4[^"\']*)["\'][^>]*property=["\']og:video',
-        ):
-            m = re.search(pat, html_text)
-            if m:
-                cand = m.group(1).replace('&amp;', '&')
-                if is_safe_url(cand):
-                    logger.info(f"🎯 سناب سبوت لايت (og:video): {cand[:90]}")
-                    return cand
-
-        # 2) أي رابط فيديو خام من CDN سناب داخل JSON المضمّن (قد تكون الشرطات
-        #    مهرّبة \/ لذا نطابق حتى علامة الاقتباس ثم نفكّ التهريب)
-        m = re.search(r'"(https:[^"]*sc-cdn\.net[^"]*\.mp4[^"]*)"', html_text)
-        if m:
-            cand = m.group(1).replace('\\/', '/').replace('&amp;', '&')
-            if is_safe_url(cand):
-                logger.info(f"🎯 سناب سبوت لايت (cdn): {cand[:90]}")
-                return cand
-    except Exception as e:
-        logger.warning(f"⚠️ تعذّر استخراج سناب سبوت لايت ({url[:60]}): {e}")
-    return url
-
-
-# ═══════════════════════════════════════════════════════════════
-# روابط الأغاني (Shazam/Apple Music/Spotify) — لا تُحمّل مباشرة
-# (Shazam يتعرّف فقط على الأغنية، وApple/Spotify مشفّرة بـ DRM). الحل:
-# استخراج اسم الأغنية والفنان ثم البحث عنها وتحميلها من يوتيوب.
-# ═══════════════════════════════════════════════════════════════
-_MUSIC_LINK_MARKERS = ('shazam.com', 'music.apple.com', 'itunes.apple.com',
-                       'open.spotify.com/track', 'spotify.link/')
-
-
-def _is_music_link(url: str) -> bool:
-    """هل الرابط من منصة أغاني نحوّلها لبحث يوتيوب؟"""
-    low = (url or '').lower()
-    return any(m in low for m in _MUSIC_LINK_MARKERS)
-
-
-def _fetch_music_meta(url: str, timeout: int = 10):
-    """يجلب (العنوان، الفنان) من صفحة Apple Music/Spotify عبر وسوم og/title."""
-    import urllib.request
-    from html import unescape
-    try:
-        req = urllib.request.Request(url, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                          'AppleWebKit/537.36 (KHTML, like Gecko) '
-                          'Chrome/120.0.0.0 Safari/537.36',
-            'Accept-Language': 'en-US,en;q=0.9',
-        })
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            page = resp.read(600000).decode('utf-8', 'ignore')
-    except Exception as e:
-        logger.warning(f"⚠️ تعذّر جلب بيانات الأغنية ({url[:60]}): {e}")
-        return None, None
-
-    def meta(prop):
-        for pat in (rf'{prop}["\'][^>]*content=["\']([^"\']+)["\']',
-                    rf'content=["\']([^"\']+)["\'][^>]*{prop}'):
-            m = re.search(pat, page, re.I)
-            if m:
-                return unescape(m.group(1)).strip()
-        return None
-
-    og_title = meta('og:title')
-    desc = meta('og:description') or ''
-    raw_title = None
-    m = re.search(r'<title[^>]*>([^<]+)</title>', page, re.I)
-    if m:
-        raw_title = unescape(m.group(1)).strip()
-
-    title = og_title or raw_title
-    artist = None
-    # نمط "العنوان by الفنان" (شائع في Apple Music) من og:title أو <title>
-    for src in (og_title, raw_title):
-        if src and not artist:
-            mm = re.search(r'^(.*?)\s+by\s+(.+?)(?:\s+on\s+Apple Music.*)?(?:\s*[|].*)?$',
-                           src, re.I)
-            if mm:
-                title = mm.group(1).strip()
-                artist = mm.group(2).strip()
-    # Spotify: og:description مثل "Elissa · Song · 2004" → الفنان أول جزء
-    if not artist and '·' in desc:
-        first = desc.split('·')[0].strip()
-        if first and first.lower() not in ('song', 'album', 'single', 'listen'):
-            artist = first
-    # نظّف اللواحق الشائعة من العنوان
-    if title:
-        title = re.sub(r'\s*[|].*$', '', title).strip()
-        title = re.sub(r'\s+on Apple Music.*$', '', title, flags=re.I).strip()
-    return (title or None), (artist or None)
-
-
-def _music_search_query(url: str):
-    """يبني نص بحث 'الفنان العنوان' من رابط أغنية، أو None عند التعذّر."""
-    import urllib.parse
-    from html import unescape
-    low = (url or '').lower()
-    title = artist = None
-
-    if 'shazam.com' in low:
-        # الاسم والفنان في نهاية رابط شزام: #{"title":"...","artist":"..."}
-        if '#' in url:
-            frag = urllib.parse.unquote(url.split('#', 1)[1])
-            mt = re.search(r'"title"\s*:\s*"([^"]+)"', frag)
-            ma = re.search(r'"artist"\s*:\s*"([^"]+)"', frag)
-            title = mt.group(1) if mt else None
-            artist = ma.group(1) if ma else None
-        # احتياطي: اسم المقطع من مسار الرابط /track/<id>/<slug>
-        if not title:
-            ms = re.search(r'/track/\d+/([^/?#]+)', url)
-            if ms:
-                title = urllib.parse.unquote(ms.group(1)).replace('-', ' ')
-    else:
-        # Apple Music / Spotify: اجلب الصفحة واقرأ الوسوم
-        title, artist = _fetch_music_meta(url)
-
-    if not title:
-        return None
-    q = f"{artist} {title}" if artist else title
-    return re.sub(r'\s+', ' ', unescape(q)).strip()
-
-
-def resolve_music_link(url: str):
-    """يحوّل رابط أغنية إلى رابط يوتيوب لأول نتيجة بحث، أو None عند الفشل.
-    (طلب شبكي متزامن — يُنفَّذ خارج حلقة الأحداث)."""
-    query = _music_search_query(url)
-    if not query:
-        return None
-    try:
-        opts = {'quiet': True, 'no_warnings': True, 'skip_download': True,
-                'extract_flat': True, 'default_search': 'ytsearch1'}
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            r = ydl.extract_info(f"ytsearch1:{query}", download=False)
-        entries = (r or {}).get('entries') or []
-        if not entries:
-            return None
-        vid = entries[0].get('id')
-        if vid:
-            return f"https://www.youtube.com/watch?v={vid}"
-        return entries[0].get('url') or entries[0].get('webpage_url')
-    except Exception as ex:
-        logger.warning(f"⚠️ فشل بحث يوتيوب للأغنية '{query}': {ex}")
-        return None
-
-
 # Initialize Queue Manager
 queue_manager = DownloadQueueManager(cooldown_seconds=10)
 
@@ -418,116 +161,6 @@ conversation_state = {}
 #                 'stats_chat', 'stats_msg_id', 'last_edit'}}
 broadcast_polls = {}
 broadcast_counter = 0
-
-# منصات الـ cookies المدعومة
-COOKIES_PLATFORMS = {
-    'facebook': {'name': 'Facebook 📘', 'file': 'cookies/facebook.txt'},
-    'instagram': {'name': 'Instagram �', 'file': 'cookies/instagram.txt'},
-    'youtube': {'name': 'YouTube 📺', 'file': 'cookies/youtube.txt'},
-    'twitter': {'name': 'Twitter/X 🐦', 'file': 'cookies/twitter.txt'},
-    'reddit': {'name': 'Reddit �', 'file': 'cookies/reddit.txt'},
-    'snapchat': {'name': 'Snapchat 👻', 'file': 'cookies/snapchat.txt'},
-    'pinterest': {'name': 'Pinterest 📌', 'file': 'cookies/pinterest.txt'},
-    'tiktok': {'name': 'TikTok 🎵', 'file': 'cookies/tiktok.txt'},
-    'other': {'name': 'أخرى 🌐', 'file': 'cookies/other.txt'},
-}
-
-# ربط أجزاء الرابط بالمنصة المناسبة لاختيار ملف الـ cookies الصحيح
-PLATFORM_URL_MARKERS = {
-    'youtube': ['youtube.', 'youtu.be'],
-    'facebook': ['facebook.', 'fb.watch', 'fb.com'],
-    'instagram': ['instagram.', 'instagr.am'],
-    'threads': ['threads.net', 'threads.com'],
-    # ملاحظة: 't.co/' بشرطة لتفادي مطابقة "snapcha[t.co]m" الخاطئة، و'//x.com'
-    # لتفادي مطابقة نطاقات تنتهي بـ x.com (مثل netflix.com).
-    'twitter': ['twitter.', '//x.com', 't.co/'],
-    'reddit': ['reddit.', 'redd.it'],
-    'snapchat': ['snapchat.'],
-    'pinterest': ['pinterest.', 'pin.it'],
-    'tiktok': ['tiktok.'],
-}
-
-# منصات تشارك ملف cookies منصة أخرى (Threads يستخدم تسجيل دخول Instagram)
-COOKIE_SOURCE_MAP = {
-    'threads': 'instagram',
-}
-
-# ═══════════════════════════════════════════════════════════════
-# فلتر المحتوى الإباحي (حظر قبل التحميل) - Adult content filter
-# الطريقة: قائمة نطاقات معروفة + كلمات مفتاحية في الرابط والعنوان.
-# يوقف المحتوى قبل أي تحميل (بلا تكلفة) ويمكن للأدمن تشغيله/إيقافه.
-# ═══════════════════════════════════════════════════════════════
-ADULT_DOMAINS = {
-    'pornhub.com', 'xvideos.com', 'xvideos2.com', 'xnxx.com', 'xhamster.com',
-    'xhamster.desi', 'redtube.com', 'youporn.com', 'tube8.com', 'spankbang.com',
-    'youjizz.com', 'beeg.com', 'tnaflix.com', 'drtuber.com', 'sunporno.com',
-    'eporner.com', 'txxx.com', 'hclips.com', 'upornia.com', 'hotmovs.com',
-    'vjav.com', 'porntrex.com', 'motherless.com', 'porn.com', 'pornhd.com',
-    'porntube.com', 'pornone.com', 'porngo.com', 'porntrex.com', 'fapality.com',
-    'brazzers.com', 'realitykings.com', 'bangbros.com', 'naughtyamerica.com',
-    'onlyfans.com', 'fansly.com', 'manyvids.com', 'clips4sale.com',
-    'chaturbate.com', 'cam4.com', 'myfreecams.com', 'stripchat.com',
-    'bongacams.com', 'livejasmin.com', 'camsoda.com', 'streamate.com',
-    'redgifs.com', 'gifs.com', 'rule34video.com', 'rule34.xxx',
-    'hanime.tv', 'hentaihaven.xxx', 'nhentai.net', 'hentai.tv', 'fakings.com',
-    'xmoviesforyou.com', 'fux.com', 'keezmovies.com', 'extremetube.com',
-    'gotporn.com', 'pornhat.com', 'analdin.com', 'hdzog.com', 'thothub.tv',
-}
-
-# كلمات مفتاحية صريحة (عربي + إنجليزي). تُفحص في النطاق ومسار الرابط والعنوان.
-ADULT_KEYWORDS = [
-    'porn', 'xxx', 'xnxx', 'sexvideo', 'sex-video', 'nsfw', 'hentai',
-    'camgirl', 'camslut', 'fuck', 'blowjob', 'creampie', 'cumshot',
-    'milf', 'hardcore', 'bigtits', 'pussy', 'anal', 'escort',
-    'سكس', 'اباحي', 'إباحي', 'اباحية', 'إباحية', 'نيك', 'خلاعة', 'عاهرة',
-    'شرموطة', 'متناكة', 'سحاق', 'لواط',
-]
-
-
-def _url_host(url):
-    """يستخرج اسم المضيف (host) من الرابط بصيغة صغيرة."""
-    try:
-        host = urlparse(url if '://' in url else 'http://' + url).hostname or ''
-    except Exception:
-        host = ''
-    return host.lower().lstrip('.')
-
-
-def _custom_adult_domains():
-    """نطاقات إضافية حظرها الأدمن من لوحة التحكم (مفصولة بفاصلة)."""
-    raw = subdb.get_setting('adult_custom_domains', '') or ''
-    return [d.strip().lower().lstrip('.') for d in raw.split(',') if d.strip()]
-
-
-def _custom_adult_keywords():
-    """كلمات إضافية حظرها الأدمن من لوحة التحكم (مفصولة بفاصلة)."""
-    raw = subdb.get_setting('adult_custom_keywords', '') or ''
-    return [k.strip().lower() for k in raw.split(',') if k.strip()]
-
-
-def _add_to_setting_list(key, value):
-    """يضيف قيمة لقائمة إعداد مفصولة بفواصل (يتجاهل التكرار). يرجع True إن أُضيفت."""
-    value = value.strip().lower().lstrip('.')
-    if not value:
-        return False
-    raw = subdb.get_setting(key, '') or ''
-    items = [x.strip().lower() for x in raw.split(',') if x.strip()]
-    if value in items:
-        return False
-    items.append(value)
-    subdb.set_setting(key, ','.join(items))
-    return True
-
-
-def _remove_from_setting_list(key, index):
-    """يحذف عنصراً واحداً من قائمة إعداد حسب فهرسه. يرجع القيمة المحذوفة أو None."""
-    raw = subdb.get_setting(key, '') or ''
-    items = [x.strip() for x in raw.split(',') if x.strip()]
-    if 0 <= index < len(items):
-        removed = items.pop(index)
-        subdb.set_setting(key, ','.join(items))
-        return removed
-    return None
 
 
 def _blocked_list_view():
@@ -572,224 +205,6 @@ def _banned_list_view():
         text += f"\n… و{len(rows_data) - 30} آخرين."
     kb.append([InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")])
     return text, InlineKeyboardMarkup(kb)
-
-
-def _host_is_adult(host):
-    """هل المضيف ينتمي لنطاق إباحي معروف (يشمل النطاقات الفرعية)؟"""
-    if not host:
-        return False
-    if host.startswith('www.'):
-        host = host[4:]
-    for domain in set(ADULT_DOMAINS) | set(_custom_adult_domains()):
-        if host == domain or host.endswith('.' + domain):
-            return True
-    return False
-
-
-def _text_has_adult_keyword(text):
-    """هل النص يحتوي على كلمة مفتاحية إباحية صريحة؟"""
-    if not text:
-        return False
-    low = str(text).lower()
-    return any(kw in low for kw in (ADULT_KEYWORDS + _custom_adult_keywords()))
-
-
-def is_adult_url(url):
-    """فحص الرابط قبل الاستخراج: النطاق أولاً، ثم كلمات في مسار الرابط."""
-    host = _url_host(url)
-    if _host_is_adult(host):
-        return True
-    return _text_has_adult_keyword(url)
-
-
-def is_adult_info(info):
-    """فحص بيانات الفيديو بعد الاستخراج (الحساسية/العنوان/الوصف/الناشر)."""
-    if not info:
-        return False
-    try:
-        if int(info.get('age_limit') or 0) >= 18:
-            return True
-    except (TypeError, ValueError):
-        pass
-    # علم الحساسية في X/تويتر ومنصات أخرى
-    if info.get('possibly_sensitive') or info.get('is_nsfw') or info.get('nsfw'):
-        return True
-    parts = [info.get('title'), info.get('description'), info.get('uploader'),
-             info.get('uploader_id'), info.get('channel'), info.get('uploader_url')]
-    parts.extend(info.get('categories') or [])
-    parts.extend(info.get('tags') or [])
-    return any(_text_has_adult_keyword(p) for p in parts)
-
-
-def _blocked_accounts():
-    """مجموعة الحسابات المحظورة (يديرها الأدمن، مفصولة بفواصل)."""
-    raw = subdb.get_setting('blocked_accounts', '') or ''
-    return {x.strip().lower().lstrip('@') for x in raw.split(',') if x.strip()}
-
-
-def _handle_from_url(url):
-    """يستخرج اسم الحساب من رابط X/تويتر (x.com/<handle>/status/...)."""
-    try:
-        p = urlparse(url if '://' in url else 'http://' + url)
-        host = (p.hostname or '').lower()
-        if not any(h in host for h in ('x.com', 'twitter.com')):
-            return None
-        parts = [x for x in p.path.split('/') if x]
-        if parts and parts[0].lower() not in ('i', 'status', 'home', 'search'):
-            return parts[0].lstrip('@').lower()
-    except Exception:
-        pass
-    return None
-
-
-def is_blocked_url(url):
-    """حظر مبكر (قبل الاستخراج) حسب اسم الحساب في رابط X/تويتر."""
-    h = _handle_from_url(url)
-    return bool(h and h in _blocked_accounts())
-
-
-def _account_identifiers(info):
-    """يجمع معرّفات الناشر الممكنة من معلومات الفيديو (للمطابقة مع قائمة الحظر)."""
-    ids = set()
-    if not info:
-        return ids
-    for key in ('uploader_id', 'uploader', 'channel_id', 'channel', 'creator',
-                'uploader_url', 'channel_url', 'webpage_url'):
-        v = info.get(key)
-        if not v:
-            continue
-        s = str(v).strip().lower().lstrip('@')
-        if s:
-            ids.add(s)
-            if '/' in s:  # استخرج اسم الحساب من نهاية الرابط
-                tail = s.rstrip('/').split('/')[-1]
-                if tail:
-                    ids.add(tail.lstrip('@'))
-    return ids
-
-
-def is_blocked_account(info):
-    """هل ناشر هذا المحتوى ضمن قائمة الحسابات المحظورة؟"""
-    blocked = _blocked_accounts()
-    if not blocked:
-        return False
-    return bool(_account_identifiers(info) & blocked)
-
-
-def adult_filter_enabled():
-    """هل فلتر المحتوى الإباحي مُفعّل؟ (افتراضياً مُفعّل)."""
-    return subdb.get_setting('block_adult_content', '1') == '1'
-
-
-def downloads_enabled():
-    """هل التحميل مُفعّل للأعضاء؟ (افتراضياً مُفعّل). الأدمن لا يتأثر."""
-    return subdb.get_setting('downloads_enabled', '1') == '1'
-
-
-def generate_video_thumbnail(video_path, duration=None):
-    """يولّد صورة مصغّرة (JPEG) للفيديو حتى تظهر معاينة ثابتة في تلجرام
-    بدل الإطار الأسود/المتجمّد. يرجع مسار المصغّر أو None عند الفشل."""
-    try:
-        thumb_path = os.path.splitext(video_path)[0] + '.thumb.jpg'
-        # نأخذ لقطة بعد ثانية واحدة (أو 10% من المدة للفيديوهات الأطول)
-        ss = 1.0
-        if duration and duration > 4:
-            ss = min(3.0, duration / 10.0)
-        cmd = [
-            'ffmpeg', '-y', '-ss', str(ss), '-i', video_path,
-            '-frames:v', '1', '-vf', 'scale=320:-2',
-            '-q:v', '4', thumb_path,
-        ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
-        if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
-            return thumb_path
-    except Exception as e:
-        logger.warning(f"⚠️ تعذّر توليد المصغّر: {e}")
-    return None
-
-
-def probe_video(video_path):
-    """يفحص الفيديو بـ ffprobe ويرجع (vcodec, acodec, width, height, duration).
-    القيم غير المتوفرة تكون None."""
-    try:
-        out = subprocess.run(
-            ['ffprobe', '-v', 'error',
-             '-show_entries', 'stream=codec_type,codec_name,width,height:format=duration',
-             '-of', 'json', video_path],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60
-        ).stdout.decode('utf-8', 'ignore')
-        data = json.loads(out or '{}')
-        vcodec = acodec = width = height = None
-        for s in data.get('streams', []):
-            if s.get('codec_type') == 'video' and vcodec is None:
-                vcodec = (s.get('codec_name') or '').lower()
-                width = s.get('width')
-                height = s.get('height')
-            elif s.get('codec_type') == 'audio' and acodec is None:
-                acodec = (s.get('codec_name') or '').lower()
-        duration = None
-        try:
-            duration = int(float(data.get('format', {}).get('duration')))
-        except (TypeError, ValueError):
-            pass
-        return vcodec, acodec, width, height, duration
-    except Exception as e:
-        logger.warning(f"⚠️ تعذّر فحص الفيديو بـ ffprobe: {e}")
-        return None, None, None, None, None
-
-
-def finalize_video(video_path):
-    """يجهّز الفيديو لتلجرام لكل المنصات (وليس يوتيوب فقط) ويرجع
-    (width, height, duration) الحقيقية من الملف:
-    - يضمن ترميز H.264/AAC: ينسخ إن كان متوافقاً، وإلا يُعيد الترميز (سبب
-      تجمّد الصورة في فيسبوك/منصات أخرى تستخدم VP9/AV1).
-    - +faststart: نقل moov atom للبداية ليُعاين ويُشغّل فوراً.
-    - creation_time = الآن ليظهر المقطع بترتيب وقت التحميل في المعرض.
-    """
-    vcodec, acodec, width, height, duration = probe_video(video_path)
-
-    # هل الترميز متوافق مع مشغّل تلجرام؟ (None = غير معروف، نكتفي بالنسخ)
-    v_compatible = vcodec in ('h264', 'avc1', None)
-    a_compatible = acodec in ('aac', 'mp4a', None)
-    v_args = ['-c:v', 'copy'] if v_compatible else \
-        ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p']
-    a_args = ['-c:a', 'copy'] if a_compatible else ['-c:a', 'aac', '-b:a', '128k']
-    if not v_compatible:
-        logger.info(f"🎞️ إعادة ترميز الفيديو إلى H.264 (المصدر: {vcodec})")
-
-    tmp = os.path.splitext(video_path)[0] + '.fixed.mp4'
-    try:
-        now_iso = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
-        cmd = (
-            ['ffmpeg', '-y', '-i', video_path, '-map', '0:v?', '-map', '0:a?']
-            + v_args + a_args
-            + ['-movflags', '+faststart', '-metadata', f'creation_time={now_iso}', tmp]
-        )
-        # إعادة الترميز قد تستغرق وقتاً أطول من النسخ
-        timeout = 3600 if not v_compatible else 900
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout)
-        if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
-            os.replace(tmp, video_path)
-            # أعد الفحص بعد التحويل للحصول على الأبعاد الصحيحة
-            nv, na, nw, nh, nd = probe_video(video_path)
-            width = nw or width
-            height = nh or height
-            duration = nd or duration
-    except Exception as e:
-        logger.warning(f"⚠️ تعذّر تجهيز الفيديو لتلجرام: {e}")
-    finally:
-        if os.path.exists(tmp):
-            try:
-                os.remove(tmp)
-            except Exception:
-                pass
-    # تحديث تاريخ الملف نفسه إلى الآن (مهم لمعرض أندرويد)
-    try:
-        os.utime(video_path, None)
-    except Exception:
-        pass
-
-    return width, height, duration
 
 
 def _binance_support_keyboard(binance_id, lang):
@@ -946,139 +361,6 @@ async def add_forced_channel_from_admin(client, message, user_id):
         await message.reply_text("ℹ️ هذه القناة/القروب مُضافة مسبقاً.")
 
 
-def _is_valid_cookie_file(platform_key):
-    """يتحقق أن ملف الـ cookies الخاص بالمنصة موجود وليس فارغاً"""
-    data = COOKIES_PLATFORMS.get(platform_key)
-    if not data:
-        return None
-    path = data['file']
-    if os.path.exists(path) and os.path.getsize(path) > 100:
-        return path
-    return None
-
-
-def get_cookie_file_for_url(url):
-    """يختار ملف الـ cookies المطابق لمنصة الرابط.
-
-    الستوري في فيسبوك وإنستغرام يتطلب تسجيل دخول، لذا يجب استخدام cookies
-    نفس المنصة تحديداً وليس أي ملف cookies متوفر. عند عدم توفر ملف المنصة
-    نرجع إلى ملف 'other' إن كان صالحاً.
-    """
-    url_lower = (url or '').lower()
-    for platform_key, markers in PLATFORM_URL_MARKERS.items():
-        if any(marker in url_lower for marker in markers):
-            # بعض المنصات (مثل Threads) تستخدم cookies منصة أخرى (Instagram)
-            cookie_platform = COOKIE_SOURCE_MAP.get(platform_key, platform_key)
-            cookie = _is_valid_cookie_file(cookie_platform)
-            if cookie:
-                logger.info(f"🍪 استخدام cookies المنصة المطابقة: {platform_key} (cookies: {cookie_platform})")
-                return cookie
-            logger.warning(f"⚠️ لا يوجد ملف cookies صالح للمنصة {cookie_platform}؛ قد يفشل تحميل محتوى {platform_key} الخاص")
-            break
-    # احتياطي: ملف cookies عام
-    return _is_valid_cookie_file('other')
-
-
-# نطاقات كل منصة وأسماء كوكيز تسجيل الدخول الأساسية للتحقق الحقيقي
-PLATFORM_COOKIE_INFO = {
-    'facebook':  {'domains': ['facebook.com'],                'auth_cookies': ['c_user', 'xs']},
-    'instagram': {'domains': ['instagram.com'],               'auth_cookies': ['sessionid', 'ds_user_id']},
-    'youtube':   {'domains': ['youtube.com', 'google.com'],   'auth_cookies': ['SID', 'SAPISID']},
-    'twitter':   {'domains': ['twitter.com', 'x.com'],        'auth_cookies': ['auth_token', 'ct0']},
-    'reddit':    {'domains': ['reddit.com'],                  'auth_cookies': ['reddit_session']},
-    'snapchat':  {'domains': ['snapchat.com'],                'auth_cookies': []},
-    'pinterest': {'domains': ['pinterest.com'],               'auth_cookies': ['_pinterest_sess']},
-    'tiktok':    {'domains': ['tiktok.com'],                  'auth_cookies': ['sessionid']},
-    'other':     {'domains': [],                              'auth_cookies': []},
-}
-
-
-def _parse_netscape_cookies(path):
-    """يقرأ ملف cookies بصيغة Netscape ويعيد قائمة بالكوكيز (domain/name/expiry)."""
-    cookies = []
-    try:
-        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-            for raw in f:
-                line = raw.strip()
-                if not line:
-                    continue
-                # أسطر #HttpOnly_ هي كوكيز حقيقية وليست تعليقات
-                if line.startswith('#HttpOnly_'):
-                    line = line[len('#HttpOnly_'):]
-                elif line.startswith('#'):
-                    continue
-                parts = line.split('\t')
-                if len(parts) != 7:
-                    continue
-                domain, _flag, _cpath, _secure, expiry, name, _value = parts
-                cookies.append({'domain': domain, 'expiry': expiry, 'name': name})
-    except Exception as e:
-        logger.error(f"خطأ في قراءة ملف الكوكيز {path}: {e}")
-    return cookies
-
-
-def validate_platform_cookies(platform_id):
-    """تحقق حقيقي من صلاحية كوكيز منصة معينة.
-
-    يفحص: وجود الملف، صيغته، أن الكوكيز تخص نطاق المنصة فعلاً،
-    وجود كوكيز تسجيل الدخول الأساسية، وأنها غير منتهية الصلاحية.
-    يعيد dict فيه ok وسبب وتفاصيل.
-    """
-    data = COOKIES_PLATFORMS.get(platform_id)
-    if not data:
-        return {'ok': False, 'reason': 'unknown_platform'}
-
-    path = data['file']
-    if not os.path.exists(path) or os.path.getsize(path) <= 100:
-        return {'ok': False, 'reason': 'empty'}
-
-    cookies = _parse_netscape_cookies(path)
-    if not cookies:
-        return {'ok': False, 'reason': 'unparseable'}
-
-    info = PLATFORM_COOKIE_INFO.get(platform_id, {})
-    domains = info.get('domains', [])
-    auth_names = info.get('auth_cookies', [])
-
-    # كوكيز تخص نطاق المنصة فقط
-    if domains:
-        platform_cookies = [c for c in cookies if any(d in c['domain'] for d in domains)]
-    else:
-        platform_cookies = cookies
-
-    if domains and not platform_cookies:
-        found = sorted({c['domain'].lstrip('.') for c in cookies})[:5]
-        return {'ok': False, 'reason': 'wrong_platform', 'found_domains': found}
-
-    names = {c['name'] for c in platform_cookies}
-
-    # كوكيز تسجيل الدخول الأساسية
-    missing_auth = [a for a in auth_names if a not in names]
-    if auth_names and missing_auth:
-        return {'ok': False, 'reason': 'not_logged_in', 'missing': missing_auth,
-                'cookie_count': len(platform_cookies)}
-
-    # فحص انتهاء الصلاحية لكوكيز تسجيل الدخول (أو كلها إن لم تكن هناك كوكيز محددة)
-    now = time.time()
-    check_list = ([c for c in platform_cookies if c['name'] in auth_names]
-                  if auth_names else platform_cookies)
-    expired = []
-    for c in check_list:
-        try:
-            exp = float(c['expiry'])
-        except (ValueError, TypeError):
-            continue
-        if exp != 0 and exp < now:
-            expired.append(c['name'])
-
-    if expired and (not auth_names or len(expired) == len(check_list)):
-        return {'ok': False, 'reason': 'expired', 'expired': expired,
-                'cookie_count': len(platform_cookies)}
-
-    return {'ok': True, 'cookie_count': len(platform_cookies),
-            'has_auth': bool(auth_names) and not missing_auth,
-            'expired': expired}
-
 # نظام تتبع الأخطاء
 user_errors = {}  # {error_id: {'user_id': ..., 'error': ..., 'url': ..., 'time': ..., 'status': 'pending'}}
 error_counter = 0
@@ -1229,11 +511,6 @@ cookies_expiry = {}  # {platform: {'uploaded': timestamp, 'expires': timestamp, 
 # Helper Functions
 # ═══════════════════════════════════════════════════════════════
 
-def get_file_size_mb(file_path):
-    """الحصول على حجم الملف بالميغابايت"""
-    return os.path.getsize(file_path) / (1024 * 1024)
-
-
 
 # عملاء يوتيوب: android_vr لا يتطلب PO token؛ نتجنّب 'tv' لأنه يبلّغ DRM زوراً بدون كوكيز
 # و'web_embedded' يسبب خطأ إعداد. formats=missing_pot يسمح باستخدام الصيغ المحجوبة بلا توكن.
@@ -1253,83 +530,9 @@ def _youtube_extractor_args():
     return {'youtube': {'player_client': list(YT_PLAYER_CLIENTS), 'formats': ['missing_pot']}}
 
 
-def _is_drm_error(err):
-    """هل الفيديو محمي بـ DRM (لا يمكن تحميله إطلاقاً)؟"""
-    return 'drm' in str(err).lower()
-
-
-def _is_geo_restricted_error(err, url=''):
-    """هل الفشل بسبب حظر جغرافي/حقوق بث للمحتوى (لا يمكن تحميله من منطقة الخادم)؟"""
-    msg = str(err).lower()
-    # عبارات yt-dlp الصريحة عن الحظر الجغرافي
-    geo_signs = [
-        'geo restrict', 'geo-restrict', 'geo restricted', 'geo blocked',
-        'not available from your location', 'not available in your country',
-        'not available in your region', 'blocked it in your country',
-        'blocked in your country',
-    ]
-    if any(s in msg for s in geo_signs):
-        return True
-    # X/تويتر: فشل تنزيل بيانات الفيديو بـ403 = غالباً حظر جغرافي/حقوق بث للمقطع
-    is_twitter = any(m in url.lower() for m in PLATFORM_URL_MARKERS['twitter'])
-    if is_twitter and '403' in msg and (
-        'download video data' in msg or 'm3u8' in msg or 'forbidden' in msg
-    ):
-        return True
-    return False
-
-
-def _is_youtube_cookie_issue(err):
-    """هل خطأ يوتيوب ناتج عن حجب الصيغ بسبب الكوكيز/الحماية؟"""
-    msg = str(err).lower()
-    signs = [
-        'requested format is not available',
-        'player response',
-        'sign in to confirm',
-        'this content isn',
-        'po token',
-        'no video formats',
-    ]
-    return any(s in msg for s in signs)
-
-
-def _is_facebook_cookie_issue(err):
-    """هل خطأ فيسبوك ناتج عن كوكيز فاسدة/منتهية تكسر استخراج المحتوى العام؟
-
-    فيسبوك بكوكيز منتهية يقدّم صفحة تسجيل دخول/تحقّق لا يستطيع yt-dlp قراءتها
-    فيظهر 'Cannot parse data'. المحتوى العام (الريلز) يُستخرج بدون كوكيز، لذا
-    نعيد المحاولة بدونها.
-    """
-    msg = str(err).lower()
-    return 'cannot parse data' in msg
-
-
-def _is_cookie_file_issue(err):
-    """هل الخطأ بسبب ملف كوكيز تالف/غير صالح (ليس بصيغة Netscape)؟
-
-    ملف كوكيز معطوب يجعل yt-dlp يفشل قبل بدء الاستخراج لأي منصة، فنتجاوزه
-    ونعيد المحاولة بدون كوكيز (يكفي للمحتوى العام).
-    """
-    msg = str(err).lower()
-    return 'netscape' in msg and 'cookies' in msg
-
-
 # سبب فشل آخر استخراج ضمن نفس المهمة (task) — يُقرأ فور رجوع get_video_info.
 # ContextVar معزول لكل مهمة async، فلا يتداخل بين المستخدمين المتزامنين.
 _last_info_error = contextvars.ContextVar('_last_info_error', default=None)
-
-
-def _is_restricted_content_error(err_msg: str) -> bool:
-    """يكتشف رسائل إنستغرام/غيره للمحتوى المقيّد بالعمر أو الحسّاس."""
-    m = (err_msg or '').lower()
-    return any(s in m for s in (
-        'may be inappropriate',
-        'certain audiences',
-        'sensitive content',
-        'age-restricted',
-        'age restricted',
-        'restricted video',
-    ))
 
 
 async def get_video_info(url: str):
