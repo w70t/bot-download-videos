@@ -7,7 +7,7 @@ Translation System - Arabic & English Support
 TRANSLATIONS = {
     'ar': {
         # الرسائل الأساسية - Basic Messages
-        'welcome': '╭─────────────────╮\n   ✦ 𝗩𝗜𝗗𝗘𝗢 𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗𝗘𝗥 ✦\n╰─────────────────╯\n\n🌟 أهـلاً وسهـلاً **{name}** 🌟\nنوّرت **بوت التحميل الأقوى** 🏆\n\n🌐 **المنصّات المدعومة:**\n▸ YouTube ▸ TikTok ▸ Instagram\n▸ Facebook ▸ Snapchat ▸ X\n▸ Pinterest ▸ Reddit ▸ Threads\n\n💎 **المزايا:**\n🎬 جودة عالية حتى Full HD\n🚀 رفع حتى 2GB\n⏱️ فيديوهات حتى 4 ساعات\n🎵 تحميل الصوت MP3\n⚡ إرسال فوري للمقاطع المكرّرة\n\n━━━━━━━━━━━━━━━\n📥 أرسل **رابط أي فيديو**… وخلّ الباقي علينا! ✨',
+        'welcome': '╭─────────────────╮\n   ✦ 𝗩𝗜𝗗𝗘𝗢 𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗𝗘𝗥 ✦\n╰─────────────────╯\n\n🌟 أهـلاً وسهـلاً **{name}** 🌟\nنوّرت **بوت التحميل الأقوى** 🏆\n\n🌐 **المنصّات المدعومة:**\n▸ YouTube ▸ TikTok ▸ Instagram\n▸ Facebook ▸ Snapchat ▸ X\n▸ Pinterest ▸ Reddit ▸ Threads\n\n💎 **المزايا:**\n🎬 جودة عالية حتى Full HD\n🚀 رفع حتى 2GB\n⏱️ فيديوهات حتى 4 ساعات\n🎵 تحميل الصوت MP3\n⚡ إرسال فوري للمقاطع المكرّرة\n\n⚠️ **تنبيه هام:**\n🔞 هذا البوت لتحميل الفيديوهات من مواقع التواصل الاجتماعي فقط.\nتحميل المحتوى الإباحي أو المخل **ممنوع منعاً باتاً**، والمخالف **يُحظر فوراً**.\n\n━━━━━━━━━━━━━━━\n📥 أرسل **رابط أي فيديو**… وخلّ الباقي علينا! ✨',
         'choose_language': '🌍 **اختر لغتك**\nChoose Your Language',
         'language_set': '✅ تم تحديد اللغة: العربية 🇮🇶',
         'language_changed': '✅ تم تغيير اللغة إلى العربية 🇮🇶',
@@ -170,7 +170,7 @@ TRANSLATIONS = {
     
     'en': {
         # Basic Messages
-        'welcome': '╭─────────────────╮\n   ✦ 𝗩𝗜𝗗𝗘𝗢 𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗𝗘𝗥 ✦\n╰─────────────────╯\n\n🌟 Welcome **{name}** 🌟\nto the **Ultimate Downloader** 🏆\n\n🌐 **Supported platforms:**\n▸ YouTube ▸ TikTok ▸ Instagram\n▸ Facebook ▸ Snapchat ▸ X\n▸ Pinterest ▸ Reddit ▸ Threads\n\n💎 **Features:**\n🎬 Up to Full HD quality\n🚀 Upload up to 2GB\n⏱️ Videos up to 4 hours\n🎵 MP3 audio download\n⚡ Instant resend for cached clips\n\n━━━━━━━━━━━━━━━\n📥 Just send **any video link**… we\'ll handle the rest! ✨',
+        'welcome': '╭─────────────────╮\n   ✦ 𝗩𝗜𝗗𝗘𝗢 𝗗𝗢𝗪𝗡𝗟𝗢𝗔𝗗𝗘𝗥 ✦\n╰─────────────────╯\n\n🌟 Welcome **{name}** 🌟\nto the **Ultimate Downloader** 🏆\n\n🌐 **Supported platforms:**\n▸ YouTube ▸ TikTok ▸ Instagram\n▸ Facebook ▸ Snapchat ▸ X\n▸ Pinterest ▸ Reddit ▸ Threads\n\n💎 **Features:**\n🎬 Up to Full HD quality\n🚀 Upload up to 2GB\n⏱️ Videos up to 4 hours\n🎵 MP3 audio download\n⚡ Instant resend for cached clips\n\n⚠️ **Important notice:**\n🔞 This bot is for downloading videos from social media only.\nDownloading adult or explicit content is **strictly forbidden**, and violators are **banned immediately**.\n\n━━━━━━━━━━━━━━━\n📥 Just send **any video link**… we\'ll handle the rest! ✨',
         'choose_language': '🌍 **اختر لغتك**\nChoose Your Language',
         'language_set': '✅ Language set to: English 🇺🇸',
         'language_changed': '✅ Language changed to English 🇺🇸',
