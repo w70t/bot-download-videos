@@ -24,6 +24,7 @@ import logging
 import asyncio
 import yt_dlp
 import traceback
+import contextvars  # نقل سبب فشل الاستخراج (محتوى مقيّد) للمستدعي بأمان مع التزامن
 from datetime import datetime
 from urllib.parse import urlparse, parse_qsl, urlencode
 from pyrogram import Client, filters, enums, StopPropagation
@@ -1168,8 +1169,27 @@ def _is_cookie_file_issue(err):
     return 'netscape' in msg and 'cookies' in msg
 
 
+# سبب فشل آخر استخراج ضمن نفس المهمة (task) — يُقرأ فور رجوع get_video_info.
+# ContextVar معزول لكل مهمة async، فلا يتداخل بين المستخدمين المتزامنين.
+_last_info_error = contextvars.ContextVar('_last_info_error', default=None)
+
+
+def _is_restricted_content_error(err_msg: str) -> bool:
+    """يكتشف رسائل إنستغرام/غيره للمحتوى المقيّد بالعمر أو الحسّاس."""
+    m = (err_msg or '').lower()
+    return any(s in m for s in (
+        'may be inappropriate',
+        'certain audiences',
+        'sensitive content',
+        'age-restricted',
+        'age restricted',
+        'restricted video',
+    ))
+
+
 async def get_video_info(url: str):
     """استخراج معلومات الفيديو"""
+    _last_info_error.set(None)
     try:
         # حماية SSRF: ارفض الروابط غير http/https أو التي تشير لعنوان داخلي
         if not is_safe_url(url):
@@ -1234,6 +1254,11 @@ async def get_video_info(url: str):
             raise
     except Exception as e:
         error_msg = str(e)
+        # محتوى مقيّد بالعمر/حسّاس على المنصة → سجّل السبب ليعرضه المستدعي بوضوح
+        if _is_restricted_content_error(error_msg):
+            _last_info_error.set('restricted')
+            logger.warning(f"🔞 محتوى مقيّد/حسّاس يتعذّر استخراجه: {error_msg[:200]}")
+            return None
         # معالجة خاصة لأخطاء Facebook parsing
         if 'Cannot parse data' in error_msg or 'facebook' in error_msg.lower():
             logger.error(f"خطأ Facebook parse: {error_msg[:200]}")
@@ -1699,6 +1724,11 @@ async def process_download_from_queue(task: DownloadTask):
                     message.from_user.username, lang
                 ):
                     return
+            # محتوى مقيّد بالعمر/حسّاس → رسالة واضحة بدل "رابط غير صحيح" المضلّلة
+            if _last_info_error.get() == 'restricted':
+                await send_error_to_admin(user_id, user_name, "Restricted/sensitive content", url)
+                await status.edit_text(t('content_restricted', lang))
+                return
             await send_error_to_admin(user_id, user_name, "Failed to extract video info", url)
             await status.edit_text(t('invalid_url', lang))
             return
@@ -4335,6 +4365,11 @@ async def handle_url(client, message):
                 ):
                     pending_downloads.pop(user_id, None)
                     return
+            # محتوى مقيّد بالعمر/حسّاس → رسالة واضحة بدل "رابط غير صحيح" المضلّلة
+            if _last_info_error.get() == 'restricted':
+                await send_error_to_admin(user_id, user_name, "Restricted/sensitive content", url)
+                await status.edit_text(t('content_restricted', lang))
+                return
             await send_error_to_admin(user_id, user_name, "Failed to extract video info", url)
             await status.edit_text(t('invalid_url', lang))
             return
