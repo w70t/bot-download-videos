@@ -278,6 +278,9 @@ pending_playlists = {}
 # عدد التحميلات الافتراضي عند الدعوة، وأقصى عدد مقاطع لقائمة التشغيل
 # كل دعوة ناجحة تزيد الحد اليومي للداعي بهذا المقدار (دائماً)
 REFERRAL_BONUS = int(os.getenv("REFERRAL_BONUS", "1"))
+# كل دعوة ناجحة تزيد أيضاً حدّ مدة الفيديو المسموحة للداعي بهذا العدد من الدقائق (دائماً)
+# مثال: الأساس 10 دقائق + دعوة واحدة = 15 دقيقة، دعوتان = 20 دقيقة... وهكذا
+REFERRAL_MINUTES = int(os.getenv("REFERRAL_MINUTES", "5"))
 PLAYLIST_MAX = int(os.getenv("PLAYLIST_MAX", "5"))
 
 # أقصى عدد صور تُحمَّل من منشور إنستغرام/تيك توك (كاروسيل/سلايدشو)
@@ -1807,7 +1810,8 @@ async def process_download_from_queue(task: DownloadTask):
             await status.edit_text(t('no_media_found', lang))
             return
 
-        max_duration_minutes = subdb.get_max_duration()
+        # الحد الأقصى للمدة = الأساس + مكافأة دعوات المستخدم (كل دعوة +REFERRAL_MINUTES دقيقة)
+        max_duration_minutes = _user_max_duration_minutes(user_id)
         max_duration_seconds = max_duration_minutes * 60
 
         # If not subscribed and exceeds max duration
@@ -2813,12 +2817,18 @@ async def _process_referral_start(client, message, new_user_id):
     # الحد اليومي الجديد للداعي = الأساس + مجموع دعواته
     base = subdb.get_daily_limit()
     new_limit = (base + subdb.get_bonus_downloads(referrer_id)) if base != -1 else '∞'
-    logger.info(f"🎁 دعوة جديدة: {new_user_id} عبر {referrer_id} (الحد الآن {new_limit})")
+    # الحد الجديد لمدة الفيديو للداعي (يزيد +REFERRAL_MINUTES دقيقة مع كل دعوة)
+    new_max_minutes = _user_max_duration_minutes(referrer_id)
+    logger.info(
+        f"🎁 دعوة جديدة: {new_user_id} عبر {referrer_id} "
+        f"(الحد اليومي {new_limit}، مدة الفيديو {new_max_minutes} دقيقة)"
+    )
     try:
         r_lang = subdb.get_user_language(referrer_id)
         await client.send_message(
             referrer_id,
-            t('referral_granted', r_lang, bonus=REFERRAL_BONUS, limit=new_limit)
+            t('referral_granted', r_lang, bonus=REFERRAL_BONUS, limit=new_limit,
+              bonus_min=REFERRAL_MINUTES, max_minutes=new_max_minutes)
         )
     except Exception:
         pass
@@ -2883,13 +2893,23 @@ async def _build_invite_text(client, user_id, lang):
     count = subdb.get_referral_count(user_id)
     base = subdb.get_daily_limit()
     limit = (base + subdb.get_bonus_downloads(user_id)) if base != -1 else '∞'
+    max_minutes = _user_max_duration_minutes(user_id)
     return t('invite_info', lang, link=link, bonus=REFERRAL_BONUS,
-             count=count, limit=limit)
+             count=count, limit=limit, bonus_min=REFERRAL_MINUTES,
+             max_minutes=max_minutes)
 
 
 def _invite_button(lang):
     """زر الدعوة الذي يظهر عند انتهاء الحد اليومي."""
     return InlineKeyboardButton(t('btn_invite', lang), callback_data="show_invite")
+
+
+def _user_max_duration_minutes(user_id) -> int:
+    """أقصى مدة فيديو مسموحة لهذا المستخدم بالدقائق.
+    = الأساس (إعداد الأدمن) + (عدد أصدقائه الذين انضموا عبر رابطه × مكافأة الدعوة).
+    كل دعوة ناجحة ترفع الحد دائماً بمقدار REFERRAL_MINUTES دقيقة."""
+    base = subdb.get_max_duration()
+    return base + subdb.get_referral_count(user_id) * REFERRAL_MINUTES
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -4594,14 +4614,15 @@ async def handle_url(client, message):
         await status.edit_text(t('no_media_found', lang))
         return
 
-    max_duration_minutes = subdb.get_max_duration()
+    # الحد الأقصى للمدة = الأساس + مكافأة دعوات المستخدم (كل دعوة +REFERRAL_MINUTES دقيقة)
+    max_duration_minutes = _user_max_duration_minutes(user_id)
     max_duration_seconds = max_duration_minutes * 60
 
     # If not subscribed and exceeds max duration
     if not is_subscribed and duration and duration > max_duration_seconds:
         await show_subscription_screen(client, status, user_id, title, duration, max_duration_minutes)
         return
-    
+
     # Show download type (video / audio)
     keyboard = [
         [InlineKeyboardButton(t('btn_video', lang), callback_data="quality_best"),
@@ -4701,13 +4722,19 @@ async def show_subscription_screen(client, message, user_id, title, duration, ma
 
     text = (
         t('subscription_required', lang, title=title, duration=duration_minutes, max_duration=max_minutes) +
+        "\n\n" +
+        t('unlock_by_invite', lang, minutes=REFERRAL_MINUTES) +
         "\n\n━━━━━━━━━━━━━━━━\n\n" +
         t('subscription_benefits', lang) +
         "\n\n" +
         t('choose_plan', lang)
     )
 
-    await message.edit_text(text, reply_markup=_plans_keyboard(lang))
+    # خياران للمستخدم: يشترك (خطط الدفع) أو يدعو أصدقاءه (مجاناً) لرفع حدّ المدة
+    keyboard = InlineKeyboardMarkup(
+        _plans_keyboard(lang).inline_keyboard + [[_invite_button(lang)]]
+    )
+    await message.edit_text(text, reply_markup=keyboard)
 
 
 @app.on_callback_query(filters.regex(r'^show_plans$'))
