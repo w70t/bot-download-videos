@@ -2139,7 +2139,11 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             # تأخذ عدة بايتات، وحدّ اسم الملف في لينكس 255 بايت. 150B يترك
             # مساحة كافية للاحقات yt-dlp المؤقتة (.fXXX/.part) والامتداد.
             # [%(id)s] يضمن اسماً صالحاً وفريداً حتى لو كان العنوان فارغاً.
-            'outtmpl': os.path.join(dl_dir, '%(title).150B [%(id)s].%(ext)s'),
+            # نحدّ الـ id أيضاً بالبايت لأن بعض المنصات (سناب) تجعله ضخماً
+            # (يحوي كل معاملات الرابط) فيتجاوز اسم الملف 255 بايت ويفشل التحميل.
+            'outtmpl': os.path.join(dl_dir, '%(title).120B [%(id).50B].%(ext)s'),
+            # أمان شامل: حدّ أقصى لطول اسم الملف مهما طال العنوان/المعرّف
+            'trim_file_name': 200,
             'progress_hooks': [download_progress_hook],
             'postprocessor_hooks': [postprocessor_hook],  # تتبع مرحلة المعالجة
             'quiet': True,
