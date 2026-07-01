@@ -233,6 +233,15 @@ def set_max_duration(minutes: int):
     """تحديد الحد الأقصى لمدة الفيديو (بالدقائق)"""
     set_setting('max_duration_minutes', str(minutes))
 
+def get_referral_minutes() -> int:
+    """عدد الدقائق التي تُضاف لحدّ مدة الفيديو مقابل كل دعوة ناجحة (دائماً).
+    القيمة تُدار من لوحة الأدمن؛ الافتراضي يؤخذ من REFERRAL_MINUTES أو 5."""
+    return int(get_setting('referral_minutes', os.getenv('REFERRAL_MINUTES', '5')))
+
+def set_referral_minutes(minutes: int):
+    """تحديد عدد الدقائق الممنوحة لحدّ المدة مقابل كل دعوة ناجحة."""
+    set_setting('referral_minutes', str(minutes))
+
 # ═══════════════════════════════════════════════════════════════
 # دوال الاشتراك الإجباري بالقنوات
 # ═══════════════════════════════════════════════════════════════

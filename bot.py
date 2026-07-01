@@ -278,9 +278,8 @@ pending_playlists = {}
 # عدد التحميلات الافتراضي عند الدعوة، وأقصى عدد مقاطع لقائمة التشغيل
 # كل دعوة ناجحة تزيد الحد اليومي للداعي بهذا المقدار (دائماً)
 REFERRAL_BONUS = int(os.getenv("REFERRAL_BONUS", "1"))
-# كل دعوة ناجحة تزيد أيضاً حدّ مدة الفيديو المسموحة للداعي بهذا العدد من الدقائق (دائماً)
-# مثال: الأساس 10 دقائق + دعوة واحدة = 15 دقيقة، دعوتان = 20 دقيقة... وهكذا
-REFERRAL_MINUTES = int(os.getenv("REFERRAL_MINUTES", "5"))
+# ملاحظة: دقائق مكافأة الدعوة لحدّ مدة الفيديو تُدار الآن من لوحة الأدمن
+# عبر subdb.get_referral_minutes() (الافتراضي 5، مع REFERRAL_MINUTES في .env كقيمة أولية فقط)
 PLAYLIST_MAX = int(os.getenv("PLAYLIST_MAX", "5"))
 
 # أقصى عدد صور تُحمَّل من منشور إنستغرام/تيك توك (كاروسيل/سلايدشو)
@@ -2828,7 +2827,7 @@ async def _process_referral_start(client, message, new_user_id):
         await client.send_message(
             referrer_id,
             t('referral_granted', r_lang, bonus=REFERRAL_BONUS, limit=new_limit,
-              bonus_min=REFERRAL_MINUTES, max_minutes=new_max_minutes)
+              bonus_min=subdb.get_referral_minutes(), max_minutes=new_max_minutes)
         )
     except Exception:
         pass
@@ -2895,7 +2894,7 @@ async def _build_invite_text(client, user_id, lang):
     limit = (base + subdb.get_bonus_downloads(user_id)) if base != -1 else '∞'
     max_minutes = _user_max_duration_minutes(user_id)
     return t('invite_info', lang, link=link, bonus=REFERRAL_BONUS,
-             count=count, limit=limit, bonus_min=REFERRAL_MINUTES,
+             count=count, limit=limit, bonus_min=subdb.get_referral_minutes(),
              max_minutes=max_minutes)
 
 
@@ -2907,9 +2906,9 @@ def _invite_button(lang):
 def _user_max_duration_minutes(user_id) -> int:
     """أقصى مدة فيديو مسموحة لهذا المستخدم بالدقائق.
     = الأساس (إعداد الأدمن) + (عدد أصدقائه الذين انضموا عبر رابطه × مكافأة الدعوة).
-    كل دعوة ناجحة ترفع الحد دائماً بمقدار REFERRAL_MINUTES دقيقة."""
+    كل دعوة ناجحة ترفع الحد دائماً بمقدار دقائق الدعوة (يُدار من لوحة الأدمن)."""
     base = subdb.get_max_duration()
-    return base + subdb.get_referral_count(user_id) * REFERRAL_MINUTES
+    return base + subdb.get_referral_count(user_id) * subdb.get_referral_minutes()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -4723,7 +4722,7 @@ async def show_subscription_screen(client, message, user_id, title, duration, ma
     text = (
         t('subscription_required', lang, title=title, duration=duration_minutes, max_duration=max_minutes) +
         "\n\n" +
-        t('unlock_by_invite', lang, minutes=REFERRAL_MINUTES) +
+        t('unlock_by_invite', lang, minutes=subdb.get_referral_minutes()) +
         "\n\n━━━━━━━━━━━━━━━━\n\n" +
         t('subscription_benefits', lang) +
         "\n\n" +
@@ -5645,20 +5644,24 @@ async def handle_subscription_settings(client, callback_query):
     if action == 'set_duration':
         max_duration = subdb.get_max_duration()
         daily_limit = subdb.get_daily_limit()
-        
+        referral_minutes = subdb.get_referral_minutes()
+
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("⏱️ تغيير الحد الزمني", callback_data="change_time_limit")],
             [InlineKeyboardButton("🔢 تغيير الحد اليومي", callback_data="change_daily_limit")],
+            [InlineKeyboardButton("🎁 دقائق مكافأة الدعوة", callback_data="change_referral_minutes")],
             [InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")]
         ])
-        
+
         await callback_query.message.edit_text(
             "⚙️ **تحديد المدة القصوى**\n\n"
             f"🕒 **الحد الزمني لغير المشتركين:** {max_duration} دقيقة\n"
-            f"🔁 **الحد اليومي المسموح به:** {daily_limit} مرات\n\n"
+            f"🔁 **الحد اليومي المسموح به:** {daily_limit} مرات\n"
+            f"🎁 **دقائق تُضاف لكل دعوة ناجحة:** {referral_minutes} دقيقة\n\n"
             "💡 **ملاحظات:**\n"
             "• هذه القيود تطبق فقط على المستخدمين غير المشتركين\n"
-            "• المشتركون VIP لديهم حرية كاملة بلا قيود\n\n"
+            "• المشتركون VIP لديهم حرية كاملة بلا قيود\n"
+            "• كل صديق ينضم عبر رابط المستخدم يرفع حدّ مدته دائماً بهذا المقدار\n\n"
             "**اختر الإجراء المطلوب:**",
             reply_markup=keyboard
         )
@@ -5863,16 +5866,16 @@ async def handle_subscription_settings(client, callback_query):
     await callback_query.answer()
 
 
-@app.on_callback_query(filters.regex(r'^(change_time_limit|change_daily_limit|back_to_sub_settings)$'))
+@app.on_callback_query(filters.regex(r'^(change_time_limit|change_daily_limit|change_referral_minutes|back_to_sub_settings)$'))
 async def handle_duration_actions(client, callback_query):
     """معالج إعدادات المدة والحد اليومي"""
     if not is_admin(callback_query.from_user.id):
         await callback_query.answer("❌ للمشرفين فقط!", show_alert=True)
         return
-    
+
     action = callback_query.data
     user_id = callback_query.from_user.id
-    
+
     if action == 'change_time_limit':
         await callback_query.message.edit_text(
             "⏱️ **تغيير الحد الزمني**\n\n"
@@ -5881,6 +5884,16 @@ async def handle_duration_actions(client, callback_query):
             "(مثلاً: 60 لساعة واحدة، 120 لساعتين)"
         )
         pending_downloads[user_id] = {'waiting_for': 'max_duration'}
+
+    elif action == 'change_referral_minutes':
+        await callback_query.message.edit_text(
+            "🎁 **دقائق مكافأة الدعوة**\n\n"
+            f"القيمة الحالية: {subdb.get_referral_minutes()} دقيقة لكل دعوة\n\n"
+            "أرسل العدد الجديد من الدقائق التي تُضاف لحدّ مدة الفيديو مقابل كل صديق ينضم عبر رابط المستخدم\n"
+            "(مثلاً: 5 → كل دعوة ترفع حدّه +5 دقائق دائماً)\n"
+            "أرسل 0 لتعطيل مكافأة المدة."
+        )
+        pending_downloads[user_id] = {'waiting_for': 'referral_minutes'}
     
     elif action == 'change_daily_limit':
         current_limit = subdb.get_daily_limit()
@@ -6328,7 +6341,25 @@ async def handle_admin_input(client, message):
                 f"المدة الجديدة: {minutes} دقيقة ({minutes//60} ساعة و {minutes%60} دقيقة)"
             )
             del pending_downloads[user_id]
-        
+
+        elif waiting_for == 'referral_minutes':
+            try:
+                minutes = int(message.text.strip())
+            except ValueError:
+                await message.reply_text("❌ أرسل رقماً صحيحاً (مثلاً 5، أو 0 للتعطيل).")
+                return
+            if minutes < 0:
+                await message.reply_text("❌ لا يقبل قيمة سالبة (0 = تعطيل مكافأة المدة).")
+                return
+
+            subdb.set_referral_minutes(minutes)
+            await message.reply_text(
+                f"✅ **تم تحديث دقائق مكافأة الدعوة**\n\n"
+                f"القيمة الجديدة: {minutes} دقيقة لكل دعوة ناجحة\n"
+                f"(كل صديق ينضم عبر رابط المستخدم يرفع حدّ مدته دائماً +{minutes} دقيقة)"
+            )
+            del pending_downloads[user_id]
+
         elif waiting_for == 'daily_limit':
             limit = int(message.text.strip())
             if limit < 1:
