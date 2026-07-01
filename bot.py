@@ -3259,7 +3259,7 @@ async def cmd_dlstats(client, message):
 
 async def run_realusers_check(client, message):
     """فحص فوري للأعضاء مع عدّاد حيّ: يحذف من حظر البوت ويعرض العدد الحقيقي
-    والداخلين اليوم. مشترك بين أمر /realusers وزر '👥 الأعضاء الحقيقيون'."""
+    والداخلين اليوم. مشترك بين أمر /realusers وزر «👥 فحص العدد الحقيقي» في اللوحة."""
     total_before = len(subdb.get_all_users())
     try:
         joined = subdb.count_new_users(24)
@@ -3437,7 +3437,7 @@ async def start(client, message):
         keyboard = ReplyKeyboardMarkup([
             [KeyboardButton(t('btn_cookies', lang)), KeyboardButton(t('btn_daily_report', lang))],
             [KeyboardButton(t('btn_errors', lang)), KeyboardButton(t('btn_subscription', lang))],
-            [KeyboardButton(t('btn_real_users', lang)), KeyboardButton(t('btn_change_language', lang))]
+            [KeyboardButton(t('btn_change_language', lang))]
         ], resize_keyboard=True)
     else:
         # للمستخدمين العاديين - التحقق من الاشتراك
@@ -3471,7 +3471,7 @@ async def start(client, message):
 
 
 # معالج الأزرار السريعة
-@app.on_message(filters.text & filters.regex(r'^(🍪 Cookies|📊 التقرير اليومي|📊 Daily Report|👥 الأعضاء الحقيقيون|👥 Real Users|🔔 الأخطاء|🔔 Errors|💎 إعدادات الاشتراك|💎 Subscription Settings|📁 نسخ احتياطي)$'))
+@app.on_message(filters.text & filters.regex(r'^(🍪 Cookies|📊 التقرير اليومي|📊 Daily Report|🔔 الأخطاء|🔔 Errors|💎 إعدادات الاشتراك|💎 Subscription Settings|📁 نسخ احتياطي)$'))
 async def handle_quick_buttons(client, message):
     """معالج الأزرار السريعة"""
     if not message.from_user:
@@ -3486,8 +3486,6 @@ async def handle_quick_buttons(client, message):
         await cookies_panel(client, message)
     elif txt in ("📊 التقرير اليومي", "📊 Daily Report"):
         await send_daily_report(client, message.from_user.id)
-    elif txt in ("👥 الأعضاء الحقيقيون", "👥 Real Users"):
-        await run_realusers_check(client, message)
     elif txt in ("🔔 الأخطاء", "🔔 Errors"):
         await show_errors(client, message)
     elif txt in ("💎 إعدادات الاشتراك", "💎 Subscription Settings"):
@@ -6146,7 +6144,7 @@ async def handle_set_daily_limit(client, callback_query):
 
 
 
-@app.on_message(filters.text & ~filters.regex(r'https?://') & ~filters.regex(r'^(🍪|📊|🔔|💎|👥|/)'))
+@app.on_message(filters.text & ~filters.regex(r'https?://') & ~filters.regex(r'^(🍪|📊|🔔|💎|/)'))
 async def handle_admin_input(client, message):
     """معالج إدخالات الأدمن للإعدادات"""
     # رسائل القنوات أو المجهولة ليس لها from_user

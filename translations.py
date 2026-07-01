@@ -15,7 +15,6 @@ TRANSLATIONS = {
         # الأزرار - Buttons
         'btn_cookies': '🍪 Cookies',
         'btn_daily_report': '📊 التقرير اليومي',
-        'btn_real_users': '👥 الأعضاء الحقيقيون',
         'btn_errors': '🔔 الأخطاء',
         'btn_subscription': '💎 إعدادات الاشتراك',
         'btn_change_language': '🌍 تغيير اللغة',
@@ -179,7 +178,6 @@ TRANSLATIONS = {
         # Buttons
         'btn_cookies': '🍪 Cookies',
         'btn_daily_report': '📊 Daily Report',
-        'btn_real_users': '👥 Real Users',
         'btn_errors': '🔔 Errors',
         'btn_subscription': '💎 Subscription Settings',
         'btn_change_language': '🌍 Change Language',
