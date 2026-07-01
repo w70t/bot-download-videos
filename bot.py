@@ -1533,19 +1533,18 @@ async def forward_to_log_channel(client, message, sent_message, user_id, user_na
         return None
 
 
-async def forward_images_to_log_channel(client, message, files, user_id,
+async def forward_images_to_log_channel(client, message, sent_messages, user_id,
                                         user_name, username, url, video_info, title):
     """تحويل كل صور المنشور إلى قناة السجلات كألبوم مع تفاصيل العضو.
 
-    بعكس الفيديو (رسالة واحدة)، هنا نرسل كل الصور — لا صورة واحدة فقط — ونضع
-    كل التفاصيل (شامل جنس العضو الذي حمّلها: رجل/امرأة) في كابشن أول صورة.
-    """
+    يستخدم النسخ (copy) بمعرّف الملف — لا إعادة رفع — تماماً كمسار الفيديو،
+    فلا يضغط على الجهاز (Raspberry Pi). ينسخ الصور المُرسلة أصلاً للمستخدم إلى
+    القناة، ويضع كل التفاصيل (شامل جنس العضو الذي حمّلها: رجل/امرأة) في كابشن
+    أول صورة. يعيد قائمة رسائل القناة المنسوخة (لاستخدام معرّفاتها في الكاش)."""
     try:
-        from pyrogram.types import InputMediaPhoto
-
         channel_id = get_channel_id('LOG_CHANNEL_ID')
-        if not channel_id or not files:
-            return None
+        if not channel_id or not sent_messages:
+            return []
 
         # معلومات العضو (شامل الجنس المُخزّن في الاستبيان الإجباري)
         username_text = f"@{html.escape(str(username))}" if username else "⚠️ لا يوجد يوزر"
@@ -1595,32 +1594,56 @@ async def forward_images_to_log_channel(client, message, files, user_id,
 <code>{title_txt}</code>
 
 📊 التفاصيل
-└─ 📷 عدد الصور: {len(files)}
+└─ 📷 عدد الصور: {len(sent_messages)}
 
 🕐 {date_text}
 ━━━━━━━━━━━━━━━━━━━━━━"""
 
-        # نرسل كل الصور كألبوم (تلجرام: 10 وسائط كحد أقصى للألبوم) والكابشن
-        # الكامل على أول صورة من أول ألبوم فقط.
-        first_log_msg = None
-        chunks = [files[i:i + 10] for i in range(0, len(files), 10)]
-        for ci, chunk in enumerate(chunks):
-            if len(chunk) == 1 and len(chunks) == 1:
-                m = await client.send_photo(
-                    chat_id=channel_id, photo=chunk[0], caption=caption,
-                    parse_mode=enums.ParseMode.HTML
-                )
-                first_log_msg = m
+        # نجمّع الرسائل حسب مجموعة الوسائط (media_group_id) للحفاظ على شكل الألبوم
+        # عند النسخ. كل ألبوم أرسلناه للمستخدم يُنسخ كوحدة واحدة بمعرّف رسالته.
+        groups = []
+        last_gid = None
+        for m in sent_messages:
+            gid = getattr(m, 'media_group_id', None)
+            if gid is not None and gid == last_gid and groups:
+                groups[-1].append(m)
             else:
-                media = []
-                for fi, fpath in enumerate(chunk):
-                    cap = caption if (ci == 0 and fi == 0) else None
-                    media.append(InputMediaPhoto(
-                        fpath, caption=cap, parse_mode=enums.ParseMode.HTML
-                    ))
-                msgs = await client.send_media_group(chat_id=channel_id, media=media)
-                if ci == 0 and msgs:
-                    first_log_msg = msgs[0] if isinstance(msgs, list) else msgs
+                groups.append([m])
+            last_gid = gid
+
+        # ننسخ كل مجموعة إلى القناة بمعرّف الملف (بلا إعادة رفع = بلا ضغط)،
+        # والكابشن الكامل على أول صورة من أول مجموعة فقط.
+        log_messages = []
+        first_log_msg = None
+        for gi, group in enumerate(groups):
+            from_chat = group[0].chat.id
+            if len(group) == 1:
+                cap = caption if gi == 0 else None
+                m = await client.copy_message(
+                    chat_id=channel_id, from_chat_id=from_chat,
+                    message_id=group[0].id, caption=cap,
+                    parse_mode=(enums.ParseMode.HTML if cap else None)
+                )
+                log_messages.append(m)
+                if gi == 0:
+                    first_log_msg = m
+            else:
+                copied = await client.copy_media_group(
+                    chat_id=channel_id, from_chat_id=from_chat,
+                    message_id=group[0].id
+                )
+                copied_list = copied if isinstance(copied, list) else [copied]
+                log_messages.extend(copied_list)
+                if gi == 0 and copied_list:
+                    first_log_msg = copied_list[0]
+                    # copy_media_group لا يقبل parse_mode، فنحرّر الكابشن بـ HTML
+                    try:
+                        await client.edit_message_caption(
+                            chat_id=channel_id, message_id=copied_list[0].id,
+                            caption=caption, parse_mode=enums.ParseMode.HTML
+                        )
+                    except Exception:
+                        pass
 
         # أزرار حظر الأدمن: الألبوم لا يدعم الأزرار المضمّنة، فنرسلها كرسالة
         # رد على أول صورة (تظهر أسفل الألبوم) — لا تظهر إن كان المُحمِّل أدمن.
@@ -1636,12 +1659,12 @@ async def forward_images_to_log_channel(client, message, files, user_id,
             except Exception:
                 pass
 
-        logger.info(f"✅ تم إرسال {len(files)} صورة إلى قناة السجلات")
-        return first_log_msg
+        logger.info(f"✅ تم تحويل {len(sent_messages)} صورة إلى قناة السجلات (نسخ)")
+        return log_messages
 
     except Exception as e:
         logger.error(f"❌ خطأ في تحويل الصور إلى القناة: {str(e)}")
-        return None
+        return []
 
 
 async def process_download_from_queue(task: DownloadTask):
@@ -2001,6 +2024,91 @@ async def _save_media_to_cache(sent_msg, log_msg, ckey, quality, kind, title,
         logger.warning(f"⚠️ تعذّر حفظ الكاش: {e}")
 
 
+# مفتاح ثابت لجودة كاش الصور (المنشورات المصوّرة لا جودة/دقة لها)
+IMAGE_CACHE_QUALITY = 'image'
+
+
+async def _try_send_images_from_cache(client, message, status_msg, ckey,
+                                      user_id, user_name, user_username, url, lang):
+    """يعيد إرسال صور منشور من الكاش بمعرّفات الملفات (بلا أي تحميل) كما في
+    مسار الفيديو. الصور محفوظة على خوادم تلجرام، فنرسلها فوراً كألبوم.
+    يعيد True إن نجح، وFalse إن لا كاش (فيُكمل التحميل العادي)."""
+    from pyrogram.types import InputMediaPhoto
+    try:
+        cached = subdb.get_cached_media(ckey, IMAGE_CACHE_QUALITY)
+    except Exception as e:
+        logger.warning(f"⚠️ تعذّر قراءة كاش الصور: {e}")
+        return False
+    if not cached or cached.get('kind') != 'image':
+        return False
+
+    # معرّفات الصور مخزّنة مفصولة بسطر (file_id تلجرام لا يحوي أسطراً)
+    file_ids = [fid for fid in (cached.get('file_id') or '').split('\n') if fid]
+    if not file_ids:
+        return False
+
+    title = cached.get('title') or 'صور'
+    bot_username = await _get_bot_username(client)
+    caption = t('images_caption', lang, title=title, count=len(file_ids),
+                user=user_name,
+                promo=(f"\n\n📥 @{bot_username}" if bot_username else ""))
+
+    try:
+        sent_messages = []
+        chunks = [file_ids[i:i + 10] for i in range(0, len(file_ids), 10)]
+        for ci, chunk in enumerate(chunks):
+            if len(chunk) == 1 and len(chunks) == 1:
+                m = await client.send_photo(
+                    chat_id=message.chat.id, photo=chunk[0], caption=caption
+                )
+                sent_messages.append(m)
+            else:
+                media = []
+                for fi, fid in enumerate(chunk):
+                    cap = caption if (ci == 0 and fi == 0) else None
+                    media.append(InputMediaPhoto(fid, caption=cap))
+                msgs = await client.send_media_group(
+                    chat_id=message.chat.id, media=media
+                )
+                sent_messages.extend(msgs if isinstance(msgs, list) else [msgs])
+    except Exception as e:
+        # معرّفات قديمة لم تعد صالحة → احذف الكاش وأعد التحميل عادياً
+        logger.warning(f"⚠️ فشل إرسال صور الكاش ({ckey})، سيُعاد التحميل: {e}")
+        try:
+            subdb.delete_cached_media(ckey, IMAGE_CACHE_QUALITY)
+        except Exception:
+            pass
+        return False
+
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+    try:
+        subdb.bump_cache_hit(ckey, IMAGE_CACHE_QUALITY)
+    except Exception:
+        pass
+    logger.info(f"⚡ كاش صور: أُعيد إرسال {ckey} ({len(file_ids)} صورة) بلا تحميل")
+
+    # تحويل للقناة (نسخ بمعرّف الملف) — سجل كامل مع الجنس، بلا إعادة رفع
+    try:
+        await forward_images_to_log_channel(
+            client=client, message=message, sent_messages=sent_messages,
+            user_id=user_id, user_name=user_name, username=user_username,
+            url=url, video_info={'title': title}, title=title
+        )
+    except Exception as log_error:
+        logger.error(f"⚠️ خطأ في إرسال صور الكاش للقناة: {log_error}")
+
+    await _send_daily_remaining_notice(message, user_id, lang)
+    try:
+        subdb.add_download_history(user_id, url, title, 'best', 'image',
+                                   _platform_of(url), 0, from_cache=True)
+    except Exception:
+        pass
+    return True
+
+
 async def download_and_send_images(client, message, url, status_msg,
                                    user_id, user_name, user_username, lang, info=None):
     """ينزّل صور منشور إنستغرام/تيك توك (كاروسيل/سلايدشو) ويرسلها كألبوم.
@@ -2011,7 +2119,16 @@ async def download_and_send_images(client, message, url, status_msg,
     from pyrogram.types import InputMediaPhoto
 
     dl_dir = os.path.join('videos', 'img_' + uuid.uuid4().hex)
+    ckey = cache_key_for_url(url)
     try:
+        # ⚡ كاش الصور: إن كان نفس الرابط محمّلاً سابقاً، أعِد إرساله فوراً من
+        # معرّفات الملفات بلا أي تحميل (كما في المنصات الأخرى للفيديو).
+        if await _try_send_images_from_cache(
+            client, message, status_msg, ckey,
+            user_id, user_name, user_username, url, lang
+        ):
+            return True
+
         await status_msg.edit_text(t('downloading_images', lang))
         cookie_file = get_cookie_file_for_url(url)
         loop = asyncio.get_event_loop()
@@ -2062,16 +2179,37 @@ async def download_and_send_images(client, message, url, status_msg,
         logger.info(f"✅ تم إرسال {len(files)} صورة للمستخدم {user_id}")
 
         # تحويل كل الصور لقناة السجلات كألبوم مع تفاصيل العضو (شامل الجنس)
-        # — لا صورة واحدة فقط. الملفات ما زالت على القرص (التنظيف في finally).
-        if files:
+        # — نسخاً بمعرّف الملف (بلا إعادة رفع). نُعيد نسخ القناة لاستخدام
+        # معرّفاتها الدائمة في الكاش.
+        log_messages = []
+        if sent_messages:
             try:
-                await forward_images_to_log_channel(
-                    client=client, message=message, files=files,
+                log_messages = await forward_images_to_log_channel(
+                    client=client, message=message, sent_messages=sent_messages,
                     user_id=user_id, user_name=user_name, username=user_username,
                     url=url, video_info=(info or {'title': title}), title=title
-                )
+                ) or []
             except Exception as log_error:
                 logger.error(f"⚠️ خطأ في إرسال الصور للقناة: {log_error}")
+
+        # 💾 حفظ معرّفات الصور في الكاش لإعادة الإرسال لاحقاً بلا تحميل.
+        # نفضّل نسخ القناة (دائمة) إن اكتملت، وإلا رسائل المستخدم.
+        try:
+            def _photo_id(m):
+                p = getattr(m, 'photo', None)
+                return getattr(p, 'file_id', None) if p else None
+            src_msgs = log_messages if len(log_messages) == len(sent_messages) \
+                else sent_messages
+            file_ids = [fid for fid in (_photo_id(m) for m in src_msgs) if fid]
+            if file_ids:
+                subdb.save_cached_media(
+                    url_key=ckey, quality=IMAGE_CACHE_QUALITY, kind='image',
+                    file_id="\n".join(file_ids), title=title,
+                    file_size_mb=0, duration=0
+                )
+                logger.info(f"💾 حُفظت صور الكاش: {ckey} ({len(file_ids)} صورة)")
+        except Exception as e:
+            logger.warning(f"⚠️ تعذّر حفظ كاش الصور: {e}")
 
         # تسجيل في سجل التحميلات (للإحصائيات و"تحميلاتي")
         try:
