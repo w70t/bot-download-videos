@@ -2913,7 +2913,7 @@ async def start(client, message):
         keyboard = ReplyKeyboardMarkup([
             [KeyboardButton(t('btn_cookies', lang)), KeyboardButton(t('btn_daily_report', lang))],
             [KeyboardButton(t('btn_errors', lang)), KeyboardButton(t('btn_subscription', lang))],
-            [KeyboardButton(t('btn_change_language', lang))]
+            [KeyboardButton(t('btn_change_language', lang)), KeyboardButton(t('btn_update_ytdlp', lang))]
         ], resize_keyboard=True)
     else:
         # للمستخدمين العاديين - التحقق من الاشتراك
@@ -2946,8 +2946,63 @@ async def start(client, message):
         await _prompt_survey_if_needed(message.reply_text, user_id)
 
 
+async def run_ytdlp_update(client, message):
+    """تحديث yt-dlp فعلياً من داخل البوت (زر/أمر أدمن).
+
+    يشغّل pip في بيئة البوت نفسها (خارج حلقة الأحداث حتى لا يجمّد البوت)،
+    وعند تغيّر الإصدار يعيد تشغيل العملية بـ os.execv لتحميل الإصدار الجديد
+    (الوحدة المستوردة في الذاكرة لا تتحدث بدون إعادة تشغيل)."""
+    status = await message.reply_text("🔄 **جاري تحديث yt-dlp...**")
+    loop = asyncio.get_event_loop()
+
+    def _pip(*args):
+        return subprocess.run(
+            [sys.executable, '-m', 'pip', *args],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, timeout=600)
+
+    old_v = getattr(getattr(yt_dlp, 'version', None), '__version__', '؟')
+    try:
+        r = await loop.run_in_executor(None, lambda: _pip('install', '-U', 'yt-dlp'))
+    except Exception as e:
+        await status.edit_text(f"❌ **فشل تشغيل pip:**\n`{str(e)[:300]}`")
+        return
+    if r.returncode != 0:
+        await status.edit_text(f"❌ **فشل التحديث:**\n`{(r.stdout or '')[-500:]}`")
+        return
+
+    # الإصدار الجديد يُقرأ من pip لأن العملية الحالية ما زالت على القديم
+    show = await loop.run_in_executor(None, lambda: _pip('show', 'yt-dlp'))
+    new_v = old_v
+    for line in (show.stdout or '').splitlines():
+        if line.startswith('Version:'):
+            new_v = line.split(':', 1)[1].strip()
+            break
+
+    if new_v == old_v:
+        await status.edit_text(
+            f"✅ **yt-dlp محدّث أصلاً** (الإصدار `{old_v}`)\nلا حاجة لإعادة التشغيل.")
+        return
+
+    await status.edit_text(
+        f"✅ **تم تحديث yt-dlp:** `{old_v}` ← `{new_v}`\n"
+        f"♻️ جاري إعادة تشغيل البوت لتفعيل الإصدار الجديد..."
+    )
+    logger.info(f"♻️ إعادة تشغيل البوت لتفعيل yt-dlp {new_v} (كان {old_v})")
+    await asyncio.sleep(1)
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+@app.on_message(filters.command("update"))
+async def cmd_update_ytdlp(client, message):
+    """أمر أدمن: تحديث yt-dlp فعلياً (نفس زر 🔄 تحديث yt-dlp)."""
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    await run_ytdlp_update(client, message)
+
+
 # معالج الأزرار السريعة
-@app.on_message(filters.text & filters.regex(r'^(🍪 Cookies|📊 التقرير اليومي|📊 Daily Report|🔔 الأخطاء|🔔 Errors|💎 إعدادات الاشتراك|💎 Subscription Settings|📁 نسخ احتياطي)$'))
+@app.on_message(filters.text & filters.regex(r'^(🍪 Cookies|📊 التقرير اليومي|📊 Daily Report|🔔 الأخطاء|🔔 Errors|💎 إعدادات الاشتراك|💎 Subscription Settings|📁 نسخ احتياطي|🔄 تحديث yt-dlp|🔄 Update yt-dlp)$'))
 async def handle_quick_buttons(client, message):
     """معالج الأزرار السريعة"""
     if not message.from_user:
@@ -2968,6 +3023,8 @@ async def handle_quick_buttons(client, message):
         await subscription_settings_panel(client, message)
     elif txt == "📁 نسخ احتياطي":
         await send_database_backup(client, message)
+    elif txt in ("🔄 تحديث yt-dlp", "🔄 Update yt-dlp"):
+        await run_ytdlp_update(client, message)
 
 
 # معالج زر اشتراكي - Subscription Status Button Handler
@@ -6318,7 +6375,8 @@ async def handle_language_selection(client, callback_query):
         keyboard = ReplyKeyboardMarkup([
             [KeyboardButton(t('btn_cookies', lang)), KeyboardButton(t('btn_daily_report', lang))],
             [KeyboardButton(t('btn_errors', lang)), KeyboardButton(t('btn_subscription', lang))],
-            [KeyboardButton("📁 نسخ احتياطي"), KeyboardButton(t('btn_change_language', lang))]
+            [KeyboardButton("📁 نسخ احتياطي"), KeyboardButton(t('btn_change_language', lang))],
+            [KeyboardButton(t('btn_update_ytdlp', lang))]
         ], resize_keyboard=True)
     else:
         from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton

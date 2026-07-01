@@ -19,6 +19,7 @@ TRANSLATIONS = {
         'btn_subscription': '💎 إعدادات الاشتراك',
         'btn_change_language': '🌍 تغيير اللغة',
         'btn_my_subscription': '💎 اشتراكي',
+        'btn_update_ytdlp': '🔄 تحديث yt-dlp',
         
         # Download
         'processing': '⏳ **جاري المعالجة...**',
@@ -190,6 +191,7 @@ TRANSLATIONS = {
         'btn_subscription': '💎 Subscription Settings',
         'btn_change_language': '🌍 Change Language',
         'btn_my_subscription': '💎 My Subscription',
+        'btn_update_ytdlp': '🔄 Update yt-dlp',
         
         # Download
         'processing': '⏳ **Processing...**',
