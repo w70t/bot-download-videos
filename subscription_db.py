@@ -170,9 +170,16 @@ def deactivate_subscription(user_id: int):
     logger.info(f"❌ تم إلغاء اشتراك المستخدم {user_id}")
 
 def delete_user(user_id: int):
-    """حذف مستخدم نهائياً من قاعدة البيانات (عند حظره البوت أو حذف حسابه)"""
+    """حذف مستخدم نهائياً من قاعدة البيانات (عند حظره البوت أو حذف حسابه).
+
+    يحذف أيضاً صفوف الاستبيان والإجابات حتى لا تبقى إحصائيات الجنس منتفخة
+    بأعضاء غادروا."""
     with db_cursor(commit=True) as cursor:
         cursor.execute('DELETE FROM users WHERE user_id = %s', (user_id,))
+        # تنظيف بيانات الاستبيان والإجابات المرتبطة (الجداول تُنشأ عند الإقلاع)
+        # حتى لا تبقى إحصائيات الجنس منتفخة بأعضاء غادروا.
+        cursor.execute('DELETE FROM member_survey WHERE user_id = %s', (user_id,))
+        cursor.execute('DELETE FROM member_answers WHERE user_id = %s', (user_id,))
     logger.info(f"🗑️ تم حذف المستخدم {user_id} من قاعدة البيانات")
 
 def get_recent_users(limit: int = 50):
@@ -1046,10 +1053,18 @@ def set_question_answer(user_id, answer, version):
 
 
 def get_gender_stats():
-    """إحصائية الجنس: {'male': n, 'female': n}."""
+    """إحصائية الجنس للأعضاء الموجودين فعلاً: {'male': n, 'female': n}.
+
+    نربط مع جدول users فلا نعدّ صفوف استبيان لأعضاء غادروا/حُذفوا (تفادي
+    الأرقام المنتفخة)."""
     with db_cursor() as cursor:
-        cursor.execute(
-            'SELECT gender, COUNT(*) FROM member_survey WHERE gender IS NOT NULL GROUP BY gender')
+        cursor.execute('''
+            SELECT s.gender, COUNT(*)
+            FROM member_survey s
+            JOIN users u ON u.user_id = s.user_id
+            WHERE s.gender IS NOT NULL
+            GROUP BY s.gender
+        ''')
         rows = cursor.fetchall()
     d = {'male': 0, 'female': 0}
     for g, c in rows:
