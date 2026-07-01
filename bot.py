@@ -3766,6 +3766,37 @@ async def handle_cookie_file(client, message):
         logger.error(f"خطأ في حفظ cookies: {e}")
 
 
+# أسماء المنصات للعرض في رسالة المعاينة
+PLATFORM_DISPLAY_NAMES = {
+    'youtube': 'YouTube', 'facebook': 'Facebook', 'instagram': 'Instagram',
+    'threads': 'Threads', 'twitter': 'X (Twitter)', 'reddit': 'Reddit',
+    'snapchat': 'Snapchat', 'pinterest': 'Pinterest', 'tiktok': 'TikTok',
+}
+
+
+def _best_thumbnail_url(info):
+    """يرجع رابط أفضل صورة مصغّرة من معلومات الفيديو (أو None).
+
+    نفضّل الصيغ التي يقبلها تلجرام برابط مباشر (jpg/png)؛ بعض المنصات ترجع
+    webp فيرفضه تلجرام أحياناً — عندها نسقط لأول رابط متاح ويتكفّل المستدعي
+    بالتراجع لرسالة نصية إذا فشل الإرسال."""
+    if not info:
+        return None
+    urls = []
+    if info.get('thumbnail'):
+        urls.append(str(info['thumbnail']))
+    # قائمة thumbnails مرتّبة تصاعدياً بالجودة في yt-dlp — الأخيرة الأكبر
+    for th in reversed(info.get('thumbnails') or []):
+        u = th.get('url') if isinstance(th, dict) else None
+        if u:
+            urls.append(str(u))
+    urls = [u for u in urls if u.startswith(('http://', 'https://'))]
+    for u in urls:
+        if '.webp' not in u.lower():
+            return u
+    return urls[0] if urls else None
+
+
 @app.on_message(filters.text & filters.regex(r'https?://\S+'))
 async def handle_url(client, message):
     if not message.from_user:
@@ -3983,16 +4014,32 @@ async def handle_url(client, message):
         await show_subscription_screen(client, status, user_id, title, duration, max_duration_minutes)
         return
 
-    # Show download type (video / audio)
-    keyboard = [
+    # معاينة مرتّبة: صورة مصغّرة + معلومات المقطع + زرا فيديو/صوت
+    keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(t('btn_video', lang), callback_data="quality_best"),
          InlineKeyboardButton(t('btn_audio', lang), callback_data="quality_audio")],
-    ]
+    ])
 
-    await status.edit_text(
-        t('choose_quality', lang, title=title, duration=duration_str),
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    details = t('preview_duration', lang, duration=duration_str)
+    platform = _platform_of(url)
+    if platform != 'other':
+        details += '\n' + t('preview_platform', lang,
+                            platform=PLATFORM_DISPLAY_NAMES.get(platform, platform))
+    uploader = str(info.get('uploader') or info.get('channel') or '').strip()
+    if uploader:
+        details += '\n' + t('preview_uploader', lang, uploader=uploader[:40])
+    caption = t('link_preview', lang, title=title, details=details)
+
+    thumb = _best_thumbnail_url(info)
+    if thumb:
+        try:
+            await message.reply_photo(thumb, caption=caption, reply_markup=keyboard)
+            await status.delete()
+            return
+        except Exception as e:
+            # تلجرام قد يرفض جلب المصغّر (صيغة/حجم/انتهاء الرابط) → معاينة نصية
+            logger.info(f"⚠️ تعذّر إرسال المعاينة بصورة مصغّرة ({_url_host(url)}): {e}")
+    await status.edit_text(caption, reply_markup=keyboard)
 
 
 
@@ -4003,14 +4050,25 @@ async def handle_quality(client, callback_query):
     user_id = callback_query.from_user.id
     quality = callback_query.data.replace("quality_", "")
     
+    # رسالة المعاينة قد تكون صورة (مصغّرة) → تعديلها يكون بـ edit_caption
+    async def _edit_preview(msg, text):
+        try:
+            if msg.photo:
+                await msg.edit_caption(text)
+            else:
+                await msg.edit_text(text)
+        except Exception as e:
+            logger.warning(f"⚠️ تعذّر تعديل رسالة المعاينة: {e}")
+
     if user_id not in pending_downloads:
         lang = subdb.get_user_language(user_id)
-        await callback_query.message.edit_text(t('error_occurred', lang, error="Session expired. Send link again."))
+        await _edit_preview(callback_query.message,
+                            t('error_occurred', lang, error="Session expired. Send link again."))
         return
-    
+
     url = pending_downloads[user_id]
     lang = subdb.get_user_language(user_id)
-    await callback_query.message.edit_text(t('start_download', lang))
+    await _edit_preview(callback_query.message, t('start_download', lang))
     
     await download_and_upload(client, callback_query.message, url, quality, callback_query)
 
