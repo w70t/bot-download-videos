@@ -1614,8 +1614,32 @@ async def download_and_send_images(client, message, url, status_msg,
         cleanup_download_dir(dl_dir)
 
 
-async def download_and_upload(client, message, url, quality, callback_query=None):
-    """تحميل ورفع الفيديو"""
+class PreviewStatus:
+    """يلفّ رسالة المعاينة (صورة المصغّرة) لتعمل كرسالة حالة موحّدة:
+    كل تحديثات التقدم تُكتب في تسمية الصورة (edit_caption) بدل رسالة منفصلة،
+    وبقية العمليات (delete/reply/...) تمرّ للرسالة الأصلية كما هي."""
+
+    def __init__(self, msg):
+        self._msg = msg
+
+    def __getattr__(self, name):
+        return getattr(self._msg, name)
+
+    async def edit_text(self, text, reply_markup=None, parse_mode=None, **_ignored):
+        # تسمية الصورة محدودة بـ1024 محرفاً في تلجرام
+        kwargs = {'reply_markup': reply_markup}
+        if parse_mode is not None:
+            kwargs['parse_mode'] = parse_mode
+        return await self._msg.edit_caption(str(text)[:1024], **kwargs)
+
+
+async def download_and_upload(client, message, url, quality, callback_query=None,
+                              status_msg=None):
+    """تحميل ورفع الفيديو.
+
+    status_msg (اختياري): رسالة موجودة تُستخدم لعرض التقدم بدل إنشاء رسالة
+    جديدة — تُمرَّر رسالة المعاينة (المصغّرة) من زر فيديو/صوت حتى تندمج
+    المعاينة والتقدم في رسالة واحدة."""
     # الحصول على معلومات المستخدم من callback_query إذا كان موجوداً
     if callback_query:
         user_id = callback_query.from_user.id
@@ -1625,10 +1649,18 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         user_id = message.from_user.id
         user_name = message.from_user.first_name
         user_username = message.from_user.username
-    
+
     # Get user language
     lang = subdb.get_user_language(user_id)
-    status_msg = await message.reply_text(t('processing', lang))
+    if status_msg is None:
+        status_msg = await message.reply_text(t('processing', lang))
+    else:
+        if getattr(status_msg, 'photo', None):
+            status_msg = PreviewStatus(status_msg)
+        try:
+            await status_msg.edit_text(t('processing', lang))
+        except Exception:
+            pass
 
     # ⏸️ إيقاف التحميل العام (الأدمن مُعفى)
     if not is_admin(user_id) and not downloads_enabled():
@@ -4068,18 +4100,15 @@ async def handle_quality(client, callback_query):
 
     url = pending_downloads[user_id]
     lang = subdb.get_user_language(user_id)
-    await _edit_preview(callback_query.message, t('start_download', lang))
 
-    await download_and_upload(client, callback_query.message, url, quality, callback_query)
+    # رسالة المعاينة نفسها تصير رسالة التقدم (معاينة + تقدم مدموجة في رسالة
+    # واحدة)؛ عند النجاح تُحذف من داخل download_and_upload، وعند الفشل يظهر
+    # الخطأ عليها مباشرة.
+    await download_and_upload(client, callback_query.message, url, quality,
+                              callback_query, status_msg=callback_query.message)
 
     # Safe deletion - prevents KeyError if user clicks multiple quality buttons
     pending_downloads.pop(user_id, None)
-
-    # نظافة المحادثة: احذف رسالة المعاينة (المصغّرة/النص) بعد اكتمال العملية
-    try:
-        await callback_query.message.delete()
-    except Exception:
-        pass
 
 
 @app.on_callback_query(filters.regex(r'^playlist_dl$'))
