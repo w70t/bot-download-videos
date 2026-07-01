@@ -1018,6 +1018,26 @@ def _ensure_survey_table():
                 updated_at TIMESTAMP DEFAULT NOW()
             )
         ''')
+        # عمود الموافقة على الشروط (للقواعد الموجودة مسبقاً أيضاً)
+        cursor.execute(
+            'ALTER TABLE member_survey ADD COLUMN IF NOT EXISTS consent BOOLEAN DEFAULT FALSE')
+
+
+def has_consent(user_id):
+    """هل وافق العضو على شروط الاستخدام (منع المحتوى الإباحي)؟"""
+    with db_cursor() as cursor:
+        cursor.execute('SELECT consent FROM member_survey WHERE user_id = %s', (user_id,))
+        row = cursor.fetchone()
+    return bool(row[0]) if row and row[0] is not None else False
+
+
+def set_consent(user_id):
+    """يسجّل موافقة العضو على الشروط."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            INSERT INTO member_survey (user_id, consent) VALUES (%s, TRUE)
+            ON CONFLICT (user_id) DO UPDATE SET consent = TRUE, updated_at = NOW()
+        ''', (user_id,))
 
 
 def get_survey(user_id):

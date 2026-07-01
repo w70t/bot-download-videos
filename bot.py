@@ -3084,10 +3084,20 @@ def _question_keyboard(qid, lang):
     ]])
 
 
+def _consent_keyboard(lang):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(t('btn_consent_agree', lang), callback_data='consent_agree')
+    ]])
+
+
 async def _prompt_survey_if_needed(send_func, user_id):
-    """يعرض الخطوة الناقصة من الاستبيان (الجنس ثم الأسئلة غير المُجابة).
-    يرجع True إذا عُرض سؤال (أي يجب إيقاف التحميل)، وإلا False (الاستبيان مكتمل)."""
+    """يعرض الخطوة الناقصة من البوابة: الموافقة على الشروط ثم الجنس ثم الأسئلة.
+    يرجع True إذا عُرضت خطوة (أي يجب إيقاف التحميل)، وإلا False (اكتملت البوابة)."""
     lang = subdb.get_user_language(user_id)
+    # 1) الموافقة الإجبارية على الشروط (منع المحتوى الإباحي) قبل أي شيء
+    if not subdb.has_consent(user_id):
+        await send_func(t('consent_prompt', lang), reply_markup=_consent_keyboard(lang))
+        return True
     if not subdb.get_survey(user_id).get('gender'):
         await send_func(t('ask_gender', lang), reply_markup=_gender_keyboard(lang))
         return True
@@ -3171,6 +3181,18 @@ def _questions_panel_view():
     rows.append([InlineKeyboardButton("➕ إضافة سؤال", callback_data="sub_qadd")])
     rows.append([InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")])
     return text, InlineKeyboardMarkup(rows)
+
+
+@app.on_callback_query(filters.regex(r'^consent_agree$'))
+async def handle_consent(client, callback_query):
+    """يسجّل موافقة العضو على الشروط ثم ينتقل للخطوة التالية من البوابة."""
+    await callback_query.answer(t('consent_thanks', subdb.get_user_language(callback_query.from_user.id)))
+    uid = callback_query.from_user.id
+    lang = subdb.get_user_language(uid)
+    subdb.set_consent(uid)
+    if not await _prompt_survey_if_needed(callback_query.message.edit_text, uid):
+        await callback_query.message.edit_text(t('survey_done', lang))
+        await _post_survey_result(client, callback_query.from_user)
 
 
 @app.on_callback_query(filters.regex(r'^gender_(male|female)$'))
