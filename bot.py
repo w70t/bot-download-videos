@@ -1136,6 +1136,27 @@ def _is_drm_error(err):
     return 'drm' in str(err).lower()
 
 
+def _is_geo_restricted_error(err, url=''):
+    """هل الفشل بسبب حظر جغرافي/حقوق بث للمحتوى (لا يمكن تحميله من منطقة الخادم)؟"""
+    msg = str(err).lower()
+    # عبارات yt-dlp الصريحة عن الحظر الجغرافي
+    geo_signs = [
+        'geo restrict', 'geo-restrict', 'geo restricted', 'geo blocked',
+        'not available from your location', 'not available in your country',
+        'not available in your region', 'blocked it in your country',
+        'blocked in your country',
+    ]
+    if any(s in msg for s in geo_signs):
+        return True
+    # X/تويتر: فشل تنزيل بيانات الفيديو بـ403 = غالباً حظر جغرافي/حقوق بث للمقطع
+    is_twitter = any(m in url.lower() for m in PLATFORM_URL_MARKERS['twitter'])
+    if is_twitter and '403' in msg and (
+        'download video data' in msg or 'm3u8' in msg or 'forbidden' in msg
+    ):
+        return True
+    return False
+
+
 def _is_youtube_cookie_issue(err):
     """هل خطأ يوتيوب ناتج عن حجب الصيغ بسبب الكوكيز/الحماية؟"""
     msg = str(err).lower()
@@ -2765,7 +2786,9 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             lang = subdb.get_user_language(user_id)
 
             # رسائل مخصصة لأخطاء معينة
-            if _is_drm_error(error_text):
+            if _is_geo_restricted_error(error_text, url):
+                await status_msg.edit_text(t('geo_restricted', lang))
+            elif _is_drm_error(error_text):
                 await status_msg.edit_text(t('drm_protected', lang))
             elif 'Cannot parse data' in error_text and 'facebook' in error_text.lower():
                 await status_msg.edit_text(t('facebook_unavailable', lang))
