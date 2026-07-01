@@ -2956,10 +2956,16 @@ async def run_ytdlp_update(client, message):
     loop = asyncio.get_event_loop()
 
     def _pip(*args):
-        return subprocess.run(
-            [sys.executable, '-m', 'pip', *args],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, timeout=600)
+        cmd = [sys.executable, '-m', 'pip', *args]
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           text=True, timeout=600)
+        # بايثون النظام في Debian يمنع pip افتراضياً (PEP 668)؛ نتجاوز المنع
+        # لأن هذه هي بيئة تشغيل البوت الفعلية نفسها (وليست بيئة أخرى)
+        if r.returncode != 0 and 'externally-managed-environment' in (r.stdout or ''):
+            r = subprocess.run(cmd + ['--break-system-packages'],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               text=True, timeout=600)
+        return r
 
     old_v = getattr(getattr(yt_dlp, 'version', None), '__version__', '؟')
     try:
