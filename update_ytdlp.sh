@@ -1,7 +1,10 @@
 #!/bin/bash
 # =============================================================
 # تحديث yt-dlp تلقائياً (يُشغَّل من cron)
-# - يحدّث yt-dlp داخل بيئة البوت الافتراضية (بصلاحيات مالك المجلد)
+# - يكتشف بيئة بايثون التي يعمل بها البوت فعلياً (من العملية الحيّة عبر
+#   systemd) فيحدّث المكان الصحيح سواء كان venv أو بايثون النظام
+# - يتجاوز منع Debian لتحديث بايثون النظام (PEP 668) عند الحاجة لأن
+#   المستهدفة هي بيئة تشغيل البوت الفعلية نفسها
 # - يعيد تشغيل البوت فقط إذا تغيّر الإصدار (لا يقطع تحميلات جارية بلا داعٍ)
 # - يرسل إشعار تلجرام للأدمن بالنتيجة (نجاح/فشل)
 #
@@ -15,10 +18,22 @@
 set -u
 
 BOT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PIP="$BOT_DIR/venv/bin/pip"
 SERVICE="${BOT_SERVICE:-bot7}"
 NOTIFY_NO_CHANGE="${NOTIFY_NO_CHANGE:-0}"
-OWNER="$(stat -c %U "$BOT_DIR")"
+
+# بيئة بايثون الفعلية للبوت: من العملية الحيّة أولاً، وإلا venv المشروع، وإلا python3
+MAIN_PID="$(systemctl show -p MainPID --value "$SERVICE" 2>/dev/null | tr -d ' ')"
+MAIN_PID="${MAIN_PID:-0}"
+if [ "$MAIN_PID" != "0" ] && [ -n "$MAIN_PID" ] && [ -e "/proc/$MAIN_PID/exe" ]; then
+    PY="$(readlink -f "/proc/$MAIN_PID/exe")"
+    RUN_USER="$(ps -o user= -p "$MAIN_PID" | tr -d ' ')"
+elif [ -x "$BOT_DIR/venv/bin/python" ]; then
+    PY="$BOT_DIR/venv/bin/python"
+    RUN_USER="$(stat -c %U "$BOT_DIR")"
+else
+    PY="$(command -v python3)"
+    RUN_USER="$(stat -c %U "$BOT_DIR")"
+fi
 
 # قراءة توكن البوت ومعرّف الأدمن من .env لإرسال الإشعار
 _env() { grep -E "^$1=" "$BOT_DIR/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d ' \r'; }
@@ -31,21 +46,30 @@ notify() {
         -d chat_id="${ADMIN_ID}" --data-urlencode text="$1" >/dev/null || true
 }
 
-# نفّذ pip بصلاحيات مالك المجلد حتى لا تتخرب ملكية ملفات venv عند التشغيل كـroot
-run_pip() {
-    if [ "$(id -un)" = "$OWNER" ]; then
-        "$PIP" "$@"
+# نفّذ بايثون بهوية مستخدم البوت نفسه حتى يصل التحديث لنفس البيئة التي يقرأها
+run_py() {
+    if [ "$(id -un)" = "$RUN_USER" ]; then
+        "$PY" "$@"
     else
-        runuser -u "$OWNER" -- "$PIP" "$@"
+        runuser -u "$RUN_USER" -- "$PY" "$@"
     fi
 }
 
-ver() { run_pip show yt-dlp 2>/dev/null | awk '/^Version:/{print $2}'; }
+ver() { run_py -m pip show yt-dlp 2>/dev/null | awk '/^Version:/{print $2}'; }
 
-echo "===== $(date '+%F %T') فحص تحديث yt-dlp ====="
+pip_upgrade() {
+    OUT="$(run_py -m pip install -U yt-dlp 2>&1)" && return 0
+    # بايثون النظام في Debian يمنع pip افتراضياً (PEP 668) — تجاوز المنع
+    if echo "$OUT" | grep -q 'externally-managed-environment'; then
+        OUT="$(run_py -m pip install -U yt-dlp --break-system-packages 2>&1)" && return 0
+    fi
+    return 1
+}
+
+echo "===== $(date '+%F %T') فحص تحديث yt-dlp (python: $PY, user: $RUN_USER) ====="
 OLD="$(ver)"
 
-if OUT="$(run_pip install -U yt-dlp 2>&1)"; then
+if pip_upgrade; then
     NEW="$(ver)"
     if [ -n "$NEW" ] && [ "$OLD" != "$NEW" ]; then
         echo "تم التحديث: ${OLD:-?} -> ${NEW} — إعادة تشغيل ${SERVICE}"
