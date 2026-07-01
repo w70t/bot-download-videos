@@ -1533,6 +1533,117 @@ async def forward_to_log_channel(client, message, sent_message, user_id, user_na
         return None
 
 
+async def forward_images_to_log_channel(client, message, files, user_id,
+                                        user_name, username, url, video_info, title):
+    """تحويل كل صور المنشور إلى قناة السجلات كألبوم مع تفاصيل العضو.
+
+    بعكس الفيديو (رسالة واحدة)، هنا نرسل كل الصور — لا صورة واحدة فقط — ونضع
+    كل التفاصيل (شامل جنس العضو الذي حمّلها: رجل/امرأة) في كابشن أول صورة.
+    """
+    try:
+        from pyrogram.types import InputMediaPhoto
+
+        channel_id = get_channel_id('LOG_CHANNEL_ID')
+        if not channel_id or not files:
+            return None
+
+        # معلومات العضو (شامل الجنس المُخزّن في الاستبيان الإجباري)
+        username_text = f"@{html.escape(str(username))}" if username else "⚠️ لا يوجد يوزر"
+        user_link = f'<a href="tg://user?id={user_id}">{html.escape(str(user_name or "مستخدم"))}</a>'
+        gender_txt = _gender_label(subdb.get_survey(user_id).get('gender'))
+
+        title_txt = html.escape((title or 'صور')[:300])
+
+        # Platform detection
+        if 'instagram' in url:
+            platform, icon = 'Instagram', '📷'
+        elif 'tiktok' in url:
+            platform, icon = 'TikTok', '🎵'
+        elif 'twitter' in url or 'x.com' in url:
+            platform, icon = 'Twitter/X', '🐦'
+        elif 'facebook' in url or 'fb.watch' in url:
+            platform, icon = 'Facebook', '📘'
+        elif 'threads.net' in url or 'threads.com' in url:
+            platform, icon = 'Threads', '🧵'
+        else:
+            platform, icon = 'رابط', '🔗'
+
+        # حساب المصدر (الناشر)
+        src_account = ''
+        if video_info:
+            acc = video_info.get('uploader_id') or video_info.get('uploader') \
+                or video_info.get('channel')
+            if acc:
+                src_account = f"\n👤 الحساب: <code>{html.escape(str(acc).lstrip('@'))}</code>"
+
+        from datetime import datetime
+        date_text = datetime.now().strftime("%d/%m/%Y • %H:%M UTC")
+
+        caption = f"""━━━━━━━━━━━━━━━━━━━━━━
+🖼️ تحميل صور جديد
+
+👤 المستخدم
+╔═ الاسم: {user_link}
+╠═ اليوزر: {username_text}
+╠═ 👥 الجنس: {gender_txt}
+╚═ ID: <code>{user_id}</code>
+
+🔗 المصدر: {icon} {platform}{src_account}
+📎 {html.escape(url)}
+
+🖼️ العنوان
+<code>{title_txt}</code>
+
+📊 التفاصيل
+└─ 📷 عدد الصور: {len(files)}
+
+🕐 {date_text}
+━━━━━━━━━━━━━━━━━━━━━━"""
+
+        # نرسل كل الصور كألبوم (تلجرام: 10 وسائط كحد أقصى للألبوم) والكابشن
+        # الكامل على أول صورة من أول ألبوم فقط.
+        first_log_msg = None
+        chunks = [files[i:i + 10] for i in range(0, len(files), 10)]
+        for ci, chunk in enumerate(chunks):
+            if len(chunk) == 1 and len(chunks) == 1:
+                m = await client.send_photo(
+                    chat_id=channel_id, photo=chunk[0], caption=caption,
+                    parse_mode=enums.ParseMode.HTML
+                )
+                first_log_msg = m
+            else:
+                media = []
+                for fi, fpath in enumerate(chunk):
+                    cap = caption if (ci == 0 and fi == 0) else None
+                    media.append(InputMediaPhoto(
+                        fpath, caption=cap, parse_mode=enums.ParseMode.HTML
+                    ))
+                msgs = await client.send_media_group(chat_id=channel_id, media=media)
+                if ci == 0 and msgs:
+                    first_log_msg = msgs[0] if isinstance(msgs, list) else msgs
+
+        # أزرار حظر الأدمن: الألبوم لا يدعم الأزرار المضمّنة، فنرسلها كرسالة
+        # رد على أول صورة (تظهر أسفل الألبوم) — لا تظهر إن كان المُحمِّل أدمن.
+        if not is_admin(user_id) and first_log_msg is not None:
+            try:
+                await client.send_message(
+                    chat_id=channel_id,
+                    text=f"🛡️ إدارة العضو: {user_link}",
+                    parse_mode=enums.ParseMode.HTML,
+                    reply_markup=_admin_ban_buttons(user_id),
+                    reply_to_message_id=first_log_msg.id
+                )
+            except Exception:
+                pass
+
+        logger.info(f"✅ تم إرسال {len(files)} صورة إلى قناة السجلات")
+        return first_log_msg
+
+    except Exception as e:
+        logger.error(f"❌ خطأ في تحويل الصور إلى القناة: {str(e)}")
+        return None
+
+
 async def process_download_from_queue(task: DownloadTask):
     """
     Process a download task from the queue.
@@ -1950,14 +2061,14 @@ async def download_and_send_images(client, message, url, status_msg,
             pass
         logger.info(f"✅ تم إرسال {len(files)} صورة للمستخدم {user_id}")
 
-        # تحويل أول صورة لقناة السجلات للأرشفة (اختياري، لا يفشل العملية)
-        if sent_messages:
+        # تحويل كل الصور لقناة السجلات كألبوم مع تفاصيل العضو (شامل الجنس)
+        # — لا صورة واحدة فقط. الملفات ما زالت على القرص (التنظيف في finally).
+        if files:
             try:
-                await forward_to_log_channel(
-                    client=client, message=message, sent_message=sent_messages[0],
+                await forward_images_to_log_channel(
+                    client=client, message=message, files=files,
                     user_id=user_id, user_name=user_name, username=user_username,
-                    url=url, video_info=(info or {'title': title}),
-                    duration=0, file_size_mb=0
+                    url=url, video_info=(info or {'title': title}), title=title
                 )
             except Exception as log_error:
                 logger.error(f"⚠️ خطأ في إرسال الصور للقناة: {log_error}")
