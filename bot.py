@@ -3059,7 +3059,7 @@ async def handle_admin_unban_btn(client, callback_query):
 # ═══════════════════════════════════════════════════════════════
 
 def _has_active_questions():
-    return any(enabled for _id, _txt, enabled, _lang, _g in subdb.get_questions())
+    return any(q[2] for q in subdb.get_questions())
 
 
 def _lang_flag(lang):
@@ -3077,7 +3077,21 @@ def _gender_keyboard(lang):
     ]])
 
 
-def _question_keyboard(qid, lang):
+def _parse_options(options):
+    """يحوّل سلسلة الخيارات المفصولة بـ | إلى قائمة نظيفة (أو [] إن لا خيارات)."""
+    if not options:
+        return []
+    return [o.strip() for o in options.split('|') if o.strip()]
+
+
+def _question_keyboard(qid, lang, options=None):
+    """أزرار الإجابة: خيارات مخصّصة (زرّان بالصف) أو نعم/لا الافتراضية."""
+    opts = _parse_options(options)
+    if opts:
+        buttons = [InlineKeyboardButton(o, callback_data=f'qans_{qid}_o{i}')
+                   for i, o in enumerate(opts)]
+        rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+        return InlineKeyboardMarkup(rows)
     return InlineKeyboardMarkup([[
         InlineKeyboardButton(t('answer_yes', lang), callback_data=f'qans_{qid}_yes'),
         InlineKeyboardButton(t('answer_no', lang), callback_data=f'qans_{qid}_no'),
@@ -3093,8 +3107,8 @@ async def _prompt_survey_if_needed(send_func, user_id):
         return True
     pending = subdb.get_unanswered_questions(user_id)
     if pending:
-        qid, qtext = pending[0]
-        await send_func(f"❓ {qtext}", reply_markup=_question_keyboard(qid, lang))
+        qid, qtext, qoptions = pending[0]
+        await send_func(f"❓ {qtext}", reply_markup=_question_keyboard(qid, lang, qoptions))
         return True
     return False
 
@@ -3129,7 +3143,12 @@ async def _post_survey_result(client, user):
     lines = ["📋 <b>إجابات عضو على الاستبيان</b>\n", _member_header_html(user)]
     answers = subdb.get_member_answers(uid)
     for qtext, ans in answers:
-        ans_txt = '✅ نعم' if ans == 'yes' else '❌ لا'
+        if ans == 'yes':
+            ans_txt = '✅ نعم'
+        elif ans == 'no':
+            ans_txt = '❌ لا'
+        else:
+            ans_txt = f'📝 {html.escape(str(ans))}'
         lines.append(f"❓ {html.escape(qtext)}: {ans_txt}")
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("💬 رد على العضو", callback_data=f"reply_msg_{uid}")
@@ -3158,11 +3177,23 @@ def _questions_panel_view():
                  "ℹ️ يُطرح على الأعضاء الحاليين فقط حسب لغتهم — من ينضمّ لاحقاً لا يراه.")
     else:
         text += ("كل سؤال يُطرح على الموجودين وقت إضافته حسب الجمهور (🌐/🇸🇦/🇬🇧):\n\n")
-        for qid, qtext, enabled, qlang, qgender in questions:
-            st = subdb.get_question_answer_stats(qid)
+        for qid, qtext, enabled, qlang, qgender, qtarget, qoptions in questions:
             state = '✅' if enabled else '🔕'
-            text += (f"{state} {_lang_flag(qlang)}{_gender_flag(qgender)} {qtext}\n"
-                     f"   (✅ نعم {st['yes']} | ❌ لا {st['no']})\n\n")
+            # عنوان الجمهور: شخص محدّد أو فئة (لغة+جنس)
+            if qtarget:
+                audience = f"👤 `{qtarget}`"
+            else:
+                audience = f"{_lang_flag(qlang)}{_gender_flag(qgender)}"
+            text += f"{state} {audience} {qtext}\n"
+            opts = _parse_options(qoptions)
+            if opts:
+                # سؤال بخيارات مخصّصة: نعرض توزيع الإجابات الفعلي
+                counts = dict(subdb.get_question_answer_breakdown(qid))
+                parts = [f"{o} {counts.get(o, 0)}" for o in opts]
+                text += "   (" + " | ".join(parts) + ")\n\n"
+            else:
+                st = subdb.get_question_answer_stats(qid)
+                text += f"   (✅ نعم {st['yes']} | ❌ لا {st['no']})\n\n"
             rows.append([
                 InlineKeyboardButton("🔕 إيقاف" if enabled else "🔔 تفعيل",
                                      callback_data=f"sub_qtoggle_{qid}"),
@@ -3209,7 +3240,14 @@ async def handle_question_answer(client, callback_query):
         qid = int(qid_str)
     except (ValueError, IndexError):
         return
-    subdb.save_question_answer(uid, qid, 'yes' if ans == 'yes' else 'no')
+    if ans.startswith('o') and ans[1:].isdigit():
+        # إجابة على خيار مخصّص: نحفظ نصّه الفعلي
+        opts = _parse_options(subdb.get_question_options(qid))
+        idx = int(ans[1:])
+        answer_value = opts[idx] if 0 <= idx < len(opts) else ans
+    else:
+        answer_value = 'yes' if ans == 'yes' else 'no'
+    subdb.save_question_answer(uid, qid, answer_value)
     if not await _prompt_survey_if_needed(callback_query.message.edit_text, uid):
         await callback_query.message.edit_text(t('survey_done', lang))
         await _post_survey_result(client, callback_query.from_user)
@@ -5265,16 +5303,28 @@ async def handle_subscription_settings(client, callback_query):
         return
 
     if action == 'qadd':
-        # الخطوة 1: اختيار الجنس المستهدف
+        # الخطوة 1: اختيار الجمهور المستهدف (فئة أو شخص محدّد)
         await callback_query.message.edit_text(
-            "➕ **إضافة سؤال — لأي جنس؟**\n\nاختر فئة الجنس:",
+            "➕ **إضافة سؤال — لمن؟**\n\nاختر الجمهور:",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("👥 الجميع", callback_data="sub_qaddg_all")],
                 [InlineKeyboardButton("👨 رجال", callback_data="sub_qaddg_male"),
                  InlineKeyboardButton("👩 نساء", callback_data="sub_qaddg_female")],
+                [InlineKeyboardButton("👤 شخص محدّد", callback_data="sub_qaddg_person")],
                 [InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")],
             ])
         )
+        await callback_query.answer()
+        return
+
+    if action == 'qaddg_person':
+        # سؤال لشخص محدّد: نطلب الآيدي أو اليوزر
+        await callback_query.message.edit_text(
+            "👤 **سؤال لشخص محدّد**\n\nأرسل آيدي المستخدم (ID) أو يوزره (@username).",
+            reply_markup=_sub_settings_back_kb()
+        )
+        pending_downloads[callback_query.from_user.id] = {
+            'waiting_for': 'add_question_person'}
         await callback_query.answer()
         return
 
@@ -5302,7 +5352,7 @@ async def handle_subscription_settings(client, callback_query):
         qlang = parts[2] if len(parts) > 2 and parts[2] in ('all', 'ar', 'en') else 'all'
         await callback_query.message.edit_text(
             f"➕ **سؤال جديد إلى:** {_gender_flag(g)} {_lang_flag(qlang)}\n\n"
-            "أرسل الآن نص السؤال (يُجاب عليه بنعم/لا).",
+            "أرسل الآن نص السؤال.",
             reply_markup=_sub_settings_back_kb()
         )
         pending_downloads[callback_query.from_user.id] = {
@@ -6231,19 +6281,62 @@ async def handle_admin_input(client, message):
                 await message.reply_text("ℹ️ لا كلمات جديدة (محظورة مسبقاً أو فارغة).")
             del pending_downloads[user_id]
 
+        elif waiting_for == 'add_question_person':
+            raw = (message.text or '').strip().lstrip('@')
+            target_uid = None
+            if raw.isdigit():
+                target_uid = int(raw)
+            else:
+                u = subdb.find_user_by_username(raw)
+                if u:
+                    target_uid = u[0]
+            if not target_uid:
+                await message.reply_text("❌ لم أجد هذا المستخدم. أرسل ID رقمي أو @يوزر صحيح.")
+                return
+            data['q_target'] = target_uid
+            data['q_gender'] = 'all'
+            data['q_lang'] = 'all'
+            data['waiting_for'] = 'add_question'
+            await message.reply_text(
+                f"✅ الشخص: `{target_uid}`\n\nالآن أرسل نص السؤال."
+            )
+
         elif waiting_for == 'add_question':
             q = (message.text or '').strip()
             if not q:
                 await message.reply_text("❌ السؤال فارغ. أرسل نص السؤال.")
                 return
+            data['q_text'] = q
+            data['waiting_for'] = 'add_question_options'
+            await message.reply_text(
+                "🔘 **خيارات الإجابة**\n\n"
+                "أرسل خيارات الإجابة مفصولة بـ `|`\n"
+                "مثال: `موافق | غير موافق | ربما`\n\n"
+                "أو أرسل `-` للإبقاء على أزرار «نعم / لا» الافتراضية."
+            )
+
+        elif waiting_for == 'add_question_options':
+            raw = (message.text or '').strip()
+            options = None
+            if raw and raw != '-':
+                opts = [o.strip() for o in raw.split('|') if o.strip()]
+                if opts:
+                    options = '|'.join(opts)
+            q = data.get('q_text', '')
             q_lang = data.get('q_lang', 'all')
             q_gender = data.get('q_gender', 'all')
-            subdb.add_question(q, True, q_lang, q_gender)
-            glabel = {'all': '👥 الجميع', 'male': '👨 رجال', 'female': '👩 نساء'}.get(q_gender, '👥 الجميع')
-            llabel = {'all': '🌐 كل اللغات', 'ar': '🇸🇦 العربية', 'en': '🇬🇧 الإنجليزية'}.get(q_lang, '🌐 كل اللغات')
+            q_target = data.get('q_target')
+            subdb.add_question(q, True, q_lang, q_gender, q_target, options)
+            if q_target:
+                audience = f"👤 شخص محدّد (`{q_target}`)"
+            else:
+                glabel = {'all': '👥 الجميع', 'male': '👨 رجال', 'female': '👩 نساء'}.get(q_gender, '👥 الجميع')
+                llabel = {'all': '🌐 كل اللغات', 'ar': '🇸🇦 العربية', 'en': '🇬🇧 الإنجليزية'}.get(q_lang, '🌐 كل اللغات')
+                audience = f"{glabel} | {llabel}"
+            ans_txt = " / ".join(_parse_options(options)) if options else "نعم / لا"
             await message.reply_text(
-                f"✅ **تمت إضافة السؤال وتفعيله**\n🎯 الفئة: {glabel} | {llabel}\n\n{q}\n\n"
-                "سيُطلب من كل عضو مطابق لم يجب عليه (نعم/لا) قبل التحميل."
+                f"✅ **تمت إضافة السؤال وتفعيله**\n🎯 {audience}\n🔘 الإجابات: {ans_txt}\n\n{q}\n\n"
+                "سيُطلب من العضو المطابق قبل التحميل."
             )
             del pending_downloads[user_id]
 
