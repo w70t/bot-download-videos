@@ -3291,7 +3291,7 @@ async def run_realusers_check(client, message):
 
     try:
         alive, removed, _ = await probe_and_cleanup_users(client, progress_cb=_progress)
-        _record_realcheck_time()
+        _record_realcheck(alive)
         net = joined - removed
         net_txt = f"+{net}" if net > 0 else str(net)
         await status.edit_text(
@@ -3812,7 +3812,7 @@ async def daily_cleanup_task():
             logger.info(f"🧹 بدء الفحص اليومي للأعضاء ({total_before})...")
 
             alive, removed, removed_ids = await probe_and_cleanup_users(app)
-            _record_realcheck_time()
+            _record_realcheck(alive)
 
             # صافي التغيّر خلال اليوم = الداخلون - الخارجون
             net = joined - removed
@@ -5030,12 +5030,25 @@ async def show_forced_sub_panel(client, callback_query):
     await callback_query.answer()
 
 
-def _record_realcheck_time():
-    """يحفظ وقت آخر فحص فعلي للأعضاء (لعرض حداثة الأرقام في اللوحة)."""
+def _record_realcheck(alive=None):
+    """يحفظ وقت آخر فحص فعلي + العدد الحقيقي الواصل (لعرضه في اللوحة).
+
+    alive: عدد الأعضاء الذين ردّوا على الفحص الصامت (العدد الحقيقي الفعلي)."""
     try:
         subdb.set_setting('last_realcheck_at', datetime.now().strftime('%Y-%m-%d %H:%M'))
+        if alive is not None:
+            subdb.set_setting('last_realcheck_alive', str(alive))
     except Exception:
         pass
+
+
+def _get_realcheck_alive():
+    """العدد الحقيقي الواصل من آخر فحص، أو None إن لم يُجرَ فحص بعد."""
+    try:
+        rv = subdb.get_setting('last_realcheck_alive', '') or ''
+        return int(rv) if rv else None
+    except Exception:
+        return None
 
 
 def _last_realcheck_line():
@@ -5066,6 +5079,13 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
     price_m = "مجاني" if _price_value(_pm) <= 0 else f"${_pm}"
     price_y = "مجاني" if _price_value(_py) <= 0 else f"${_py}"
     stats = subdb.get_user_stats()
+    # العدد الحقيقي من آخر فحص (يستبعد من حظر البوت/غير المتفاعلين). إن وُجد
+    # نعرضه كـ«المجموع»، وإلا نعرض عدد قاعدة البيانات.
+    real_alive = _get_realcheck_alive()
+    total_display = real_alive if real_alive is not None else stats['total']
+    free_display = max(0, total_display - stats['subscribed'])
+    db_note = (f"📦 في قاعدة البيانات: {stats['total']} (اضغط الفحص للتنظيف)\n"
+               if real_alive is not None and real_alive != stats['total'] else "")
     try:
         gs = subdb.get_gender_stats()
     except Exception:
@@ -5119,11 +5139,12 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
         f"🔞 **حظر المحتوى الإباحي:** {'مُفعّل ✅' if adult_on else 'متوقف ❌'}\n"
         f"⏯️ **التحميل للأعضاء:** {'يعمل ▶️' if dl_on else 'متوقف ⏸️'}\n\n"
         f"📊 **الأعضاء الحقيقيون:**\n"
-        f"• المجموع: {stats['total']} عضو\n"
+        f"• المجموع: {total_display} عضو{' ✅' if real_alive is not None else ''}\n"
         f"• المشتركون: {stats['subscribed']} 💎\n"
-        f"• العاديون: {stats['free']} 🆓\n"
+        f"• العاديون: {free_display} 🆓\n"
         f"• 👨 رجال: {gs['male']} | 👩 نساء: {gs['female']}\n"
         f"• 🇸🇦 عربي: {lc['ar']} | 🇬🇧 إنجليزي: {lc['en']}\n"
+        f"{db_note}"
         f"{_last_realcheck_line()}\n"
         f"💡 اضغط «👥 فحص العدد الحقيقي» لحذف من حظر البوت وتحديث الأرقام.\n\n"
         f"**اختر الإعداد:**"
