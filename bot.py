@@ -3098,6 +3098,45 @@ def _question_keyboard(qid, lang, options=None):
     ]])
 
 
+def _question_target_label(q_target, q_gender='all', q_lang='all'):
+    """وصف جمهور السؤال: شخص محدّد أو فئة (جنس + لغة)."""
+    if q_target:
+        return f"👤 شخص محدّد (`{q_target}`)"
+    glabel = {'all': '👥 الجميع', 'male': '👨 رجال', 'female': '👩 نساء'}.get(q_gender, '👥 الجميع')
+    llabel = {'all': '🌐 كل اللغات', 'ar': '🇸🇦 العربية', 'en': '🇬🇧 الإنجليزية'}.get(q_lang, '🌐 كل اللغات')
+    return f"{glabel} | {llabel}"
+
+
+def _question_preview_kb(options):
+    """لوحة معاينة الأزرار: أزرار الإجابة (كما ستظهر) + إرسال + رجوع."""
+    opts = _parse_options(options)
+    if opts:
+        buttons = [InlineKeyboardButton(o, callback_data='sub_qprev') for o in opts]
+    else:
+        buttons = [InlineKeyboardButton('نعم', callback_data='sub_qprev'),
+                   InlineKeyboardButton('لا', callback_data='sub_qprev')]
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    rows.append([InlineKeyboardButton('✅ إرسال وتفعيل', callback_data='sub_qsave')])
+    rows.append([InlineKeyboardButton('« رجوع', callback_data='sub_qcancel')])
+    return InlineKeyboardMarkup(rows)
+
+
+def _question_preview_text(data):
+    """نص رسالة المعاينة قبل تأكيد إضافة السؤال."""
+    audience = _question_target_label(
+        data.get('q_target'), data.get('q_gender', 'all'), data.get('q_lang', 'all'))
+    options = data.get('q_options')
+    ans_txt = " / ".join(_parse_options(options)) if options else "نعم / لا"
+    return (
+        "👁️ **معاينة السؤال**\n\n"
+        f"🎯 {audience}\n"
+        f"🔘 الإجابات: {ans_txt}\n\n"
+        f"❓ {data.get('q_text', '')}\n\n"
+        "هكذا ستظهر الأزرار للعضو 👇\n"
+        "اضغط **✅ إرسال وتفعيل** إن أعجبك، أو **« رجوع** للإلغاء."
+    )
+
+
 async def _prompt_survey_if_needed(send_func, user_id):
     """يعرض الخطوة الناقصة من البوابة: الجنس ثم الأسئلة.
     يرجع True إذا عُرضت خطوة (أي يجب إيقاف التحميل)، وإلا False (اكتملت البوابة)."""
@@ -5328,6 +5367,41 @@ async def handle_subscription_settings(client, callback_query):
         await callback_query.answer()
         return
 
+    if action == 'qprev':
+        # ضغط على زر معاينة (غير فعّال) — تنبيه فقط
+        await callback_query.answer("🔎 هذه معاينة — اضغط «✅ إرسال وتفعيل» للتأكيد", show_alert=True)
+        return
+
+    if action == 'qsave':
+        # تأكيد إضافة السؤال من شاشة المعاينة
+        pdata = pending_downloads.get(callback_query.from_user.id)
+        if not isinstance(pdata, dict) or pdata.get('waiting_for') != 'confirm_question':
+            await callback_query.answer("انتهت الجلسة، ابدأ الإضافة من جديد.", show_alert=True)
+            return
+        q = pdata.get('q_text', '')
+        q_lang = pdata.get('q_lang', 'all')
+        q_gender = pdata.get('q_gender', 'all')
+        q_target = pdata.get('q_target')
+        options = pdata.get('q_options')
+        subdb.add_question(q, True, q_lang, q_gender, q_target, options)
+        pending_downloads.pop(callback_query.from_user.id, None)
+        audience = _question_target_label(q_target, q_gender, q_lang)
+        ans_txt = " / ".join(_parse_options(options)) if options else "نعم / لا"
+        await callback_query.message.edit_text(
+            f"✅ **تمت إضافة السؤال وتفعيله**\n🎯 {audience}\n🔘 الإجابات: {ans_txt}\n\n"
+            f"❓ {q}\n\nسيُطلب من العضو المطابق قبل التحميل."
+        )
+        await callback_query.answer("✅ تم الإرسال")
+        return
+
+    if action == 'qcancel':
+        # إلغاء الإضافة والرجوع للوحة الأسئلة
+        pending_downloads.pop(callback_query.from_user.id, None)
+        text, kb = _questions_panel_view()
+        await callback_query.message.edit_text(text, reply_markup=kb)
+        await callback_query.answer("أُلغيت الإضافة")
+        return
+
     if action.startswith('qaddg_'):
         g = action.split('_', 1)[1]  # all/male/female
         if g not in ('all', 'male', 'female'):
@@ -6322,23 +6396,13 @@ async def handle_admin_input(client, message):
                 opts = [o.strip() for o in raw.split('|') if o.strip()]
                 if opts:
                     options = '|'.join(opts)
-            q = data.get('q_text', '')
-            q_lang = data.get('q_lang', 'all')
-            q_gender = data.get('q_gender', 'all')
-            q_target = data.get('q_target')
-            subdb.add_question(q, True, q_lang, q_gender, q_target, options)
-            if q_target:
-                audience = f"👤 شخص محدّد (`{q_target}`)"
-            else:
-                glabel = {'all': '👥 الجميع', 'male': '👨 رجال', 'female': '👩 نساء'}.get(q_gender, '👥 الجميع')
-                llabel = {'all': '🌐 كل اللغات', 'ar': '🇸🇦 العربية', 'en': '🇬🇧 الإنجليزية'}.get(q_lang, '🌐 كل اللغات')
-                audience = f"{glabel} | {llabel}"
-            ans_txt = " / ".join(_parse_options(options)) if options else "نعم / لا"
+            # نحفظ الخيارات ونعرض معاينة الأزرار قبل التأكيد النهائي
+            data['q_options'] = options
+            data['waiting_for'] = 'confirm_question'
             await message.reply_text(
-                f"✅ **تمت إضافة السؤال وتفعيله**\n🎯 {audience}\n🔘 الإجابات: {ans_txt}\n\n{q}\n\n"
-                "سيُطلب من العضو المطابق قبل التحميل."
+                _question_preview_text(data),
+                reply_markup=_question_preview_kb(options)
             )
-            del pending_downloads[user_id]
 
         elif waiting_for == 'punish_user_id':
             raw = (message.text or '').strip().lstrip('@')
