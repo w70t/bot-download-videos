@@ -423,6 +423,17 @@ def get_user_stats():
         'free': free_users
     }
 
+def count_new_users(hours=24):
+    """عدد المستخدمين الجدد الذين دخلوا البوت خلال آخر (hours) ساعة."""
+    with db_cursor() as cursor:
+        cursor.execute(
+            "SELECT COUNT(*) FROM users WHERE created_at >= NOW() - (%s * INTERVAL '1 hour')",
+            (hours,)
+        )
+        row = cursor.fetchone()
+    return row[0] if row else 0
+
+
 def get_all_users():
     """الحصول على قائمة جميع المستخدمين"""
     with db_cursor() as cursor:

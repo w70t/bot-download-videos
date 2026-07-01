@@ -3257,6 +3257,36 @@ async def cmd_dlstats(client, message):
     )
 
 
+@app.on_message(filters.command("realusers"))
+async def cmd_realusers(client, message):
+    """فحص فوري للأعضاء: يحذف من حظر البوت ويعرض العدد الحقيقي + الداخلين اليوم.
+    للأدمن فقط (نفس فحص الـ3 فجراً لكن عند الطلب)."""
+    if not is_admin(message.from_user.id):
+        return
+    status = await message.reply_text("🔍 جارٍ فحص الأعضاء الفعليين… قد يستغرق دقائق حسب العدد.")
+    try:
+        total_before = len(subdb.get_all_users())
+        try:
+            joined = subdb.count_new_users(24)
+        except Exception:
+            joined = 0
+        alive, removed, _ = await probe_and_cleanup_users(client)
+        net = joined - removed
+        net_txt = f"+{net}" if net > 0 else str(net)
+        await status.edit_text(
+            "📊 **فحص فوري للأعضاء**\n\n"
+            f"🟢 دخلوا اليوم (آخر 24 ساعة): **{joined}**\n"
+            f"🔴 خرجوا/حظروا (حُذفوا الآن): **{removed}**\n"
+            f"⚖️ صافي التغيّر: **{net_txt}**\n\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"👥 قبل الفحص: **{total_before}**\n"
+            f"✅ العدد الحقيقي الآن: **{alive}**"
+        )
+    except Exception as e:
+        logger.error(f"❌ خطأ في /realusers: {e}")
+        await status.edit_text(f"❌ تعذّر إكمال الفحص: {str(e)[:100]}")
+
+
 @app.on_message(filters.command("blockacc"))
 async def cmd_blockacc(client, message):
     """حظر حساب (X/تويتر أو غيره) ليُرفض كل محتواه. للأدمن فقط."""
@@ -3731,19 +3761,30 @@ async def daily_cleanup_task():
         try:
             admin_id = int(os.getenv("ADMIN_ID"))
             total_before = len(subdb.get_all_users())
+            # الداخلون الجدد خلال آخر 24 ساعة (قبل حذف الغائبين)
+            try:
+                joined = subdb.count_new_users(24)
+            except Exception:
+                joined = 0
             logger.info(f"🧹 بدء الفحص اليومي للأعضاء ({total_before})...")
 
             alive, removed, removed_ids = await probe_and_cleanup_users(app)
 
+            # صافي التغيّر خلال اليوم = الداخلون - الخارجون
+            net = joined - removed
+            net_txt = f"+{net}" if net > 0 else str(net)
+
             await app.send_message(
                 admin_id,
-                "🧹 **الفحص اليومي للأعضاء (3 فجراً)**\n\n"
+                "📊 **التقرير اليومي للأعضاء (3 فجراً)**\n\n"
+                f"🟢 دخلوا اليوم (آخر 24 ساعة): **{joined}**\n"
+                f"🔴 خرجوا/حظروا: **{removed}**\n"
+                f"⚖️ صافي التغيّر: **{net_txt}**\n\n"
+                "━━━━━━━━━━━━━━━━━━\n"
                 f"👥 قبل الفحص: **{total_before}**\n"
-                f"✅ موجودون فعلاً: **{alive}**\n"
-                f"🗑️ حُذفوا (غادروا/حظروا): **{removed}**\n"
-                f"📊 العدد الحقيقي الآن: **{alive}**"
+                f"✅ العدد الحقيقي الآن: **{alive}**"
             )
-            logger.info(f"🧹 انتهى الفحص: {alive} موجود، {removed} محذوف")
+            logger.info(f"🧹 انتهى الفحص: دخل {joined}، خرج {removed}، الحقيقي {alive}")
         except Exception as e:
             logger.error(f"❌ خطأ في الفحص اليومي: {e}")
 
