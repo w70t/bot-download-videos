@@ -3291,6 +3291,7 @@ async def run_realusers_check(client, message):
 
     try:
         alive, removed, _ = await probe_and_cleanup_users(client, progress_cb=_progress)
+        _record_realcheck_time()
         net = joined - removed
         net_txt = f"+{net}" if net > 0 else str(net)
         await status.edit_text(
@@ -3811,6 +3812,7 @@ async def daily_cleanup_task():
             logger.info(f"🧹 بدء الفحص اليومي للأعضاء ({total_before})...")
 
             alive, removed, removed_ids = await probe_and_cleanup_users(app)
+            _record_realcheck_time()
 
             # صافي التغيّر خلال اليوم = الداخلون - الخارجون
             net = joined - removed
@@ -5028,6 +5030,23 @@ async def show_forced_sub_panel(client, callback_query):
     await callback_query.answer()
 
 
+def _record_realcheck_time():
+    """يحفظ وقت آخر فحص فعلي للأعضاء (لعرض حداثة الأرقام في اللوحة)."""
+    try:
+        subdb.set_setting('last_realcheck_at', datetime.now().strftime('%Y-%m-%d %H:%M'))
+    except Exception:
+        pass
+
+
+def _last_realcheck_line():
+    """سطر يوضّح متى جرى آخر فحص فعلي (حذف من حظر البوت)."""
+    try:
+        ts = subdb.get_setting('last_realcheck_at', '') or ''
+    except Exception:
+        ts = ''
+    return f"🕐 آخر فحص فعلي: {ts}" if ts else "🕐 لم يُجرَ فحص فعلي بعد"
+
+
 async def subscription_settings_panel(client, message, user_id=None, edit=False):
     """لوحة إعدادات الاشتراك للأدمن.
 
@@ -5075,6 +5094,7 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
         [InlineKeyboardButton("📋 القائمة المحظورة", callback_data="sub_list_blocked"),
          InlineKeyboardButton("❓ سؤال للأعضاء", callback_data="sub_member_question")],
         # — الأعضاء —
+        [InlineKeyboardButton("👥 فحص العدد الحقيقي", callback_data="sub_realcheck")],
         [InlineKeyboardButton("👥 المشتركون", callback_data="sub_view_subscribers"),
          InlineKeyboardButton("📊 آخر 50 عضو", callback_data="sub_recent_users")],
         [InlineKeyboardButton("📊 إحصائيات الأعضاء", callback_data="sub_member_stats"),
@@ -5098,12 +5118,14 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
         f"📅 **المدد:** شهري 30 يوم | سنوي 365 يوم\n"
         f"🔞 **حظر المحتوى الإباحي:** {'مُفعّل ✅' if adult_on else 'متوقف ❌'}\n"
         f"⏯️ **التحميل للأعضاء:** {'يعمل ▶️' if dl_on else 'متوقف ⏸️'}\n\n"
-        f"📊 **الإحصائيات:**\n"
+        f"📊 **الأعضاء الحقيقيون:**\n"
         f"• المجموع: {stats['total']} عضو\n"
         f"• المشتركون: {stats['subscribed']} 💎\n"
         f"• العاديون: {stats['free']} 🆓\n"
         f"• 👨 رجال: {gs['male']} | 👩 نساء: {gs['female']}\n"
-        f"• 🇸🇦 عربي: {lc['ar']} | 🇬🇧 إنجليزي: {lc['en']}\n\n"
+        f"• 🇸🇦 عربي: {lc['ar']} | 🇬🇧 إنجليزي: {lc['en']}\n"
+        f"{_last_realcheck_line()}\n"
+        f"💡 اضغط «👥 فحص العدد الحقيقي» لحذف من حظر البوت وتحديث الأرقام.\n\n"
         f"**اختر الإعداد:**"
     )
 
@@ -5121,6 +5143,19 @@ async def handle_subscription_settings(client, callback_query):
         return
     
     action = callback_query.data[len('sub_'):]  # إزالة البادئة فقط (لا كل التكرارات)
+
+    if action == 'realcheck':
+        # فحص فوري (بعدّاد حيّ) يحذف من حظر البوت، ثم نحدّث اللوحة بالأرقام الحقيقية
+        await callback_query.answer("🔍 بدأ الفحص… تابع العدّاد في الأسفل")
+        await run_realusers_check(client, callback_query.message)
+        try:
+            await subscription_settings_panel(
+                client, callback_query.message,
+                user_id=callback_query.from_user.id, edit=True
+            )
+        except Exception:
+            pass
+        return
 
     if action == 'toggle_downloads':
         new_state = '0' if downloads_enabled() else '1'
