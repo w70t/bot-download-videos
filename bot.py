@@ -2967,7 +2967,17 @@ async def run_ytdlp_update(client, message):
                                text=True, timeout=600)
         return r
 
-    old_v = getattr(getattr(yt_dlp, 'version', None), '__version__', '؟')
+    def _pip_version():
+        r = _pip('show', 'yt-dlp')
+        for line in (r.stdout or '').splitlines():
+            if line.startswith('Version:'):
+                return line.split(':', 1)[1].strip()
+        return None
+
+    # المقارنة قبل/بعد من pip نفسه — مقارنة إصدار الوحدة المحمّلة بإصدار pip
+    # تعطي فرقاً وهمياً لأن pip يوحّد الصيغة (2026.06.30 → 2026.6.30.dev0)
+    old_v = await loop.run_in_executor(None, _pip_version) \
+        or getattr(getattr(yt_dlp, 'version', None), '__version__', '؟')
     try:
         r = await loop.run_in_executor(None, lambda: _pip('install', '-U', 'yt-dlp'))
     except Exception as e:
@@ -2977,13 +2987,7 @@ async def run_ytdlp_update(client, message):
         await status.edit_text(f"❌ **فشل التحديث:**\n`{(r.stdout or '')[-500:]}`")
         return
 
-    # الإصدار الجديد يُقرأ من pip لأن العملية الحالية ما زالت على القديم
-    show = await loop.run_in_executor(None, lambda: _pip('show', 'yt-dlp'))
-    new_v = old_v
-    for line in (show.stdout or '').splitlines():
-        if line.startswith('Version:'):
-            new_v = line.split(':', 1)[1].strip()
-            break
+    new_v = await loop.run_in_executor(None, _pip_version) or old_v
 
     if new_v == old_v:
         await status.edit_text(
