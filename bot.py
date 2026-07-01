@@ -211,6 +211,59 @@ def extract_first_url(text: str):
     return url or None
 
 
+def resolve_snapchat_spotlight(url: str, timeout: int = 20) -> str:
+    """يجلب صفحة سناب سبوت لايت ويستخرج رابط الفيديو الخام المباشر (أنظف نسخة
+    متاحة، غالباً بلا لوقو لأن اللوقو طبقة واجهة لا جزء من الملف) من وسم
+    og:video أو من رابط CDN داخل الصفحة، فيُحمّل مباشرة بدل مسار سناب الضعيف
+    في yt-dlp. يعمل للسبوت لايت العام فقط؛ عند أي فشل يعيد الرابط الأصلي."""
+    low = (url or '').lower()
+    if 'snapchat.com' not in low or 'spotlight' not in low:
+        return url
+    import urllib.request
+    from http.cookiejar import MozillaCookieJar
+    try:
+        cj = MozillaCookieJar()
+        cookie_file = get_cookie_file_for_url(url)
+        if cookie_file and os.path.exists(cookie_file):
+            try:
+                cj.load(cookie_file, ignore_discard=True, ignore_expires=True)
+            except Exception:
+                pass
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+        opener.addheaders = [
+            ('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                           'AppleWebKit/537.36 (KHTML, like Gecko) '
+                           'Chrome/120.0.0.0 Safari/537.36'),
+            ('Accept-Language', 'en-US,en;q=0.9'),
+        ]
+        with opener.open(url, timeout=timeout) as resp:
+            html_text = resp.read(1500000).decode('utf-8', 'ignore')
+
+        # 1) og:video — الأنسب لأن معاينات الروابط تعتمد عليه فيبقى مستقراً
+        for pat in (
+            r'property=["\']og:video(?::secure_url)?["\'][^>]*content=["\']([^"\']+\.mp4[^"\']*)["\']',
+            r'content=["\']([^"\']+\.mp4[^"\']*)["\'][^>]*property=["\']og:video',
+        ):
+            m = re.search(pat, html_text)
+            if m:
+                cand = m.group(1).replace('&amp;', '&')
+                if is_safe_url(cand):
+                    logger.info(f"🎯 سناب سبوت لايت (og:video): {cand[:90]}")
+                    return cand
+
+        # 2) أي رابط فيديو خام من CDN سناب داخل JSON المضمّن (قد تكون الشرطات
+        #    مهرّبة \/ لذا نطابق حتى علامة الاقتباس ثم نفكّ التهريب)
+        m = re.search(r'"(https:[^"]*sc-cdn\.net[^"]*\.mp4[^"]*)"', html_text)
+        if m:
+            cand = m.group(1).replace('\\/', '/').replace('&amp;', '&')
+            if is_safe_url(cand):
+                logger.info(f"🎯 سناب سبوت لايت (cdn): {cand[:90]}")
+                return cand
+    except Exception as e:
+        logger.warning(f"⚠️ تعذّر استخراج سناب سبوت لايت ({url[:60]}): {e}")
+    return url
+
+
 # Initialize Queue Manager
 queue_manager = DownloadQueueManager(cooldown_seconds=10)
 
@@ -3954,6 +4007,14 @@ async def handle_url(client, message):
         logger.warning(f"🚫 Blocked unsafe/internal URL from user {user_id}: {url[:100]}")
         await message.reply_text(t('invalid_url', lang))
         return
+
+    # 🎯 سناب سبوت لايت: استخرج الفيديو الخام (أنظف نسخة، غالباً بلا لوقو) قبل
+    #    التحميل. طلب شبكي متزامن فيُنفَّذ خارج حلقة الأحداث. عند الفشل يبقى الرابط.
+    if 'snapchat.com' in url.lower() and 'spotlight' in url.lower():
+        _resolved = await asyncio.get_event_loop().run_in_executor(
+            None, resolve_snapchat_spotlight, url)
+        if _resolved and _resolved != url:
+            url = _resolved
 
     # 📢 الاشتراك الإجباري بالقنوات قبل أي تحميل (تحقق حقيقي)
     if await enforce_forced_subscription(client, message, user_id, lang):
