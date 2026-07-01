@@ -3257,24 +3257,44 @@ async def cmd_dlstats(client, message):
     )
 
 
-@app.on_message(filters.command("realusers"))
-async def cmd_realusers(client, message):
-    """فحص فوري للأعضاء: يحذف من حظر البوت ويعرض العدد الحقيقي + الداخلين اليوم.
-    للأدمن فقط (نفس فحص الـ3 فجراً لكن عند الطلب)."""
-    if not is_admin(message.from_user.id):
-        return
-    status = await message.reply_text("🔍 جارٍ فحص الأعضاء الفعليين… قد يستغرق دقائق حسب العدد.")
+async def run_realusers_check(client, message):
+    """فحص فوري للأعضاء مع عدّاد حيّ: يحذف من حظر البوت ويعرض العدد الحقيقي
+    والداخلين اليوم. مشترك بين أمر /realusers وزر '👥 الأعضاء الحقيقيون'."""
+    total_before = len(subdb.get_all_users())
     try:
-        total_before = len(subdb.get_all_users())
+        joined = subdb.count_new_users(24)
+    except Exception:
+        joined = 0
+
+    status = await message.reply_text(
+        f"🔍 **جارٍ فحص الأعضاء…**\n\n👥 الإجمالي: {total_before}\n⏳ التقدّم: 0/{total_before}"
+    )
+
+    # خنق سرعة تعديل العدّاد زمنياً (تفادي حدود تلجرام) — تعديل كل ~3 ثوانٍ
+    last_edit = {'t': 0.0}
+
+    async def _progress(done, total, alive, removed):
+        now = time.monotonic()
+        if now - last_edit['t'] < 3.0:
+            return
+        last_edit['t'] = now
+        pct = int(done * 100 / total) if total else 0
         try:
-            joined = subdb.count_new_users(24)
+            await status.edit_text(
+                "🔍 **جارٍ فحص الأعضاء…**\n\n"
+                f"⏳ التقدّم: **{done}/{total}** ({pct}%)\n"
+                f"✅ موجودون: **{alive}**\n"
+                f"🔴 خرجوا/حظروا: **{removed}**"
+            )
         except Exception:
-            joined = 0
-        alive, removed, _ = await probe_and_cleanup_users(client)
+            pass
+
+    try:
+        alive, removed, _ = await probe_and_cleanup_users(client, progress_cb=_progress)
         net = joined - removed
         net_txt = f"+{net}" if net > 0 else str(net)
         await status.edit_text(
-            "📊 **فحص فوري للأعضاء**\n\n"
+            "📊 **فحص فوري للأعضاء (اكتمل)**\n\n"
             f"🟢 دخلوا اليوم (آخر 24 ساعة): **{joined}**\n"
             f"🔴 خرجوا/حظروا (حُذفوا الآن): **{removed}**\n"
             f"⚖️ صافي التغيّر: **{net_txt}**\n\n"
@@ -3283,8 +3303,16 @@ async def cmd_realusers(client, message):
             f"✅ العدد الحقيقي الآن: **{alive}**"
         )
     except Exception as e:
-        logger.error(f"❌ خطأ في /realusers: {e}")
+        logger.error(f"❌ خطأ في فحص الأعضاء: {e}")
         await status.edit_text(f"❌ تعذّر إكمال الفحص: {str(e)[:100]}")
+
+
+@app.on_message(filters.command("realusers"))
+async def cmd_realusers(client, message):
+    """فحص فوري للأعضاء (أمر). للأدمن فقط — نفس فحص الـ3 فجراً لكن عند الطلب."""
+    if not is_admin(message.from_user.id):
+        return
+    await run_realusers_check(client, message)
 
 
 @app.on_message(filters.command("blockacc"))
@@ -3408,7 +3436,7 @@ async def start(client, message):
         keyboard = ReplyKeyboardMarkup([
             [KeyboardButton(t('btn_cookies', lang)), KeyboardButton(t('btn_daily_report', lang))],
             [KeyboardButton(t('btn_errors', lang)), KeyboardButton(t('btn_subscription', lang))],
-            [KeyboardButton(t('btn_change_language', lang))]
+            [KeyboardButton(t('btn_real_users', lang)), KeyboardButton(t('btn_change_language', lang))]
         ], resize_keyboard=True)
     else:
         # للمستخدمين العاديين - التحقق من الاشتراك
@@ -3442,25 +3470,28 @@ async def start(client, message):
 
 
 # معالج الأزرار السريعة
-@app.on_message(filters.text & filters.regex(r'^(🍪 Cookies|📊 التقرير اليومي|🔔 الأخطاء|💎 إعدادات الاشتراك|📁 نسخ احتياطي)$'))
+@app.on_message(filters.text & filters.regex(r'^(🍪 Cookies|📊 التقرير اليومي|📊 Daily Report|👥 الأعضاء الحقيقيون|👥 Real Users|🔔 الأخطاء|🔔 Errors|💎 إعدادات الاشتراك|💎 Subscription Settings|📁 نسخ احتياطي)$'))
 async def handle_quick_buttons(client, message):
     """معالج الأزرار السريعة"""
     if not message.from_user:
         return
     user_id = message.from_user.id
-    
+
     if not is_admin(user_id):
         return
-    
-    if message.text == "🍪 Cookies":
+
+    txt = message.text
+    if txt == "🍪 Cookies":
         await cookies_panel(client, message)
-    elif message.text == "📊 التقرير اليومي":
+    elif txt in ("📊 التقرير اليومي", "📊 Daily Report"):
         await send_daily_report(client, message.from_user.id)
-    elif message.text == "🔔 الأخطاء":
+    elif txt in ("👥 الأعضاء الحقيقيون", "👥 Real Users"):
+        await run_realusers_check(client, message)
+    elif txt in ("🔔 الأخطاء", "🔔 Errors"):
         await show_errors(client, message)
-    elif message.text == "💎 إعدادات الاشتراك":
+    elif txt in ("💎 إعدادات الاشتراك", "💎 Subscription Settings"):
         await subscription_settings_panel(client, message)
-    elif message.text == "📁 نسخ احتياطي":
+    elif txt == "📁 نسخ احتياطي":
         await send_database_backup(client, message)
 
 
@@ -3708,19 +3739,23 @@ async def daily_report_task():
         await asyncio.sleep(86400)
 
 
-async def probe_and_cleanup_users(client):
+async def probe_and_cleanup_users(client, progress_cb=None):
     """فحص صامت لكل الأعضاء لمعرفة من بقي ومن غادر، وحذف الغائبين.
 
     يستخدم send_chat_action (مؤشر "يكتب…") وهو فحص صامت تماماً لا يرى العضو
     أي رسالة. إن نجح فالعضو موجود، وإن فشل بخطأ "غادر" نحذفه من قاعدة البيانات.
     يُعيد (alive, removed, removed_ids).
+
+    progress_cb (اختياري): دالة async تُستدعى دورياً بـ (done, total, alive,
+    removed) لعرض عدّاد حيّ. تُستدعى كل 20 عضواً (وعند النهاية).
     """
     users = subdb.get_all_users()
+    total = len(users)
     alive = 0
     removed = 0
     removed_ids = []
 
-    for u in users:
+    for idx, u in enumerate(users, 1):
         uid = u[0]
         try:
             # فحص صامت: مؤشر كتابة يختفي فوراً ولا يُرسل رسالة مرئية
@@ -3742,6 +3777,13 @@ async def probe_and_cleanup_users(client):
         except Exception as e:
             # خطأ مؤقت/غير معروف → نُبقي العضو احتياطاً
             logger.warning(f"فحص العضو {uid} أعطى خطأً غير حاسم: {e}")
+
+        # عدّاد حيّ كل 20 عضواً (والدالة نفسها تخنق سرعة التعديل زمنياً)
+        if progress_cb and (idx % 20 == 0):
+            try:
+                await progress_cb(idx, total, alive, removed)
+            except Exception:
+                pass
 
     return alive, removed, removed_ids
 
@@ -6048,7 +6090,7 @@ async def handle_set_daily_limit(client, callback_query):
 
 
 
-@app.on_message(filters.text & ~filters.regex(r'https?://') & ~filters.regex(r'^(🍪|📊|🔔|💎|/)'))
+@app.on_message(filters.text & ~filters.regex(r'https?://') & ~filters.regex(r'^(🍪|📊|🔔|💎|👥|/)'))
 async def handle_admin_input(client, message):
     """معالج إدخالات الأدمن للإعدادات"""
     # رسائل القنوات أو المجهولة ليس لها from_user
