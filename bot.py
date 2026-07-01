@@ -215,9 +215,10 @@ def resolve_snapchat_spotlight(url: str, timeout: int = 20) -> str:
     """يجلب صفحة سناب سبوت لايت ويستخرج رابط الفيديو الخام المباشر (أنظف نسخة
     متاحة، غالباً بلا لوقو لأن اللوقو طبقة واجهة لا جزء من الملف) من وسم
     og:video أو من رابط CDN داخل الصفحة، فيُحمّل مباشرة بدل مسار سناب الضعيف
-    في yt-dlp. يعمل للسبوت لايت العام فقط؛ عند أي فشل يعيد الرابط الأصلي."""
+    في yt-dlp. يعمل للسبوت لايت العام فقط؛ عند أي فشل يعيد الرابط الأصلي.
+    يقبل روابط المشاركة snapchat.com/t/... (يتبع التوجيه للصفحة الحقيقية)."""
     low = (url or '').lower()
-    if 'snapchat.com' not in low or 'spotlight' not in low:
+    if 'snapchat.com' not in low:
         return url
     import urllib.request
     from http.cookiejar import MozillaCookieJar
@@ -312,7 +313,9 @@ PLATFORM_URL_MARKERS = {
     'facebook': ['facebook.', 'fb.watch', 'fb.com'],
     'instagram': ['instagram.', 'instagr.am'],
     'threads': ['threads.net', 'threads.com'],
-    'twitter': ['twitter.', 'x.com', 't.co'],
+    # ملاحظة: 't.co/' بشرطة لتفادي مطابقة "snapcha[t.co]m" الخاطئة، و'//x.com'
+    # لتفادي مطابقة نطاقات تنتهي بـ x.com (مثل netflix.com).
+    'twitter': ['twitter.', '//x.com', 't.co/'],
     'reddit': ['reddit.', 'redd.it'],
     'snapchat': ['snapchat.'],
     'pinterest': ['pinterest.', 'pin.it'],
@@ -4010,7 +4013,7 @@ async def handle_url(client, message):
 
     # 🎯 سناب سبوت لايت: استخرج الفيديو الخام (أنظف نسخة، غالباً بلا لوقو) قبل
     #    التحميل. طلب شبكي متزامن فيُنفَّذ خارج حلقة الأحداث. عند الفشل يبقى الرابط.
-    if 'snapchat.com' in url.lower() and 'spotlight' in url.lower():
+    if 'snapchat.com' in url.lower():
         _resolved = await asyncio.get_event_loop().run_in_executor(
             None, resolve_snapchat_spotlight, url)
         if _resolved and _resolved != url:
