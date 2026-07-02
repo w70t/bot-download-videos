@@ -1,12 +1,13 @@
 #!/bin/bash
 # =============================================================
-# تحديث yt-dlp تلقائياً (يُشغَّل من cron)
+# تحديث مكتبات التحميل تلقائياً: yt-dlp + gallery-dl + curl_cffi
+# (يُشغَّل من cron)
 # - يكتشف بيئة بايثون التي يعمل بها البوت فعلياً (من العملية الحيّة عبر
 #   systemd) فيحدّث المكان الصحيح سواء كان venv أو بايثون النظام
 # - يتجاوز منع Debian لتحديث بايثون النظام (PEP 668) عند الحاجة لأن
 #   المستهدفة هي بيئة تشغيل البوت الفعلية نفسها
-# - يعيد تشغيل البوت فقط إذا تغيّر الإصدار (لا يقطع تحميلات جارية بلا داعٍ)
-# - يرسل إشعار تلجرام للأدمن بالنتيجة (نجاح/فشل)
+# - يعيد تشغيل البوت فقط إذا تغيّر إصدار مكتبة (لا يقطع تحميلات جارية بلا داعٍ)
+# - يرسل إشعار تلجرام للأدمن بالنتيجة (نجاح/فشل) مع قائمة ما تغيّر
 #
 # الاستخدام في جدولة root (مثال كل 6 ساعات):
 #   0 */6 * * * /home/<user>/bot7/update_ytdlp.sh >> /home/<user>/bot7/ytdlp_update.log 2>&1
@@ -14,6 +15,7 @@
 # متغيرات اختيارية (تُضبط قبل السطر في cron أو تُصدَّر):
 #   BOT_SERVICE=bot7        اسم خدمة systemd (الافتراضي bot7)
 #   NOTIFY_NO_CHANGE=1      أرسل إشعاراً حتى عند عدم وجود تحديث (الافتراضي 0 = صامت)
+#   PKGS="yt-dlp ..."       قائمة الحزم (الافتراضي yt-dlp gallery-dl curl_cffi)
 # =============================================================
 set -u
 
@@ -62,40 +64,53 @@ run_py() {
     fi
 }
 
-ver() { run_py -m pip show yt-dlp 2>/dev/null | awk '/^Version:/{print $2}'; }
+PKGS="${PKGS:-yt-dlp gallery-dl curl_cffi}"
+
+ver() { run_py -m pip show "$1" 2>/dev/null | awk '/^Version:/{print $2}'; }
 
 pip_upgrade() {
-    OUT="$(run_py -m pip install -U yt-dlp 2>&1)" && return 0
+    # shellcheck disable=SC2086
+    OUT="$(run_py -m pip install -U $PKGS 2>&1)" && return 0
     # بايثون النظام في Debian يمنع pip افتراضياً (PEP 668) — تجاوز المنع
     if echo "$OUT" | grep -q 'externally-managed-environment'; then
-        OUT="$(run_py -m pip install -U yt-dlp --break-system-packages 2>&1)" && return 0
+        # shellcheck disable=SC2086
+        OUT="$(run_py -m pip install -U $PKGS --break-system-packages 2>&1)" && return 0
     fi
     return 1
 }
 
-echo "===== $(date '+%F %T') فحص تحديث yt-dlp (python: $PY, user: $RUN_USER) ====="
-OLD="$(ver)"
+echo "===== $(date '+%F %T') فحص تحديث المكتبات [$PKGS] (python: $PY, user: $RUN_USER) ====="
+declare -A OLDV
+for p in $PKGS; do OLDV[$p]="$(ver "$p")"; done
 
 if pip_upgrade; then
-    NEW="$(ver)"
-    if [ -n "$NEW" ] && [ "$OLD" != "$NEW" ]; then
-        echo "تم التحديث: ${OLD:-?} -> ${NEW} — إعادة تشغيل ${SERVICE}"
+    CHANGES=""
+    for p in $PKGS; do
+        NEWP="$(ver "$p")"
+        if [ -n "$NEWP" ] && [ "${OLDV[$p]}" != "$NEWP" ]; then
+            CHANGES="${CHANGES}${p}: ${OLDV[$p]:-?} ← ${NEWP}
+"
+        fi
+    done
+    if [ -n "$CHANGES" ]; then
+        echo "تم التحديث — إعادة تشغيل ${SERVICE}:"
+        echo "$CHANGES"
         if systemctl restart "$SERVICE"; then
-            notify "✅ تحديث تلقائي: yt-dlp
-${OLD:-?} ← ${NEW}
-♻️ تمت إعادة تشغيل البوت بنجاح"
+            notify "✅ تحديث تلقائي للمكتبات:
+${CHANGES}♻️ تمت إعادة تشغيل البوت بنجاح"
         else
-            notify "⚠️ تحدّث yt-dlp إلى ${NEW} لكن فشلت إعادة تشغيل ${SERVICE} — افحص الخادم!"
+            notify "⚠️ تحدّثت المكتبات لكن فشلت إعادة تشغيل ${SERVICE} — افحص الخادم!
+${CHANGES}"
         fi
     else
-        echo "لا جديد (الإصدار ${OLD:-?})"
+        echo "لا جديد (yt-dlp ${OLDV[yt-dlp]:-?})"
         if [ "$NOTIFY_NO_CHANGE" = "1" ]; then
-            notify "ℹ️ فحص تحديث yt-dlp: لا جديد (الإصدار ${OLD:-?})"
+            notify "ℹ️ فحص تحديث المكتبات: لا جديد (yt-dlp ${OLDV[yt-dlp]:-?})"
         fi
     fi
 else
     echo "فشل التحديث:"
     echo "$OUT" | tail -5
-    notify "❌ فشل التحديث التلقائي لـ yt-dlp:
+    notify "❌ فشل التحديث التلقائي للمكتبات:
 $(echo "$OUT" | tail -3)"
 fi
