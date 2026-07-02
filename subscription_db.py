@@ -707,12 +707,14 @@ def bump_cache_hit(url_key: str, quality: str):
 
 
 def delete_cached_media(url_key: str, quality: str):
-    """يحذف صف كاش (يُستخدم عند فشل المعرّف القديم)."""
+    """يحذف صف كاش (يُستخدم عند فشل المعرّف القديم أو مسح محتوى خاطئ).
+    يرجع True إذا حُذف صف فعلاً."""
     with db_cursor(commit=True) as cursor:
         cursor.execute(
             'DELETE FROM media_cache WHERE url_key = %s AND quality = %s',
             (url_key, quality)
         )
+        return cursor.rowcount > 0
 
 
 def get_cache_stats():
