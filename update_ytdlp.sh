@@ -27,16 +27,26 @@ SERVICE="${BOT_SERVICE:-bot7}"
 NOTIFY_NO_CHANGE="${NOTIFY_NO_CHANGE:-0}"
 
 # بيئة بايثون الفعلية للبوت: من العملية الحيّة أولاً، وإلا venv المشروع، وإلا python3
+# مهم: نقرأ المسار من cmdline (وليس /proc/PID/exe) لأن python داخل venv مجرد
+# رابط رمزي لبايثون النظام — تتبّع الرابط يفقد سياق الـvenv فنحدّث بيئة خاطئة.
 MAIN_PID="$(systemctl show -p MainPID --value "$SERVICE" 2>/dev/null | tr -d ' ')"
 MAIN_PID="${MAIN_PID:-0}"
-if [ "$MAIN_PID" != "0" ] && [ -n "$MAIN_PID" ] && [ -e "/proc/$MAIN_PID/exe" ]; then
-    PY="$(readlink -f "/proc/$MAIN_PID/exe")"
+PY=""
+if [ "$MAIN_PID" != "0" ] && [ -n "$MAIN_PID" ] && [ -r "/proc/$MAIN_PID/cmdline" ]; then
+    ARG0="$(tr '\0' '\n' < "/proc/$MAIN_PID/cmdline" | head -1)"
+    if [ -n "$ARG0" ] && [ -x "$ARG0" ]; then
+        PY="$ARG0"
+    elif [ -e "/proc/$MAIN_PID/exe" ]; then
+        PY="$(readlink -f "/proc/$MAIN_PID/exe")"
+    fi
     RUN_USER="$(ps -o user= -p "$MAIN_PID" | tr -d ' ')"
-elif [ -x "$BOT_DIR/venv/bin/python" ]; then
-    PY="$BOT_DIR/venv/bin/python"
-    RUN_USER="$(stat -c %U "$BOT_DIR")"
-else
-    PY="$(command -v python3)"
+fi
+if [ -z "$PY" ]; then
+    if [ -x "$BOT_DIR/venv/bin/python" ]; then
+        PY="$BOT_DIR/venv/bin/python"
+    else
+        PY="$(command -v python3)"
+    fi
     RUN_USER="$(stat -c %U "$BOT_DIR")"
 fi
 
