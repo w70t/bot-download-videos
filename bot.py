@@ -585,6 +585,16 @@ async def get_video_info(url: str):
                 return ydl.extract_info(url, download=False)
 
         try:
+            if is_facebook and cookie_file:
+                # كوكيز تسجيل الدخول تجعل فيسبوك يحقن فيديو إعلان بدل الفيديو
+                # المطلوب أحياناً → جرّب بدون كوكيز أولاً (يكفي للمحتوى العام
+                # وبدون دخول لا إعلانات)، وعند الفشل (ستوري/محتوى يتطلب
+                # تسجيل دخول) أعد المحاولة بالكوكيز.
+                try:
+                    return await loop.run_in_executor(None, lambda: extract(False))
+                except Exception:
+                    logger.warning("⚠️ فشل فيسبوك بدون كوكيز، إعادة المحاولة بالكوكيز...")
+                    return await loop.run_in_executor(None, lambda: extract(True))
             return await loop.run_in_executor(None, lambda: extract(True))
         except Exception as e:
             # يوتيوب مع الكوكيز قد يفشل بسبب حجب الصيغ → أعد المحاولة بدون كوكيز
@@ -1866,7 +1876,16 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         fallback_fmt = 'bestaudio/best' if is_audio else 'bv*+ba/b/best'
 
         try:
-            info, file_path = await loop.run_in_executor(None, lambda: download(True))
+            if ydl_opts.get('cookiefile') and is_facebook_url:
+                # فيسبوك مع كوكيز الدخول قد يحمّل فيديو إعلان محقون بدل
+                # المطلوب → بدون كوكيز أولاً، وبالكوكيز عند الفشل (ستوري/خاص)
+                try:
+                    info, file_path = await loop.run_in_executor(None, lambda: download(False))
+                except Exception:
+                    logger.warning("⚠️ فشل تحميل فيسبوك بدون كوكيز، إعادة المحاولة بالكوكيز...")
+                    info, file_path = await loop.run_in_executor(None, lambda: download(True))
+            else:
+                info, file_path = await loop.run_in_executor(None, lambda: download(True))
         except Exception as dl_err:
             msg = str(dl_err).lower()
             # يوتيوب مع الكوكيز قد يفشل بسبب حجب الصيغ → أعد المحاولة بدون كوكيز
@@ -3009,6 +3028,35 @@ async def cmd_update_ytdlp(client, message):
     if not message.from_user or not is_admin(message.from_user.id):
         return
     await run_ytdlp_update(client, message)
+
+
+@app.on_message(filters.command("uncache"))
+async def cmd_uncache(client, message):
+    """أمر أدمن: مسح رابط من الكاش ليُعاد تحميله من جديد.
+
+    الاستخدام: /uncache <الرابط>
+    مفيد عندما يُخزَّن محتوى خاطئ (مثل إعلان فيسبوك محقون بدل الفيديو)."""
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    parts = (message.text or '').split(maxsplit=1)
+    url = extract_first_url(parts[1] if len(parts) > 1 else '')
+    if not url:
+        await message.reply_text("الاستخدام: `/uncache <الرابط>`")
+        return
+    ckey = cache_key_for_url(url)
+    removed = []
+    for q in ('best', 'medium', '480', '360', 'audio', IMAGE_CACHE_QUALITY):
+        try:
+            if subdb.delete_cached_media(ckey, q):
+                removed.append(q)
+        except Exception:
+            pass
+    if removed:
+        await message.reply_text(
+            f"🗑️ **تم مسح الرابط من الكاش** ({', '.join(removed)})\n"
+            f"أعد إرسال الرابط وسيُحمَّل من جديد.")
+    else:
+        await message.reply_text("ℹ️ هذا الرابط غير موجود في الكاش أصلاً.")
 
 
 # معالج الأزرار السريعة
