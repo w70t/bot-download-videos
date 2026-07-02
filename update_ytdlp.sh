@@ -17,6 +17,9 @@
 # =============================================================
 set -u
 
+# cron لا يضع مجلدات sbin في PATH فلا يجد runuser/systemctl أحياناً
+export PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH"
+
 BOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SERVICE="${BOT_SERVICE:-bot7}"
 NOTIFY_NO_CHANGE="${NOTIFY_NO_CHANGE:-0}"
@@ -50,8 +53,12 @@ notify() {
 run_py() {
     if [ "$(id -un)" = "$RUN_USER" ]; then
         "$PY" "$@"
-    else
+    elif command -v runuser >/dev/null 2>&1; then
         runuser -u "$RUN_USER" -- "$PY" "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo -u "$RUN_USER" "$PY" "$@"
+    else
+        "$PY" "$@"
     fi
 }
 
