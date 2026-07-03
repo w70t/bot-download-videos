@@ -11,6 +11,7 @@
 import os
 import re
 import logging
+from urllib.parse import urlparse
 
 import yt_dlp
 
@@ -72,6 +73,69 @@ def resolve_snapchat_spotlight(url: str, timeout: int = 20) -> str:
     except Exception as e:
         logger.warning(f"⚠️ تعذّر استخراج سناب سبوت لايت ({url[:60]}): {e}")
     return url
+
+
+# ═══════════════════════════════════════════════════════════════
+# إنستغرام: خطة بديلة عبر مرآة عامة (بدون كوكيز)
+# إنستغرام يحجب الوصول المجهول لبيانات الوسائط ويعيد "empty media response"،
+# فيفشل yt-dlp في استخراج الريلز/المنشورات للزوّار حتى مع كوكيز منتهية. مرايا
+# InstaFix العامة تعيد توجيهاً مباشراً لملف الفيديو على CDN إنستغرام عند الطلب
+# بوكيل مستخدم بوت، فنستخدمها للحصول على رابط mp4 مباشر يحمّله yt-dlp عادياً.
+# ═══════════════════════════════════════════════════════════════
+
+# مرايا InstaFix العامة، تُجرَّب بالترتيب. يمكن إضافة/تغيير المرايا بمتغيّر
+# البيئة INSTAGRAM_PROXY_HOSTS (مفصولة بفواصل) دون تعديل الكود إن تعطّلت مرآة.
+_INSTAGRAM_PROXY_HOSTS = [
+    h.strip() for h in os.getenv(
+        'INSTAGRAM_PROXY_HOSTS', 'kkinstagram.com'
+    ).split(',') if h.strip()
+]
+
+# مسار منشور فيديو/ريلز في إنستغرام (نتجاهل الستوري/البروفايل)
+_INSTAGRAM_MEDIA_RE = re.compile(r'/(?:reel|reels|p|tv)/[A-Za-z0-9_-]+', re.I)
+
+# وكيل مستخدم بوت: المرايا تعيد توجيهاً مباشراً للفيديو للبوتات، وصفحة هبوط
+# للمتصفحات، لذا ننتحل بوت معاينة روابط للحصول على ملف mp4 مباشرة.
+_BOT_UA = 'Mozilla/5.0 (compatible; TelegramBot)'
+
+
+def resolve_instagram_media(url: str, timeout: int = 20):
+    """يحوّل رابط ريلز/منشور إنستغرام إلى رابط الفيديو المباشر (mp4) عبر مرآة
+    عامة لا تتطلّب كوكيز، ليُحمّل حين يعجز yt-dlp عن الوصول المجهول.
+
+    يعيد رابط mp4 مباشراً عند النجاح، أو None لغير روابط إنستغرام أو لمنشورات
+    الصور (المرآة تعيد صورة لا فيديو) أو عند أي فشل — فيبقى المسار الأصلي
+    (كوكيز إن توفّرت، أو مسار الصور عبر gallery-dl)."""
+    import urllib.request
+    low = (url or '').lower()
+    if not any(h in low for h in ('instagram.com', 'instagr.am')):
+        return None
+    try:
+        path = urlparse(url).path
+    except Exception:
+        return None
+    m = _INSTAGRAM_MEDIA_RE.search(path)
+    if not m:
+        return None  # ستوري/بروفايل/رابط غير منشور — لا مرآة له
+    media_path = m.group(0)
+    for proxy_host in _INSTAGRAM_PROXY_HOSTS:
+        proxy_url = f"https://{proxy_host}{media_path}"
+        try:
+            req = urllib.request.Request(proxy_url, headers={
+                'User-Agent': _BOT_UA,
+                'Accept': '*/*',
+            })
+            # urlopen يتبع التوجيهات؛ geturl() = الرابط النهائي (mp4 على CDN)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                ctype = (resp.headers.get_content_type() or '').lower()
+                final = resp.geturl()
+            if ctype.startswith('video/') and is_safe_url(final):
+                logger.info(f"🎯 إنستغرام عبر {proxy_host}: {final[:90]}")
+                return final
+            logger.info(f"ℹ️ {proxy_host} لم يُرجع فيديو (نوع={ctype}) لـ {media_path}")
+        except Exception as e:
+            logger.warning(f"⚠️ تعذّر حل إنستغرام عبر {proxy_host} ({media_path}): {e}")
+    return None
 
 
 _MUSIC_LINK_MARKERS = ('shazam.com', 'music.apple.com', 'itunes.apple.com',

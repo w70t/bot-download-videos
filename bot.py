@@ -49,6 +49,7 @@ from cookies_manager import (
 )
 from link_resolvers import (
     resolve_snapchat_spotlight, _is_music_link, resolve_music_link,
+    resolve_instagram_media,
 )
 from content_filter import (
     ADULT_DOMAINS, _custom_adult_domains, _custom_adult_keywords,
@@ -535,6 +536,45 @@ def _youtube_extractor_args():
 _last_info_error = contextvars.ContextVar('_last_info_error', default=None)
 
 
+def _extract_direct_media(direct_url: str):
+    """يستخرج معلومات yt-dlp من رابط وسائط مباشر (mp4) ويمنحه عنواناً نظيفاً.
+    يُستدعى داخل executor (طلب شبكي متزامن)."""
+    opts = {'quiet': True, 'no_warnings': True, 'skip_download': True,
+            'nocheckcertificate': _YTDLP_NO_CHECK_CERT}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(direct_url, download=False)
+    if info is not None:
+        # عنوان CDN معرّف طويل غير مفيد → عنوان واضح للمستخدم
+        info['title'] = 'Instagram Video'
+    return info
+
+
+async def resolve_instagram_direct(url: str):
+    """يحل رابط إنستغرام إلى رابط الفيديو المباشر عبر مرآة عامة (بلا كوكيز).
+    يعيد رابط mp4 المباشر أو None. طلب شبكي متزامن يُنفَّذ خارج حلقة الأحداث."""
+    if _platform_of(url) != 'instagram':
+        return None
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, resolve_instagram_media, url)
+
+
+async def _instagram_video_fallback(url: str):
+    """خطة بديلة لإنستغرام عند فشل yt-dlp (الوصول المجهول محجوب): يحل الرابط
+    لملف فيديو مباشر عبر مرآة عامة ثم يستخرج معلوماته. يعيد dict أو None."""
+    direct = await resolve_instagram_direct(url)
+    if not direct:
+        return None
+    loop = asyncio.get_event_loop()
+    try:
+        info = await loop.run_in_executor(None, lambda: _extract_direct_media(direct))
+        if info:
+            logger.info("✅ إنستغرام عبر المرآة العامة (بديل yt-dlp، بلا كوكيز)")
+        return info
+    except Exception as e:
+        logger.warning(f"⚠️ فشل استخراج إنستغرام البديل: {e}")
+        return None
+
+
 async def get_video_info(url: str):
     """استخراج معلومات الفيديو"""
     _last_info_error.set(None)
@@ -622,6 +662,11 @@ async def get_video_info(url: str):
             logger.error(f"خطأ Facebook parse: {error_msg[:200]}")
         else:
             logger.error(f"خطأ في استخراج المعلومات: {e}")
+        # 🎯 خطة بديلة لإنستغرام: الوصول المجهول محجوب فيعجز yt-dlp عن الريلز/
+        #    المنشورات → جرّب مرآة عامة تعيد رابط الفيديو المباشر (بلا كوكيز)
+        ig = await _instagram_video_fallback(url)
+        if ig:
+            return ig
         return None
 
 
@@ -1861,15 +1906,16 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         
         is_youtube_url = any(m in url.lower() for m in PLATFORM_URL_MARKERS['youtube'])
         is_facebook_url = any(m in url.lower() for m in PLATFORM_URL_MARKERS['facebook'])
+        is_instagram_url = _platform_of(url) == 'instagram'
 
-        def download(use_cookies=True, fmt=None):
+        def download(use_cookies=True, fmt=None, url_override=None):
             o = dict(ydl_opts)
             if fmt:
                 o['format'] = fmt
             if not use_cookies:
                 o.pop('cookiefile', None)
             with yt_dlp.YoutubeDL(o) as ydl:
-                info = ydl.extract_info(url, download=True)
+                info = ydl.extract_info(url_override or url, download=True)
                 return info, ydl.prepare_filename(info)
 
         # صيغة متساهلة احتياطية عند فشل المُحدّد الصارم (بلا فلترة ترميز/امتداد)
@@ -1907,6 +1953,12 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             elif ydl_opts.get('cookiefile') and _is_cookie_file_issue(dl_err):
                 logger.warning(f"⚠️ ملف الكوكيز تالف/غير صالح ({ydl_opts.get('cookiefile')})، إعادة المحاولة بدون كوكيز...")
                 info, file_path = await loop.run_in_executor(None, lambda: download(False))
+            # 🎯 إنستغرام: الوصول المجهول محجوب فيعجز yt-dlp → حل الرابط لملف فيديو
+            #    مباشر عبر مرآة عامة (بلا كوكيز) وحمّله منها
+            elif is_instagram_url and (_direct := await resolve_instagram_direct(url)):
+                logger.info("✅ تحميل إنستغرام عبر المرآة العامة (بديل yt-dlp، بلا كوكيز)")
+                info, file_path = await loop.run_in_executor(
+                    None, lambda: download(url_override=_direct))
             # الصيغة المطلوبة غير متوفرة → أعد المحاولة بأفضل صيغة متاحة
             elif 'requested format is not available' in msg or 'no video formats' in msg:
                 logger.warning("⚠️ الصيغة المطلوبة غير متوفرة، إعادة المحاولة بأفضل صيغة متاحة")
