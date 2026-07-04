@@ -907,9 +907,12 @@ def resolve_instagram_images(url, timeout=20):
         path = _urlparse(url).path
     except Exception:
         return []
-    m = re.search(r'/(?:reel|reels|p|tv)/([A-Za-z0-9_-]+)', path, re.I)
+    # الريلز/IGTV (reel|reels|tv) فيديو دائماً — لو أخفق مسار الفيديو فإعادة صورة
+    # الغلاف من المرآة تضلّل المستخدم (يستقبل "صورة" بدل فيديو). لذا نقتصر هنا على
+    # منشورات /p/ وحدها (كاروسيل صور/صورة)، ونترك الريلز لمسار الفيديو ورسالة الفشل.
+    m = re.search(r'/p/([A-Za-z0-9_-]+)', path, re.I)
     if not m:
-        return []  # ستوري/بروفايل/رابط غير منشور — لا مرآة له
+        return []  # ريل/IGTV/ستوري/بروفايل — ليس منشور صور، لا مرآة صور له
     shortcode = m.group(1)
     ua = 'Mozilla/5.0 (compatible; TelegramBot)'
 
