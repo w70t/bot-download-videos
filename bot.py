@@ -2978,15 +2978,34 @@ def _health_check_host(host, timeout=8):
         return False, type(e).__name__
 
 
+# أسباب فشل الكوكيز بصياغة عربية مختصرة (بدل الرمز الإنجليزي الخام)
+_COOKIE_REASON_AR = {
+    'empty': 'الملف فارغ/مفقود', 'unparseable': 'صيغة غير صالحة',
+    'wrong_platform': 'كوكيز منصة خاطئة', 'not_logged_in': 'غير مسجّل دخول',
+    'expired': 'منتهية الصلاحية', 'unknown_platform': 'منصة غير معروفة',
+}
+
+
 def _run_health_checks():
-    """يشغّل كل فحوص الصحّة (متزامنة) ويعيد أسطر التقرير. يُنفَّذ في executor."""
-    lines = []
+    """يشغّل كل فحوص الصحّة (متزامنة) ويعيد نص التقرير جاهزاً. يُنفَّذ في executor.
+
+    التنسيق مُصمَّم ليقرأ بوضوح في العربية (RTL): كل عنوان قسم عربي في سطره،
+    وكل عنصر يبدأ برمز الحالة ثم اسم لاتيني فقط (منصة/مضيف) بلا خلط عربي داخل
+    السطر — تفادياً لتشوّه ترتيب النص ثنائي الاتجاه."""
+    parts = ["🩺 **فحص صحّة البوت**", ""]
+
+    # الأدوات الخارجية — نعرض رقم النسخة فقط (لا سطر Copyright الطويل)
+    parts.append("⚙️ **الأدوات:**")
     for bin_name in ('ffmpeg', 'ffprobe'):
         ok, detail = _health_check_binary(bin_name)
-        lines.append(f"{'✅' if ok else '❌'} {bin_name}: {detail}")
+        ver = ''
+        if ok and 'version' in detail:
+            ver = ' ' + detail.split('version', 1)[1].strip().split('-')[0].split()[0]
+        parts.append(f"{'✅' if ok else '❌'} {bin_name}{ver if ok else ' — ' + detail}")
 
-    ok, detail = _health_check_db()
-    lines.append(f"{'✅' if ok else '❌'} قاعدة البيانات: {detail}")
+    db_ok, db_detail = _health_check_db()
+    parts.append(f"{'✅' if db_ok else '❌'} قاعدة البيانات — " +
+                 ("متصلة" if db_ok else db_detail))
 
     # الكوكيز: افحص فقط المنصات التي رُفع لها ملف كوكيز فعلاً
     cookie_lines = []
@@ -2997,18 +3016,36 @@ def _run_health_checks():
         if not os.path.exists(path) or os.path.getsize(path) <= 100:
             continue
         res = validate_platform_cookies(pid)
-        mark = '✅' if res.get('ok') else '⚠️'
-        cookie_lines.append(f"{mark} كوكيز {pid}: {res.get('reason', 'ok')}")
-    lines.append("")
-    lines.append("🍪 **الكوكيز:** " + ("لا كوكيز مرفوعة" if not cookie_lines else ""))
-    lines.extend(cookie_lines)
+        if res.get('ok'):
+            cookie_lines.append(f"✅ {pid}")
+        else:
+            reason = _COOKIE_REASON_AR.get(res.get('reason'), res.get('reason', ''))
+            cookie_lines.append(f"⚠️ {pid} — {reason}")
+    parts.append("")
+    parts.append("🍪 **الكوكيز:**")
+    parts.extend(cookie_lines or ["— لا كوكيز مرفوعة"])
 
-    lines.append("")
-    lines.append("🌐 **المرايا:**")
+    # المرايا: نعرض الوصول فقط (يعمل/لا يصل) بلا أكواد HTTP المربكة (403/404 تعني
+    # أن المضيف يوصل فعلاً)
+    parts.append("")
+    parts.append("🌐 **المرايا:**")
     for platform, host in all_mirror_hosts():
-        ok, detail = _health_check_host(host)
-        lines.append(f"{'✅' if ok else '❌'} {platform} ({host}): {detail}")
-    return lines
+        ok, _ = _health_check_host(host)
+        parts.append(f"{'✅' if ok else '❌'} {host}" +
+                     ("" if ok else " — لا يصل"))
+
+    return "\n".join(parts)[:4096]
+
+
+async def run_health_report(client, message):
+    """يعرض تقرير صحّة البوت (مشترك بين أمر /health وزر اللوحة)."""
+    status = await message.reply_text("🩺 **جارٍ فحص صحّة البوت…**")
+    loop = asyncio.get_event_loop()
+    try:
+        report = await loop.run_in_executor(None, _run_health_checks)
+    except Exception as e:
+        report = f"❌ تعذّر إكمال فحص الصحّة: {str(e)[:200]}"
+    await status.edit_text(report)
 
 
 @app.on_message(filters.command("health"))
@@ -3016,14 +3053,7 @@ async def cmd_health(client, message):
     """فحص صحّة البوت للأدمن: ffmpeg + قاعدة البيانات + الكوكيز + وصول المرايا."""
     if not is_admin(message.from_user.id):
         return
-    status = await message.reply_text("🩺 **جارٍ فحص صحّة البوت…**")
-    loop = asyncio.get_event_loop()
-    try:
-        lines = await loop.run_in_executor(None, _run_health_checks)
-        report = "🩺 **فحص صحّة البوت**\n\n" + "\n".join(lines)
-    except Exception as e:
-        report = f"❌ تعذّر إكمال فحص الصحّة: {str(e)[:200]}"
-    await status.edit_text(report[:4096])
+    await run_health_report(client, message)
 
 
 async def run_realusers_check(client, message):
@@ -3205,7 +3235,7 @@ async def start(client, message):
         from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton
         keyboard = ReplyKeyboardMarkup([
             [KeyboardButton(t('btn_cookies', lang)), KeyboardButton(t('btn_daily_report', lang))],
-            [KeyboardButton(t('btn_errors', lang)), KeyboardButton(t('btn_subscription', lang))],
+            [KeyboardButton(t('btn_health', lang)), KeyboardButton(t('btn_subscription', lang))],
             [KeyboardButton(t('btn_change_language', lang)), KeyboardButton(t('btn_update_ytdlp', lang))]
         ], resize_keyboard=True)
     else:
@@ -3334,7 +3364,7 @@ async def cmd_uncache(client, message):
 
 
 # معالج الأزرار السريعة
-@app.on_message(filters.text & filters.regex(r'^(🍪 Cookies|📊 التقرير اليومي|📊 Daily Report|🔔 الأخطاء|🔔 Errors|💎 إعدادات الاشتراك|💎 Subscription Settings|📁 نسخ احتياطي|🔄 تحديث yt-dlp|🔄 Update yt-dlp)$'))
+@app.on_message(filters.text & filters.regex(r'^(🍪 Cookies|📊 التقرير اليومي|📊 Daily Report|🩺 فحص الصحّة|🩺 Health Check|💎 إعدادات الاشتراك|💎 Subscription Settings|📁 نسخ احتياطي|🔄 تحديث yt-dlp|🔄 Update yt-dlp)$'))
 async def handle_quick_buttons(client, message):
     """معالج الأزرار السريعة"""
     if not message.from_user:
@@ -3349,8 +3379,8 @@ async def handle_quick_buttons(client, message):
         await cookies_panel(client, message)
     elif txt in ("📊 التقرير اليومي", "📊 Daily Report"):
         await send_daily_report(client, message.from_user.id)
-    elif txt in ("🔔 الأخطاء", "🔔 Errors"):
-        await show_errors(client, message)
+    elif txt in ("🩺 فحص الصحّة", "🩺 Health Check"):
+        await run_health_report(client, message)
     elif txt in ("💎 إعدادات الاشتراك", "💎 Subscription Settings"):
         await subscription_settings_panel(client, message)
     elif txt == "📁 نسخ احتياطي":
@@ -6706,7 +6736,7 @@ async def handle_language_selection(client, callback_query):
         from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton
         keyboard = ReplyKeyboardMarkup([
             [KeyboardButton(t('btn_cookies', lang)), KeyboardButton(t('btn_daily_report', lang))],
-            [KeyboardButton(t('btn_errors', lang)), KeyboardButton(t('btn_subscription', lang))],
+            [KeyboardButton(t('btn_health', lang)), KeyboardButton(t('btn_subscription', lang))],
             [KeyboardButton("📁 نسخ احتياطي"), KeyboardButton(t('btn_change_language', lang))],
             [KeyboardButton(t('btn_update_ytdlp', lang))]
         ], resize_keyboard=True)
