@@ -3056,42 +3056,6 @@ async def cmd_health(client, message):
     await run_health_report(client, message)
 
 
-@app.on_message(filters.command("testremind"))
-async def cmd_test_remind(client, message):
-    """اختبار إرسال رسالة التذكير مباشرة (للأدمن) — يتجاوز فلتر الخمول ليتأكد
-    الأدمن أن الإرسال يعمل. بلا وسيط: يرسل لنفسه. مع user_id: يرسل لذلك العضو."""
-    if not is_admin(message.from_user.id):
-        return
-    parts = (message.text or '').split()
-    if len(parts) >= 2:
-        try:
-            target = int(parts[1])
-        except ValueError:
-            await message.reply_text("❌ معرّف غير صالح. الاستخدام: `/testremind <user_id>`")
-            return
-    else:
-        target = message.from_user.id  # بلا وسيط: اختبار على حساب الأدمن نفسه
-
-    try:
-        ulang = subdb.get_user_language(target) or 'ar'
-    except Exception:
-        ulang = 'ar'
-    try:
-        m = await client.send_message(target, t('reminder_inactive', ulang))
-        subdb.set_last_reminder(target, m.id)
-        await message.reply_text(
-            f"✅ أُرسل التذكير التجريبي إلى `{target}` (msg id {m.id}).\n"
-            "الإرسال يعمل. لو ما وصلك عبر الزر، فالسبب أن العضو لا يحقّق شرط "
-            "الخمول (≥ 7 أيام بلا تحميل)، لا خلل في الإرسال."
-        )
-    except Exception as e:
-        await message.reply_text(
-            f"❌ فشل الإرسال إلى `{target}`:\n`{str(e)[:200]}`\n\n"
-            "أسباب محتملة: العضو لم يبدأ البوت (/start) من قبل، أو حظر البوت، "
-            "أو معرّف خاطئ."
-        )
-
-
 async def run_realusers_check(client, message):
     """فحص فوري للأعضاء مع عدّاد حيّ: يحذف من حظر البوت ويعرض العدد الحقيقي
     والداخلين اليوم. مشترك بين أمر /realusers وزر «👥 فحص العدد الحقيقي» في اللوحة."""
@@ -5419,22 +5383,44 @@ async def handle_subscription_settings(client, callback_query):
     if action == 'remind_inactive':
         days = int(os.getenv("REMINDER_INACTIVE_DAYS", "7"))
         inactive = subdb.get_inactive_users(days)
-        if not inactive:
-            await callback_query.answer(f"لا يوجد أعضاء خاملون منذ {days} أيام", show_alert=True)
-            return
-        await callback_query.message.edit_text(
+        rows = []
+        if inactive:
+            rows.append([InlineKeyboardButton("📨 إرسال التذكير الآن", callback_data="sub_do_remind")])
+        # زر تجربة يرسل التذكير لحساب الأدمن نفسه (يتجاوز فلتر الخمول)
+        rows.append([InlineKeyboardButton("🧪 تجربة على حسابي", callback_data="sub_test_remind")])
+        rows.append([InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")])
+        body = (
             f"📨 **تذكير الأعضاء غير النشطين**\n\n"
             f"👥 الأعضاء: **{_current_member_count()}**\n"
             f"⏳ الخمول: ≥ {days} أيام\n"
             f"😴 غير النشطين: **{len(inactive)}** عضو\n\n"
-            "سيُرسل لكل عضو تذكيراً **بلغته**، ويُحذف تذكيره السابق تلقائياً "
-            "(يبقى الأحدث فقط).",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📨 إرسال التذكير الآن", callback_data="sub_do_remind")],
-                [InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")],
-            ])
         )
+        if inactive:
+            body += ("سيُرسل لكل عضو تذكيراً **بلغته**، ويُحذف تذكيره السابق "
+                     "تلقائياً (يبقى الأحدث فقط).")
+        else:
+            body += ("لا يوجد أعضاء خاملون الآن.\nاضغط «🧪 تجربة على حسابي» "
+                     "للتأكد أن الإرسال يعمل.")
+        await callback_query.message.edit_text(
+            body, reply_markup=InlineKeyboardMarkup(rows))
         await callback_query.answer()
+        return
+
+    if action == 'test_remind':
+        # يرسل رسالة التذكير لحساب الأدمن نفسه للتأكد أن الإرسال يعمل (يتجاوز الفلتر)
+        uid = callback_query.from_user.id
+        try:
+            ulang = subdb.get_user_language(uid) or 'ar'
+        except Exception:
+            ulang = 'ar'
+        try:
+            m = await client.send_message(uid, t('reminder_inactive', ulang))
+            subdb.set_last_reminder(uid, m.id)
+            await callback_query.answer(
+                "✅ أُرسل تذكير تجريبي إلى حسابك — تحقّق من الرسالة أعلاه.",
+                show_alert=True)
+        except Exception as e:
+            await callback_query.answer(f"❌ فشل الإرسال: {str(e)[:150]}", show_alert=True)
         return
 
     if action == 'do_remind':
