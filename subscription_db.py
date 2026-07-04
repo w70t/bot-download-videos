@@ -1274,6 +1274,16 @@ def get_inactive_users(days=7):
         return cursor.fetchall()
 
 
+def get_all_users_for_reminder():
+    """كل الأعضاء بصيغة (user_id, language, last_reminder_msg_id) — لإرسال تذكير
+    للجميع (بلا فلتر خمول)."""
+    with db_cursor() as cursor:
+        cursor.execute(
+            "SELECT user_id, COALESCE(language, 'ar'), last_reminder_msg_id FROM users"
+        )
+        return cursor.fetchall()
+
+
 def set_last_reminder(user_id, msg_id):
     """يحفظ معرّف آخر رسالة تذكير أُرسلت للمستخدم."""
     with db_cursor(commit=True) as cursor:
