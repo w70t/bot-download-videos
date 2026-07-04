@@ -806,8 +806,9 @@ def _download_images_with_gallery_dl(url, dest_dir, cookie_file=None):
     if cookie_file:
         cmd += ['--cookies', cookie_file]
     cmd.append(url)
+    proc = None
     try:
-        subprocess.run(cmd, timeout=180, capture_output=True)
+        proc = subprocess.run(cmd, timeout=180, capture_output=True)
     except subprocess.TimeoutExpired:
         logger.warning("⏱️ انتهت مهلة gallery-dl أثناء تحميل الصور")
     except Exception as e:
@@ -821,6 +822,17 @@ def _download_images_with_gallery_dl(url, dest_dir, cookie_file=None):
     except FileNotFoundError:
         files = []
     files.sort()
+    # لم يجلب gallery-dl أي صورة: سجّل سببه الحقيقي (تسجيل دخول مطلوب/حجب IP/
+    # منشور فيديو) بدل ابتلاعه بصمت — يظهر الخطأ في السجلات بدل "رابط غير صحيح"
+    if not files and proc is not None:
+        err = (proc.stderr or b'').decode('utf-8', 'ignore').strip()
+        out = (proc.stdout or b'').decode('utf-8', 'ignore').strip()
+        detail = (err or out or 'لا مخرجات').replace('\n', ' | ')[:400]
+        has_cookies = 'نعم' if cookie_file else 'لا'
+        logger.warning(
+            f"🖼️ gallery-dl لم يُرجع صوراً (rc={proc.returncode}, كوكيز={has_cookies}) "
+            f"لـ {url[:80]} — السبب: {detail}"
+        )
     return files
 
 
