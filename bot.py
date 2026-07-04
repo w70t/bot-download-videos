@@ -656,6 +656,7 @@ async def get_video_info(url: str):
         cookie_file = get_cookie_file_for_url(url)
         is_youtube = any(m in url.lower() for m in PLATFORM_URL_MARKERS['youtube'])
         is_facebook = any(m in url.lower() for m in PLATFORM_URL_MARKERS['facebook'])
+        is_instagram = any(m in url.lower() for m in PLATFORM_URL_MARKERS['instagram'])
 
         ydl_opts = {
             'quiet': True,
@@ -718,6 +719,15 @@ async def get_video_info(url: str):
             if cookie_file and _is_cookie_file_issue(e):
                 logger.warning(f"⚠️ ملف الكوكيز تالف/غير صالح ({cookie_file})، إعادة المحاولة بدون كوكيز...")
                 return await loop.run_in_executor(None, lambda: extract(False))
+            # إنستغرام: كوكيز منتهية/خارج الحساب تُرجع 404 لمنشور عام يعمل بلا كوكيز
+            # → أعد المحاولة بدون كوكيز قبل اللجوء للمرايا (أدقّ وأضمن للفيديو الأصلي).
+            # إن كان المحتوى خاصاً فعلاً فستفشل بلا كوكيز أيضاً فنكمل للمعالج الخارجي.
+            if cookie_file and is_instagram:
+                logger.warning("⚠️ فشل إنستغرام مع الكوكيز، إعادة المحاولة بدون كوكيز...")
+                try:
+                    return await loop.run_in_executor(None, lambda: extract(False))
+                except Exception:
+                    pass
             raise
     except Exception as e:
         error_msg = str(e)
@@ -2374,8 +2384,23 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             elif ydl_opts.get('cookiefile') and _is_cookie_file_issue(dl_err):
                 logger.warning(f"⚠️ ملف الكوكيز تالف/غير صالح ({ydl_opts.get('cookiefile')})، إعادة المحاولة بدون كوكيز...")
                 info, file_path = await loop.run_in_executor(None, lambda: download(False))
-            # 🎯 إنستغرام: الوصول المجهول محجوب فيعجز yt-dlp → حل الرابط لملف فيديو
-            #    مباشر عبر مرآة عامة (بلا كوكيز) وحمّله منها
+            # 🎯 إنستغرام مع كوكيز: كوكيز منتهية/خارج الحساب تُرجع 404 لمنشور عام
+            #    يعمل بلا كوكيز → أعد المحاولة بدون كوكيز (تنجح غالباً للمحتوى العام).
+            #    إن فشلت أيضاً (محتوى خاص فعلاً) جرّب المرآة العامة كخطة أخيرة.
+            elif ydl_opts.get('cookiefile') and is_instagram_url:
+                logger.warning("⚠️ فشل تحميل إنستغرام مع الكوكيز، إعادة المحاولة بدون كوكيز...")
+                try:
+                    info, file_path = await loop.run_in_executor(None, lambda: download(False))
+                except Exception:
+                    _direct = await resolve_instagram_direct(url)
+                    if _direct:
+                        logger.info("✅ تحميل إنستغرام عبر المرآة العامة (بديل، بلا كوكيز)")
+                        info, file_path = await loop.run_in_executor(
+                            None, lambda: download(url_override=_direct))
+                    else:
+                        raise
+            # 🎯 إنستغرام (بلا كوكيز): الوصول المجهول محجوب فيعجز yt-dlp → حل الرابط
+            #    لملف فيديو مباشر عبر مرآة عامة (بلا كوكيز) وحمّله منها
             elif is_instagram_url and (_direct := await resolve_instagram_direct(url)):
                 logger.info("✅ تحميل إنستغرام عبر المرآة العامة (بديل yt-dlp، بلا كوكيز)")
                 info, file_path = await loop.run_in_executor(
