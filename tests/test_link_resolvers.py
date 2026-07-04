@@ -9,6 +9,7 @@ import link_resolvers
 from link_resolvers import (
     _is_music_link, _music_search_query, resolve_snapchat_spotlight,
     resolve_instagram_media, resolve_tiktok_media,
+    resolve_twitter_media, _extract_twitter_media,
 )
 
 
@@ -117,13 +118,28 @@ def test_tiktok_resolver_ignores_non_tiktok():
     assert resolve_tiktok_media('') is None
 
 
+class _FakeRedirect:
+    """محاكاة استجابة urlopen لاتّباع تحويل رابط مختصر (geturl فقط)."""
+    def __init__(self, final):
+        self._final = final
+
+    def geturl(self):
+        return self._final
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
 def test_tiktok_resolver_returns_direct_video():
-    # المرآة تُرجع رابط hdplay مباشر → نعيده
+    # المرآة تُرجع رابط hdplay مباشر (رابط كامل بلا توسيع) → نعيده
     play = 'https://tikwm.com/video/media/hdplay/abc.mp4'
     payload = {'code': 0, 'data': {'hdplay': play, 'play': 'https://x/p.mp4'}}
     with patch('urllib.request.urlopen', return_value=_FakeJsonResp(payload)), \
             patch.object(link_resolvers, 'is_safe_url', return_value=True):
-        out = resolve_tiktok_media('https://vt.tiktok.com/ZSCV5WkL7')
+        out = resolve_tiktok_media('https://www.tiktok.com/@u/video/123')
     assert out == play
 
 
@@ -136,16 +152,76 @@ def test_tiktok_resolver_prepends_host_for_relative_path():
     assert out == 'https://tikwm.com/video/media/play/abc.mp4'
 
 
+def test_tiktok_resolver_expands_short_link():
+    # رابط مختصر (vt.tiktok) → يُوسَّع أولاً ثم يُستعلم المرآة بالرابط الكامل
+    play = 'https://tikwm.com/video/media/play/abc.mp4'
+    full = 'https://www.tiktok.com/@u/video/123'
+    payload = {'code': 0, 'data': {'play': play}}
+    # أول urlopen = اتّباع التحويل، الثاني = استعلام المرآة
+    with patch('urllib.request.urlopen',
+               side_effect=[_FakeRedirect(full), _FakeJsonResp(payload)]), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        out = resolve_tiktok_media('https://vt.tiktok.com/ZSCV5WkL7')
+    assert out == play
+
+
 def test_tiktok_resolver_none_when_no_media():
     # المرآة لا تُرجع أي رابط فيديو (منشور صور/فشل) → None
     payload = {'code': -1, 'data': {}}
     with patch('urllib.request.urlopen', return_value=_FakeJsonResp(payload)):
-        out = resolve_tiktok_media('https://vt.tiktok.com/ZSCV5WkL7')
+        out = resolve_tiktok_media('https://www.tiktok.com/@u/video/123')
     assert out is None
 
 
 def test_tiktok_resolver_handles_network_error():
     # فشل الطلب الشبكي → None بلا استثناء
     with patch('urllib.request.urlopen', side_effect=OSError('boom')):
-        out = resolve_tiktok_media('https://vt.tiktok.com/ZSCV5WkL7')
+        out = resolve_tiktok_media('https://www.tiktok.com/@u/video/123')
+    assert out is None
+
+
+# ── resolve_twitter_media ───────────────────────────────────────
+
+def test_twitter_resolver_ignores_non_twitter():
+    # روابط غير تويتر (وروابط تويتر بلا معرّف منشور) → None بلا طلب شبكي
+    assert resolve_twitter_media('https://youtube.com/watch?v=1') is None
+    assert resolve_twitter_media('https://x.com/someuser') is None
+    assert resolve_twitter_media('') is None
+
+
+def test_twitter_extract_from_vxtwitter_shape():
+    # شكل vxtwitter: media_extended بنوع فيديو صريح
+    vid = 'https://video.twimg.com/amplify_video/1/vid/avc1/x.mp4'
+    payload = {'hasMedia': True,
+               'mediaURLs': [vid],
+               'media_extended': [{'type': 'video', 'url': vid}]}
+    assert _extract_twitter_media(payload) == vid
+
+
+def test_twitter_extract_from_fxtwitter_shape():
+    # شكل fxtwitter: الوسائط متداخلة تحت tweet.media.videos
+    vid = 'https://video.twimg.com/amplify_video/2/vid/avc1/y.mp4'
+    payload = {'code': 200, 'tweet': {'media': {'videos': [{'type': 'video', 'url': vid}]}}}
+    assert _extract_twitter_media(payload) == vid
+
+
+def test_twitter_extract_none_for_photo_only():
+    # منشور صور فقط → لا فيديو
+    payload = {'mediaURLs': ['https://pbs.twimg.com/media/x.jpg'],
+               'media_extended': [{'type': 'image', 'url': 'https://pbs.twimg.com/media/x.jpg'}]}
+    assert _extract_twitter_media(payload) is None
+
+
+def test_twitter_resolver_returns_direct_video():
+    vid = 'https://video.twimg.com/amplify_video/9/vid/avc1/z.mp4'
+    payload = {'media_extended': [{'type': 'video', 'url': vid}]}
+    with patch('urllib.request.urlopen', return_value=_FakeJsonResp(payload)), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        out = resolve_twitter_media('https://x.com/user/status/2072917832770228479?s=46')
+    assert out == vid
+
+
+def test_twitter_resolver_handles_network_error():
+    with patch('urllib.request.urlopen', side_effect=OSError('boom')):
+        out = resolve_twitter_media('https://twitter.com/user/status/123')
     assert out is None

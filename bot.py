@@ -49,7 +49,7 @@ from cookies_manager import (
 )
 from link_resolvers import (
     resolve_snapchat_spotlight, _is_music_link, resolve_music_link,
-    resolve_instagram_media, resolve_tiktok_media,
+    resolve_instagram_media, resolve_tiktok_media, resolve_twitter_media,
 )
 from content_filter import (
     ADULT_DOMAINS, _custom_adult_domains, _custom_adult_keywords,
@@ -605,6 +605,34 @@ async def _tiktok_video_fallback(url: str):
         return None
 
 
+async def resolve_twitter_direct(url: str):
+    """يحل رابط تويتر/X إلى رابط الفيديو المباشر عبر مرآة عامة (بلا كوكيز).
+    يعيد رابط mp4 المباشر أو None. طلب شبكي متزامن يُنفَّذ خارج حلقة الأحداث."""
+    if _platform_of(url) != 'twitter':
+        return None
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, resolve_twitter_media, url)
+
+
+async def _twitter_video_fallback(url: str):
+    """خطة بديلة لتويتر/X عند فشل yt-dlp (حجب/تقييد): يحل الرابط لملف فيديو مباشر
+    عبر مرآة عامة ثم يستخرج معلوماته. يعيد dict أو None."""
+    direct = await resolve_twitter_direct(url)
+    if not direct:
+        return None
+    loop = asyncio.get_event_loop()
+    try:
+        info = await loop.run_in_executor(
+            None, lambda: _extract_direct_media(direct, 'Twitter Video')
+        )
+        if info:
+            logger.info("✅ تويتر عبر المرآة العامة (بديل yt-dlp، بلا كوكيز)")
+        return info
+    except Exception as e:
+        logger.warning(f"⚠️ فشل استخراج تويتر البديل: {e}")
+        return None
+
+
 async def get_video_info(url: str):
     """استخراج معلومات الفيديو"""
     _last_info_error.set(None)
@@ -702,6 +730,10 @@ async def get_video_info(url: str):
         tk = await _tiktok_video_fallback(url)
         if tk:
             return tk
+        # 🎯 خطة بديلة لتويتر/X: حجب/تقييد يفشل yt-dlp → جرّب مرآة عامة (mp4 مباشر)
+        tw = await _twitter_video_fallback(url)
+        if tw:
+            return tw
         return None
 
 
