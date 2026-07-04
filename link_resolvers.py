@@ -349,6 +349,18 @@ def resolve_twitter_media(url: str, timeout: int = 20):
     return None
 
 
+def all_mirror_hosts():
+    """يعيد قائمة (المنصة، المضيف) لكل مرايا البدائل المُهيّأة — لفحص الصحّة."""
+    hosts = []
+    for h in _INSTAGRAM_PROXY_HOSTS:
+        hosts.append(('instagram', h))
+    for h in _TIKTOK_API_HOSTS:
+        hosts.append(('tiktok', h))
+    for h in _TWITTER_API_HOSTS:
+        hosts.append(('twitter', h))
+    return hosts
+
+
 _MUSIC_LINK_MARKERS = ('shazam.com', 'music.apple.com', 'itunes.apple.com',
                        'open.spotify.com/track', 'spotify.link/')
 

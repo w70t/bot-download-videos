@@ -50,7 +50,7 @@ from cookies_manager import (
 from link_resolvers import (
     resolve_snapchat_spotlight, _is_music_link, resolve_music_link,
     resolve_instagram_media, resolve_tiktok_media, resolve_twitter_media,
-    resolve_tiktok_images,
+    resolve_tiktok_images, all_mirror_hosts,
 )
 from content_filter import (
     ADULT_DOMAINS, _custom_adult_domains, _custom_adult_keywords,
@@ -2937,6 +2937,93 @@ async def cmd_dlstats(client, message):
         + f"\n\n👥 **الجنس:** 👨 {gs['male']} | 👩 {gs['female']}"
         + f"\n🌐 **اللغة:** 🇸🇦 {subdb.get_language_counts()['ar']} | 🇬🇧 {subdb.get_language_counts()['en']}"
     )
+
+
+def _health_check_binary(name):
+    """يفحص وجود أداة خارجية (ffmpeg/ffprobe) عبر تشغيل -version."""
+    try:
+        r = subprocess.run([name, '-version'], capture_output=True, timeout=10)
+        if r.returncode == 0:
+            first = (r.stdout.decode('utf-8', 'ignore').splitlines() or [''])[0]
+            return True, first[:50]
+        return False, f"exit {r.returncode}"
+    except FileNotFoundError:
+        return False, "غير مثبّت"
+    except Exception as e:
+        return False, str(e)[:50]
+
+
+def _health_check_db():
+    """يتحقق من الاتصال بقاعدة البيانات عبر استعلام رخيص."""
+    try:
+        subdb.get_setting('__health_check__')  # SELECT خفيف
+        return True, "متصلة"
+    except Exception as e:
+        return False, str(e)[:80]
+
+
+def _health_check_host(host, timeout=8):
+    """يتحقق من إمكانية الوصول لمضيف مرآة (أي رد HTTP = يوصل)."""
+    import urllib.error
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            f"https://{host}/", method='HEAD',
+            headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return True, f"HTTP {getattr(r, 'status', 200)}"
+    except urllib.error.HTTPError as e:
+        return True, f"HTTP {e.code}"  # رد بكود = المضيف يوصل
+    except Exception as e:
+        return False, type(e).__name__
+
+
+def _run_health_checks():
+    """يشغّل كل فحوص الصحّة (متزامنة) ويعيد أسطر التقرير. يُنفَّذ في executor."""
+    lines = []
+    for bin_name in ('ffmpeg', 'ffprobe'):
+        ok, detail = _health_check_binary(bin_name)
+        lines.append(f"{'✅' if ok else '❌'} {bin_name}: {detail}")
+
+    ok, detail = _health_check_db()
+    lines.append(f"{'✅' if ok else '❌'} قاعدة البيانات: {detail}")
+
+    # الكوكيز: افحص فقط المنصات التي رُفع لها ملف كوكيز فعلاً
+    cookie_lines = []
+    for pid, data in COOKIES_PLATFORMS.items():
+        if pid == 'other':
+            continue
+        path = data.get('file', '')
+        if not os.path.exists(path) or os.path.getsize(path) <= 100:
+            continue
+        res = validate_platform_cookies(pid)
+        mark = '✅' if res.get('ok') else '⚠️'
+        cookie_lines.append(f"{mark} كوكيز {pid}: {res.get('reason', 'ok')}")
+    lines.append("")
+    lines.append("🍪 **الكوكيز:** " + ("لا كوكيز مرفوعة" if not cookie_lines else ""))
+    lines.extend(cookie_lines)
+
+    lines.append("")
+    lines.append("🌐 **المرايا:**")
+    for platform, host in all_mirror_hosts():
+        ok, detail = _health_check_host(host)
+        lines.append(f"{'✅' if ok else '❌'} {platform} ({host}): {detail}")
+    return lines
+
+
+@app.on_message(filters.command("health"))
+async def cmd_health(client, message):
+    """فحص صحّة البوت للأدمن: ffmpeg + قاعدة البيانات + الكوكيز + وصول المرايا."""
+    if not is_admin(message.from_user.id):
+        return
+    status = await message.reply_text("🩺 **جارٍ فحص صحّة البوت…**")
+    loop = asyncio.get_event_loop()
+    try:
+        lines = await loop.run_in_executor(None, _run_health_checks)
+        report = "🩺 **فحص صحّة البوت**\n\n" + "\n".join(lines)
+    except Exception as e:
+        report = f"❌ تعذّر إكمال فحص الصحّة: {str(e)[:200]}"
+    await status.edit_text(report[:4096])
 
 
 async def run_realusers_check(client, message):
