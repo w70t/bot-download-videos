@@ -869,15 +869,36 @@ _INSTAGRAM_IMG_PROXY_HOSTS = [
 ]
 
 
+def _fetch_mirror_image_url(proxy_url, ua, timeout):
+    """يطلب رابط مرآة إنستغرام ويعيد رابط الصورة النهائي على CDN إن كان المحتوى
+    صورة فعلاً وآمناً، وإلا None (404/صفحة هبوط/فيديو)."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(proxy_url, headers={
+            'User-Agent': ua, 'Accept': '*/*',
+        })
+        # urlopen يتبع التوجيه؛ geturl() = الرابط النهائي للصورة على CDN
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            ctype = (resp.headers.get_content_type() or '').lower()
+            final = resp.geturl()
+    except Exception:
+        return None
+    if ctype.startswith('image/') and is_safe_url(final):
+        return final
+    return None
+
+
 def resolve_instagram_images(url, timeout=20):
-    """يعيد قائمة روابط صور منشور إنستغرام (كاروسيل/صورة واحدة) عبر مرآة InstaFix
-    العامة بلا كوكيز، لتُحمَّل حين يعجز gallery-dl عن جلبها (تسجيل دخول مطلوب/حجب
-    IP). تعتمد على مسار /images/{shortcode}/{n} الذي يعيد توجيهاً مباشراً لكل صورة
-    (n=1,2,3...) وينتهي بخطأ عند تجاوز عدد الصور.
+    """يعيد قائمة روابط صور منشور إنستغرام عبر مرآة InstaFix العامة بلا كوكيز،
+    لتُحمَّل حين يعجز gallery-dl عن جلبها (تسجيل دخول مطلوب/حجب IP).
+
+    تختلف المرايا: بعضها يدعم فهرسة الكاروسيل (/p/{sc}/{n}) فنجمع كل الصور، وبعضها
+    (مثل kkinstagram) يعطي أول صورة فقط عبر المسار المجرّد (/p/{sc}). لذا:
+      1) نجرّب الفهرسة على كل مرآة — أول مرآة تدعمها تعيد الألبوم كاملاً.
+      2) وإلا نجلب أول صورة عبر المسار المجرّد (أفضل من رسالة فشل).
 
     تعيد قائمة فارغة لغير روابط المنشورات أو عند أي فشل، فيبقى السلوك دون تغيير."""
     import re
-    import urllib.request
     from urllib.parse import urlparse as _urlparse
     low = (url or '').lower()
     if not any(h in low for h in ('instagram.com', 'instagr.am')):
@@ -891,28 +912,30 @@ def resolve_instagram_images(url, timeout=20):
         return []  # ستوري/بروفايل/رابط غير منشور — لا مرآة له
     shortcode = m.group(1)
     ua = 'Mozilla/5.0 (compatible; TelegramBot)'
+
+    # (1) مرايا تدعم فهرسة الكاروسيل: اجمع كل عناصرها حتى أول فشل
     for host in _INSTAGRAM_IMG_PROXY_HOSTS:
-        image_urls = []
+        image_urls, seen = [], set()
         for n in range(1, GALLERY_DL_MAX_IMAGES + 1):
-            proxy_url = f"https://{host}/images/{shortcode}/{n}"
-            try:
-                req = urllib.request.Request(proxy_url, headers={
-                    'User-Agent': ua, 'Accept': '*/*',
-                })
-                # urlopen يتبع التوجيه؛ geturl() = الرابط النهائي للصورة على CDN
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    ctype = (resp.headers.get_content_type() or '').lower()
-                    final = resp.geturl()
-                if ctype.startswith('image/') and is_safe_url(final):
-                    image_urls.append(final)
-                else:
-                    break  # ليست صورة (نهاية الكاروسيل أو صفحة هبوط)
-            except Exception:
-                break  # 404 عند تجاوز عدد الصور أو فشل المرآة
+            final = _fetch_mirror_image_url(
+                f"https://{host}/p/{shortcode}/{n}", ua, timeout)
+            if not final or final in seen:
+                break  # نهاية الكاروسيل أو مرآة لا تدعم الفهرسة
+            seen.add(final)
+            image_urls.append(final)
         if image_urls:
             logger.info(
-                f"🎯 صور إنستغرام عبر {host}: {len(image_urls)} صورة (بلا كوكيز)")
+                f"🎯 صور إنستغرام عبر {host} (مفهرس): {len(image_urls)} صورة (بلا كوكيز)")
             return image_urls
+
+    # (2) مرآة بلا فهرسة (kkinstagram): على الأقل أول صورة من المسار المجرّد
+    for host in _INSTAGRAM_IMG_PROXY_HOSTS:
+        final = _fetch_mirror_image_url(
+            f"https://{host}/p/{shortcode}", ua, timeout)
+        if final:
+            logger.info(
+                f"🎯 صورة إنستغرام عبر {host} (أول صورة فقط، بلا كوكيز): {final[:80]}")
+            return [final]
     return []
 
 
