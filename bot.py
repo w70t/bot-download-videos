@@ -3056,6 +3056,42 @@ async def cmd_health(client, message):
     await run_health_report(client, message)
 
 
+@app.on_message(filters.command("testremind"))
+async def cmd_test_remind(client, message):
+    """اختبار إرسال رسالة التذكير مباشرة (للأدمن) — يتجاوز فلتر الخمول ليتأكد
+    الأدمن أن الإرسال يعمل. بلا وسيط: يرسل لنفسه. مع user_id: يرسل لذلك العضو."""
+    if not is_admin(message.from_user.id):
+        return
+    parts = (message.text or '').split()
+    if len(parts) >= 2:
+        try:
+            target = int(parts[1])
+        except ValueError:
+            await message.reply_text("❌ معرّف غير صالح. الاستخدام: `/testremind <user_id>`")
+            return
+    else:
+        target = message.from_user.id  # بلا وسيط: اختبار على حساب الأدمن نفسه
+
+    try:
+        ulang = subdb.get_user_language(target) or 'ar'
+    except Exception:
+        ulang = 'ar'
+    try:
+        m = await client.send_message(target, t('reminder_inactive', ulang))
+        subdb.set_last_reminder(target, m.id)
+        await message.reply_text(
+            f"✅ أُرسل التذكير التجريبي إلى `{target}` (msg id {m.id}).\n"
+            "الإرسال يعمل. لو ما وصلك عبر الزر، فالسبب أن العضو لا يحقّق شرط "
+            "الخمول (≥ 7 أيام بلا تحميل)، لا خلل في الإرسال."
+        )
+    except Exception as e:
+        await message.reply_text(
+            f"❌ فشل الإرسال إلى `{target}`:\n`{str(e)[:200]}`\n\n"
+            "أسباب محتملة: العضو لم يبدأ البوت (/start) من قبل، أو حظر البوت، "
+            "أو معرّف خاطئ."
+        )
+
+
 async def run_realusers_check(client, message):
     """فحص فوري للأعضاء مع عدّاد حيّ: يحذف من حظر البوت ويعرض العدد الحقيقي
     والداخلين اليوم. مشترك بين أمر /realusers وزر «👥 فحص العدد الحقيقي» في اللوحة."""
