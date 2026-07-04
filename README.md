@@ -1,7 +1,7 @@
 
 # 🤖 بوت تحميل الفيديوهات من تيليجرام
 
-[![GitHub](https://img.shields.io/badge/GitHub-telegram--downloader--bot-blue?logo=github)](https://github.com/YOUR_USERNAME/telegram-downloader-bot)
+[![GitHub](https://img.shields.io/badge/GitHub-bot--download--videos-blue?logo=github)](https://github.com/w70t/bot-download-videos)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.8%2B-blue?logo=python)](https://www.python.org/)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-12%2B-blue?logo=postgresql)](https://www.postgresql.org/)
