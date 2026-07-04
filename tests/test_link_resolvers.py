@@ -9,8 +9,19 @@ import link_resolvers
 from link_resolvers import (
     _is_music_link, _music_search_query, resolve_snapchat_spotlight,
     resolve_instagram_media, resolve_tiktok_media, resolve_tiktok_images,
-    resolve_twitter_media, _extract_twitter_media,
+    resolve_twitter_media, _extract_twitter_media, all_mirror_hosts,
 )
+
+
+def test_all_mirror_hosts_lists_configured_mirrors():
+    hosts = all_mirror_hosts()
+    # قائمة أزواج (منصة، مضيف) تشمل المرايا الافتراضية
+    assert all(isinstance(p, tuple) and len(p) == 2 for p in hosts)
+    platforms = {p for p, _ in hosts}
+    assert {'instagram', 'tiktok', 'twitter'} <= platforms
+    host_names = {h for _, h in hosts}
+    assert 'tikwm.com' in host_names
+    assert 'api.vxtwitter.com' in host_names
 
 
 def test_is_music_link():
