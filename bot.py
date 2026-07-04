@@ -65,6 +65,7 @@ from video_processing import (
 from download_errors import (
     _is_drm_error, _is_geo_restricted_error, _is_youtube_cookie_issue,
     _is_facebook_cookie_issue, _is_cookie_file_issue, _is_restricted_content_error,
+    _is_http_403_error,
 )
 
 
@@ -836,6 +837,40 @@ def _download_images_from_urls(image_urls, dest_dir):
         except Exception as e:
             logger.warning(f"⚠️ فشل تنزيل صورة تيك توك من المرآة: {e}")
     return paths
+
+
+# الصيغ التي يقبلها تلجرام كصورة (photo). غير ذلك (webp/heic/gif) يُرفض بخطأ
+# [400 PHOTO_EXT_INVALID] فنحوّله إلى JPEG قبل الإرسال.
+_TG_PHOTO_EXTS = ('.jpg', '.jpeg', '.png')
+
+
+def _normalize_images_for_telegram(files):
+    """يحوّل أي صورة بامتداد لا يقبله تلجرام كصورة (webp/heic/gif) إلى JPEG عبر
+    ffmpeg، لتفادي خطأ [400 PHOTO_EXT_INVALID] في send_photo/send_media_group.
+
+    الصور بصيغة jpg/jpeg/png تُترك كما هي. الصورة التي يتعذّر تحويلها تُتخطّى
+    (لا نُفشِل الألبوم كله). يحافظ على ترتيب الصور الأصلي (ترتيب الكاروسيل)."""
+    out = []
+    for fpath in files:
+        ext = os.path.splitext(fpath)[1].lower()
+        if ext in _TG_PHOTO_EXTS:
+            out.append(fpath)
+            continue
+        jpg_path = os.path.splitext(fpath)[0] + '_tg.jpg'
+        try:
+            subprocess.run(
+                ['ffmpeg', '-y', '-i', fpath, '-frames:v', '1', jpg_path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60
+            )
+            if os.path.isfile(jpg_path) and os.path.getsize(jpg_path) > 0:
+                out.append(jpg_path)
+                logger.info(f"🔄 حُوّلت صورة {ext} إلى JPEG لتلجرام: {os.path.basename(fpath)}")
+            else:
+                logger.warning(
+                    f"⚠️ تعذّر تحويل صورة {ext} إلى JPEG (ستُتخطّى): {os.path.basename(fpath)}")
+        except Exception as e:
+            logger.warning(f"⚠️ خطأ في تحويل صورة {ext} إلى JPEG (ستُتخطّى): {e}")
+    return out
 
 
 async def upload_media_with_progress(client, chat_id, file_path, caption, status_msg, user_id, is_video=True):
@@ -1745,6 +1780,13 @@ async def download_and_send_images(client, message, url, status_msg,
         if not files:
             return False  # ليست صوراً → ارجع لمسار الفيديو
 
+        # حوّل أي صورة بصيغة لا يقبلها تلجرام (webp/heic/gif) إلى JPEG لتفادي
+        # خطأ [400 PHOTO_EXT_INVALID] عند الإرسال كألبوم/صورة
+        files = _normalize_images_for_telegram(files)
+        if not files:
+            logger.warning("⚠️ لم تبقَ صور صالحة للإرسال بعد التحويل لتلجرام")
+            return False
+
         title = ((info or {}).get('title') or 'صور').replace('`', "'")[:200]
         bot_username = await _get_bot_username(client)
         caption = t('images_caption', lang,
@@ -2080,15 +2122,25 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         is_facebook_url = any(m in url.lower() for m in PLATFORM_URL_MARKERS['facebook'])
         is_instagram_url = _platform_of(url) == 'instagram'
 
-        def download(use_cookies=True, fmt=None, url_override=None):
+        def download(use_cookies=True, fmt=None, url_override=None, yt_clients=None):
             o = dict(ydl_opts)
             if fmt:
                 o['format'] = fmt
             if not use_cookies:
                 o.pop('cookiefile', None)
+            # فرض مجموعة عملاء مشغّل بديلة ليوتيوب (لإعادة الاستخراج بروابط جديدة)
+            if yt_clients and is_youtube_url:
+                o['extractor_args'] = {
+                    'youtube': {'player_client': list(yt_clients),
+                                'formats': ['missing_pot']}
+                }
             with yt_dlp.YoutubeDL(o) as ydl:
                 info = ydl.extract_info(url_override or url, download=True)
                 return info, ydl.prepare_filename(info)
+
+        # عملاء مشغّل بديلون ليوتيوب عند خطأ 403 (روابط صيغ محظورة/منتهية):
+        # إعادة الاستخراج بهؤلاء تعطي روابط تنزيل جديدة غير محظورة.
+        YT_403_FALLBACK_CLIENTS = ['tv', 'ios', 'web_safari', 'mweb', 'android']
 
         # صيغة متساهلة احتياطية عند فشل المُحدّد الصارم (بلا فلترة ترميز/امتداد)
         fallback_fmt = 'bestaudio/best' if is_audio else 'bv*+ba/b/best'
@@ -2117,6 +2169,18 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                         info, file_path = await loop.run_in_executor(None, lambda: download(False, fallback_fmt))
                     else:
                         raise
+            # يوتيوب: خطأ 403 عند تنزيل بيانات الفيديو = روابط صيغ محظورة/منتهية
+            # لعميل المشغّل الحالي → أعد الاستخراج بعملاء بدلاء (روابط جديدة) وبلا كوكيز
+            elif is_youtube_url and _is_http_403_error(dl_err):
+                logger.warning("⚠️ فشل تحميل يوتيوب بخطأ 403، إعادة المحاولة بعملاء مشغّل بدلاء...")
+                try:
+                    info, file_path = await loop.run_in_executor(
+                        None, lambda: download(False, yt_clients=YT_403_FALLBACK_CLIENTS))
+                except Exception:
+                    logger.warning("⚠️ استمرار فشل يوتيوب 403، إعادة المحاولة بأفضل صيغة متاحة")
+                    info, file_path = await loop.run_in_executor(
+                        None, lambda: download(False, fallback_fmt,
+                                               yt_clients=YT_403_FALLBACK_CLIENTS))
             # فيسبوك بكوكيز فاسدة قد يكسر تحميل المحتوى العام → أعد المحاولة بدون كوكيز
             elif ydl_opts.get('cookiefile') and is_facebook_url and _is_facebook_cookie_issue(dl_err):
                 logger.warning("⚠️ فشل تحميل فيسبوك مع الكوكيز (Cannot parse data)، إعادة المحاولة بدون كوكيز...")
