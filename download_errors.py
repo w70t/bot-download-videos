@@ -36,6 +36,17 @@ def _is_geo_restricted_error(err, url=''):
     return False
 
 
+def _is_http_403_error(err):
+    """هل الفشل بسبب HTTP 403 Forbidden أثناء تنزيل بيانات الفيديو؟
+
+    شائع في يوتيوب: روابط الصيغ التي يعطيها عميل مشغّل معيّن قد تنتهي صلاحيتها
+    أو تُحظر (throttling) فيظهر 'unable to download video data: HTTP Error 403:
+    Forbidden'. إعادة الاستخراج بعميل مشغّل آخر تُنتج روابط جديدة غير محظورة.
+    """
+    msg = str(err).lower()
+    return '403' in msg and ('forbidden' in msg or 'download video data' in msg)
+
+
 def _is_youtube_cookie_issue(err):
     """هل خطأ يوتيوب ناتج عن حجب الصيغ بسبب الكوكيز/الحماية؟"""
     msg = str(err).lower()

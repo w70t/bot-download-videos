@@ -4,6 +4,7 @@
 from download_errors import (
     _is_drm_error, _is_geo_restricted_error, _is_youtube_cookie_issue,
     _is_facebook_cookie_issue, _is_cookie_file_issue, _is_restricted_content_error,
+    _is_http_403_error,
 )
 
 
@@ -39,6 +40,13 @@ def test_facebook_cookie_issue():
 def test_cookie_file_issue():
     assert _is_cookie_file_issue("cookies file is not in Netscape format")
     assert not _is_cookie_file_issue('netscape browser detected')
+
+
+def test_http_403_error():
+    assert _is_http_403_error('ERROR: unable to download video data: HTTP Error 403: Forbidden')
+    assert _is_http_403_error('HTTP Error 403: Forbidden')
+    assert not _is_http_403_error('HTTP Error 404: Not Found')
+    assert not _is_http_403_error('Network timeout')
 
 
 def test_restricted_content():
