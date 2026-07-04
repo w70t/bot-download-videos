@@ -3,10 +3,12 @@
 
 from unittest.mock import patch
 
+import json
+
 import link_resolvers
 from link_resolvers import (
     _is_music_link, _music_search_query, resolve_snapchat_spotlight,
-    resolve_instagram_media,
+    resolve_instagram_media, resolve_tiktok_media,
 )
 
 
@@ -89,4 +91,61 @@ def test_instagram_resolver_handles_network_error():
     # فشل الطلب الشبكي → None بلا استثناء
     with patch('urllib.request.urlopen', side_effect=OSError('boom')):
         out = resolve_instagram_media('https://www.instagram.com/reel/ABC123/')
+    assert out is None
+
+
+# ── resolve_tiktok_media ────────────────────────────────────────
+
+class _FakeJsonResp:
+    """محاكاة استجابة urlopen تُرجع جسم JSON عبر read()."""
+    def __init__(self, payload):
+        self._body = json.dumps(payload).encode('utf-8')
+
+    def read(self, *a):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_tiktok_resolver_ignores_non_tiktok():
+    # روابط غير تيك توك تعود None بلا أي طلب شبكي
+    assert resolve_tiktok_media('https://youtube.com/watch?v=1') is None
+    assert resolve_tiktok_media('') is None
+
+
+def test_tiktok_resolver_returns_direct_video():
+    # المرآة تُرجع رابط hdplay مباشر → نعيده
+    play = 'https://tikwm.com/video/media/hdplay/abc.mp4'
+    payload = {'code': 0, 'data': {'hdplay': play, 'play': 'https://x/p.mp4'}}
+    with patch('urllib.request.urlopen', return_value=_FakeJsonResp(payload)), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        out = resolve_tiktok_media('https://vt.tiktok.com/ZSCV5WkL7')
+    assert out == play
+
+
+def test_tiktok_resolver_prepends_host_for_relative_path():
+    # مسار نسبي من المرآة → يُكمَّل برابط كامل على مضيف المرآة
+    payload = {'code': 0, 'data': {'play': '/video/media/play/abc.mp4'}}
+    with patch('urllib.request.urlopen', return_value=_FakeJsonResp(payload)), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        out = resolve_tiktok_media('https://www.tiktok.com/@u/video/123')
+    assert out == 'https://tikwm.com/video/media/play/abc.mp4'
+
+
+def test_tiktok_resolver_none_when_no_media():
+    # المرآة لا تُرجع أي رابط فيديو (منشور صور/فشل) → None
+    payload = {'code': -1, 'data': {}}
+    with patch('urllib.request.urlopen', return_value=_FakeJsonResp(payload)):
+        out = resolve_tiktok_media('https://vt.tiktok.com/ZSCV5WkL7')
+    assert out is None
+
+
+def test_tiktok_resolver_handles_network_error():
+    # فشل الطلب الشبكي → None بلا استثناء
+    with patch('urllib.request.urlopen', side_effect=OSError('boom')):
+        out = resolve_tiktok_media('https://vt.tiktok.com/ZSCV5WkL7')
     assert out is None

@@ -49,7 +49,7 @@ from cookies_manager import (
 )
 from link_resolvers import (
     resolve_snapchat_spotlight, _is_music_link, resolve_music_link,
-    resolve_instagram_media,
+    resolve_instagram_media, resolve_tiktok_media,
 )
 from content_filter import (
     ADULT_DOMAINS, _custom_adult_domains, _custom_adult_keywords,
@@ -536,7 +536,7 @@ def _youtube_extractor_args():
 _last_info_error = contextvars.ContextVar('_last_info_error', default=None)
 
 
-def _extract_direct_media(direct_url: str):
+def _extract_direct_media(direct_url: str, title: str = 'Video'):
     """يستخرج معلومات yt-dlp من رابط وسائط مباشر (mp4) ويمنحه عنواناً نظيفاً.
     يُستدعى داخل executor (طلب شبكي متزامن)."""
     opts = {'quiet': True, 'no_warnings': True, 'skip_download': True,
@@ -545,7 +545,7 @@ def _extract_direct_media(direct_url: str):
         info = ydl.extract_info(direct_url, download=False)
     if info is not None:
         # عنوان CDN معرّف طويل غير مفيد → عنوان واضح للمستخدم
-        info['title'] = 'Instagram Video'
+        info['title'] = title
     return info
 
 
@@ -566,12 +566,42 @@ async def _instagram_video_fallback(url: str):
         return None
     loop = asyncio.get_event_loop()
     try:
-        info = await loop.run_in_executor(None, lambda: _extract_direct_media(direct))
+        info = await loop.run_in_executor(
+            None, lambda: _extract_direct_media(direct, 'Instagram Video')
+        )
         if info:
             logger.info("✅ إنستغرام عبر المرآة العامة (بديل yt-dlp، بلا كوكيز)")
         return info
     except Exception as e:
         logger.warning(f"⚠️ فشل استخراج إنستغرام البديل: {e}")
+        return None
+
+
+async def resolve_tiktok_direct(url: str):
+    """يحل رابط تيك توك إلى رابط الفيديو المباشر عبر مرآة عامة (بلا كوكيز).
+    يعيد رابط mp4 المباشر أو None. طلب شبكي متزامن يُنفَّذ خارج حلقة الأحداث."""
+    if _platform_of(url) != 'tiktok':
+        return None
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, resolve_tiktok_media, url)
+
+
+async def _tiktok_video_fallback(url: str):
+    """خطة بديلة لتيك توك عند فشل yt-dlp (حجب IP الخادم): يحل الرابط لملف فيديو
+    مباشر عبر مرآة عامة ثم يستخرج معلوماته. يعيد dict أو None."""
+    direct = await resolve_tiktok_direct(url)
+    if not direct:
+        return None
+    loop = asyncio.get_event_loop()
+    try:
+        info = await loop.run_in_executor(
+            None, lambda: _extract_direct_media(direct, 'TikTok Video')
+        )
+        if info:
+            logger.info("✅ تيك توك عبر المرآة العامة (بديل yt-dlp، بلا كوكيز)")
+        return info
+    except Exception as e:
+        logger.warning(f"⚠️ فشل استخراج تيك توك البديل: {e}")
         return None
 
 
@@ -667,6 +697,11 @@ async def get_video_info(url: str):
         ig = await _instagram_video_fallback(url)
         if ig:
             return ig
+        # 🎯 خطة بديلة لتيك توك: حجب IP الخادم ("Your IP address is blocked")
+        #    يفشل yt-dlp حتى مع كوكيز → جرّب مرآة عامة بعنوان IP مختلف
+        tk = await _tiktok_video_fallback(url)
+        if tk:
+            return tk
         return None
 
 
