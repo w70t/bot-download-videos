@@ -1379,6 +1379,36 @@ def cleanup_download_dir(dl_dir):
         logger.error(f"❌ خطأ في حذف مجلد التحميل {dl_dir}: {e}")
 
 
+_PLATFORM_TITLE_LABELS = {
+    'instagram': 'Instagram', 'tiktok': 'TikTok', 'twitter': 'Twitter/X',
+    'facebook': 'Facebook', 'youtube': 'YouTube', 'snapchat': 'Snapchat',
+    'reddit': 'Reddit', 'pinterest': 'Pinterest', 'threads': 'Threads',
+}
+
+
+def _looks_like_media_id(title: str) -> bool:
+    """هل العنوان معرّف CDN/هاش قبيح لا اسم مقروء؟ (كلمة واحدة طويلة تخلط حروفاً
+    وأرقاماً بلا مسافات — مثل اسم ملف إنستغرام عبر المرآة AQM4FbWDo4mvcl...)."""
+    s = (title or '').strip()
+    if not s or ' ' in s:
+        return False  # فارغ أو فيه مسافات (كلمات مقروءة) → ليس معرّفاً
+    core = s.replace('_', '').replace('-', '')
+    return (len(s) >= 24 and core.isalnum()
+            and any(c.isalpha() for c in core)
+            and any(c.isdigit() for c in core))
+
+
+def _clean_media_title(raw_title, url):
+    """عنوان عرض ودود موحّد بين المنصات: يُبقي العناوين المقروءة كما هي، لكن
+    يستبدل العناوين الفارغة أو معرّفات CDN القبيحة (شائعة لإنستغرام عبر المرآة)
+    باسم منصة نظيف مثل 'Instagram Video' — تماماً كما تظهر تيك توك/تويتر."""
+    title = (raw_title or '').strip()
+    if title and not _looks_like_media_id(title):
+        return title
+    label = _PLATFORM_TITLE_LABELS.get(_platform_of(url))
+    return f"{label} Video" if label else 'فيديو'
+
+
 def _build_media_caption(title, file_size_mb, duration, user_name, bot_username=None):
     """وصف الوسائط الموحّد: العنوان قابل للنسخ (monospace) + الحجم والمدة +
     يوزر البوت (يبقى مع الفيديو عند إعادة إرساله)."""
@@ -2080,8 +2110,9 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         # معلومات الملف
         file_size_mb = get_file_size_mb(file_path)
         duration = info.get('duration', 0)
-        # العنوان كاملاً (مع إزالة ` حتى لا يكسر تنسيق النسخ) بحد آمن للوصف
-        title = (info.get('title') or 'فيديو').replace('`', "'")[:300]
+        # العنوان: اسم نظيف موحّد بين المنصات (يستبدل معرّفات CDN القبيحة مثل
+        # إنستغرام عبر المرآة)، مع إزالة ` حتى لا يكسر تنسيق النسخ وحد آمن للوصف
+        title = _clean_media_title(info.get('title'), url).replace('`', "'")[:300]
         
         logger.info(f"📊 حجم الملف النهائي: {file_size_mb:.2f} MB")
 
