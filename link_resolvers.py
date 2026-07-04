@@ -232,6 +232,48 @@ def resolve_tiktok_media(url: str, timeout: int = 20):
     return None
 
 
+def resolve_tiktok_images(url: str, timeout: int = 20):
+    """يعيد قائمة روابط صور منشور تيك توك المصوّر (سلايدشو) عبر مرآة عامة بلا
+    كوكيز، حين يفشل gallery-dl (حجب IP الخادم). قائمة روابط مباشرة مرتّبة، أو
+    قائمة فارغة لغير تيك توك أو لمنشور فيديو (لا صور) أو عند أي فشل."""
+    import json
+    import urllib.parse
+    import urllib.request
+    low = (url or '').lower()
+    if 'tiktok.' not in low:
+        return []
+    for host in _TIKTOK_API_HOSTS:
+        for target in _tiktok_candidate_urls(url):
+            try:
+                api_url = f"https://{host}/api/?url={urllib.parse.quote(target, safe='')}"
+                req = urllib.request.Request(api_url, headers={
+                    'User-Agent': _BOT_UA,
+                    'Accept': 'application/json',
+                })
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    payload = json.loads(resp.read(4_000_000).decode('utf-8', 'ignore'))
+                images = ((payload or {}).get('data') or {}).get('images')
+                if not isinstance(images, list) or not images:
+                    continue
+                out = []
+                for img in images:
+                    # عنصر الصورة قد يكون رابطاً نصياً أو كائناً فيه url
+                    src = img if isinstance(img, str) else (
+                        img.get('url') if isinstance(img, dict) else None)
+                    if isinstance(src, str) and src.startswith('/'):
+                        src = f"https://{host}{src}"
+                    if (isinstance(src, str)
+                            and src.lower().startswith(('http://', 'https://'))
+                            and is_safe_url(src)):
+                        out.append(src)
+                if out:
+                    logger.info(f"🎯 صور تيك توك عبر {host}: {len(out)} صورة")
+                    return out
+            except Exception as e:
+                logger.warning(f"⚠️ تعذّر جلب صور تيك توك عبر {host}: {e}")
+    return []
+
+
 # ═══════════════════════════════════════════════════════════════
 # مرآة تويتر/إكس العامة (بديل عند فشل yt-dlp)
 # تويتر/X قد يحجب/يقيّد الوصول (403، حظر جغرافي/حقوق بث، محتوى حسّاس) فيفشل

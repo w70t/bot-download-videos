@@ -8,7 +8,7 @@ import json
 import link_resolvers
 from link_resolvers import (
     _is_music_link, _music_search_query, resolve_snapchat_spotlight,
-    resolve_instagram_media, resolve_tiktok_media,
+    resolve_instagram_media, resolve_tiktok_media, resolve_tiktok_images,
     resolve_twitter_media, _extract_twitter_media,
 )
 
@@ -178,6 +178,36 @@ def test_tiktok_resolver_handles_network_error():
     with patch('urllib.request.urlopen', side_effect=OSError('boom')):
         out = resolve_tiktok_media('https://www.tiktok.com/@u/video/123')
     assert out is None
+
+
+# ── resolve_tiktok_images ───────────────────────────────────────
+
+def test_tiktok_images_ignores_non_tiktok():
+    assert resolve_tiktok_images('https://youtube.com/watch?v=1') == []
+    assert resolve_tiktok_images('') == []
+
+
+def test_tiktok_images_returns_urls():
+    imgs = ['https://tikwm.com/img/1.jpg', 'https://tikwm.com/img/2.jpg']
+    payload = {'code': 0, 'data': {'images': imgs}}
+    with patch('urllib.request.urlopen', return_value=_FakeJsonResp(payload)), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        out = resolve_tiktok_images('https://www.tiktok.com/@u/photo/123')
+    assert out == imgs
+
+
+def test_tiktok_images_empty_for_video_post():
+    # منشور فيديو (لا صور) → قائمة فارغة
+    payload = {'code': 0, 'data': {'play': 'https://x/v.mp4'}}
+    with patch('urllib.request.urlopen', return_value=_FakeJsonResp(payload)):
+        out = resolve_tiktok_images('https://www.tiktok.com/@u/video/123')
+    assert out == []
+
+
+def test_tiktok_images_handles_network_error():
+    with patch('urllib.request.urlopen', side_effect=OSError('boom')):
+        out = resolve_tiktok_images('https://www.tiktok.com/@u/photo/123')
+    assert out == []
 
 
 # ── resolve_twitter_media ───────────────────────────────────────
