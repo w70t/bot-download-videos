@@ -76,6 +76,8 @@ def finalize_video(video_path):
     (width, height, duration) الحقيقية من الملف:
     - يضمن ترميز H.264/AAC: ينسخ إن كان متوافقاً، وإلا يُعيد الترميز (سبب
       تجمّد الصورة في فيسبوك/منصات أخرى تستخدم VP9/AV1).
+    - يضيف مسار صوت صامت للفيديو الذي لا صوت له: بدونه يعرض تلجرام المقطع
+      كـ"صورة متحركة" (GIF) صامتة تُعاد تلقائياً بدل فيديو حقيقي بزر تشغيل.
     - +faststart: نقل moov atom للبداية ليُعاين ويُشغّل فوراً.
     - حذف بيانات creation_time الوصفية: بوجودها يؤرشف المعرض (خاصة iOS)
       المقطع بوقت التحميل على الخادم؛ بحذفها يعتمد الجهاز وقت حفظ المستخدم
@@ -85,18 +87,36 @@ def finalize_video(video_path):
 
     # هل الترميز متوافق مع مشغّل تلجرام؟ (None = غير معروف، نكتفي بالنسخ)
     v_compatible = vcodec in ('h264', 'avc1', None)
-    a_compatible = acodec in ('aac', 'mp4a', None)
+    # acodec is None يعني لا مسار صوت في الملف (فرق جوهري عن "صوت متوافق").
+    has_audio = bool(acodec)
+    a_compatible = acodec in ('aac', 'mp4a')
     v_args = ['-c:v', 'copy'] if v_compatible else \
         ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p']
-    a_args = ['-c:a', 'copy'] if a_compatible else ['-c:a', 'aac', '-b:a', '128k']
     if not v_compatible:
         logger.info(f"🎞️ إعادة ترميز الفيديو إلى H.264 (المصدر: {vcodec})")
+
+    # مدخل صوت صامت (anullsrc) يُضاف حين لا يوجد صوت أصلاً، حتى لا يعرضه
+    # تلجرام كصورة متحركة. -shortest يقصّه على طول الفيديو.
+    if has_audio:
+        input_args = ['-i', video_path]
+        map_args = ['-map', '0:v?', '-map', '0:a?']
+        a_args = ['-c:a', 'copy'] if a_compatible else ['-c:a', 'aac', '-b:a', '128k']
+        extra_args = []
+    else:
+        logger.info("🔇 الفيديو بلا صوت — إضافة مسار صوت صامت لمنع عرضه كصورة متحركة")
+        input_args = [
+            '-i', video_path,
+            '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+        ]
+        map_args = ['-map', '0:v:0', '-map', '1:a:0']
+        a_args = ['-c:a', 'aac', '-b:a', '128k']
+        extra_args = ['-shortest']
 
     tmp = os.path.splitext(video_path)[0] + '.fixed.mp4'
     try:
         cmd = (
-            ['ffmpeg', '-y', '-i', video_path, '-map', '0:v?', '-map', '0:a?']
-            + v_args + a_args
+            ['ffmpeg', '-y'] + input_args + map_args
+            + v_args + a_args + extra_args
             # -map_metadata -1: حذف البيانات الوصفية (منها creation_time) حتى
             # يؤرشف معرض الجوال المقطع بوقت حفظ المستخدم لا بوقت التحميل
             + ['-movflags', '+faststart', '-map_metadata', '-1', tmp]
