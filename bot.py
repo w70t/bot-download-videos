@@ -50,6 +50,7 @@ from cookies_manager import (
 from link_resolvers import (
     resolve_snapchat_spotlight, _is_music_link, resolve_music_link,
     resolve_instagram_media, resolve_tiktok_media, resolve_twitter_media,
+    resolve_tiktok_images,
 )
 from content_filter import (
     ADULT_DOMAINS, _custom_adult_domains, _custom_adult_keywords,
@@ -811,6 +812,30 @@ def _download_images_with_gallery_dl(url, dest_dir, cookie_file=None):
         files = []
     files.sort()
     return files
+
+
+def _download_images_from_urls(image_urls, dest_dir):
+    """ينزّل قائمة روابط صور مباشرة إلى dest_dir ويعيد مسارات الملفات مرتّبة.
+    يُستخدم كبديل لصور تيك توك عبر المرآة حين يفشل gallery-dl (حجب IP)."""
+    import urllib.request
+    os.makedirs(dest_dir, exist_ok=True)
+    ua = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+          '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+    paths = []
+    for i, src in enumerate(image_urls[:GALLERY_DL_MAX_IMAGES], 1):
+        try:
+            ext = os.path.splitext(src.split('?', 1)[0])[1].lower()
+            if ext not in _IMAGE_EXTS:
+                ext = '.jpg'
+            dest = os.path.join(dest_dir, f"{i:03d}{ext}")
+            req = urllib.request.Request(src, headers={'User-Agent': ua})
+            with urllib.request.urlopen(req, timeout=30) as resp, open(dest, 'wb') as fh:
+                shutil.copyfileobj(resp, fh)
+            if os.path.getsize(dest) > 0:
+                paths.append(dest)
+        except Exception as e:
+            logger.warning(f"⚠️ فشل تنزيل صورة تيك توك من المرآة: {e}")
+    return paths
 
 
 async def upload_media_with_progress(client, chat_id, file_path, caption, status_msg, user_id, is_video=True):
@@ -1666,6 +1691,18 @@ async def download_and_send_images(client, message, url, status_msg,
         files = await loop.run_in_executor(
             None, lambda: _download_images_with_gallery_dl(url, dl_dir, cookie_file)
         )
+
+        # 🎯 بديل صور تيك توك: gallery-dl يفشل عند حجب IP الخادم → اجلب روابط
+        #    الصور من مرآة عامة (بلا كوكيز) ونزّلها بعنوان IP مختلف
+        if not files and _platform_of(url) == 'tiktok':
+            image_urls = await loop.run_in_executor(
+                None, lambda: resolve_tiktok_images(url))
+            if image_urls:
+                files = await loop.run_in_executor(
+                    None, lambda: _download_images_from_urls(image_urls, dl_dir))
+                if files:
+                    logger.info(
+                        f"✅ صور تيك توك عبر المرآة العامة ({len(files)} صورة، بلا كوكيز)")
 
         if not files:
             return False  # ليست صوراً → ارجع لمسار الفيديو
