@@ -3066,7 +3066,7 @@ async def run_realusers_check(client, message):
         joined = 0
 
     status = await message.reply_text(
-        f"🔍 **جارٍ فحص الأعضاء…**\n\n👥 الإجمالي: {total_before}\n⏳ التقدّم: 0/{total_before}"
+        f"🔍 **جارٍ فحص الأعضاء…**\n\n📦 في القاعدة: {total_before}\n⏳ التقدّم: 0/{total_before}"
     )
 
     # خنق سرعة تعديل العدّاد زمنياً (تفادي حدود تلجرام) — تعديل كل ~3 ثوانٍ
@@ -5034,6 +5034,19 @@ def _last_realcheck_line():
     return f"🕐 آخر فحص فعلي: {ts}" if ts else "🕐 لم يُجرَ فحص فعلي بعد"
 
 
+def _current_member_count():
+    """المصدر الموحّد لعدد الأعضاء الحاليين المعروض في كل اللوحات (زر الفحص،
+    التذكير، الإعدادات): العدد الحقيقي من آخر فحص إن وُجد، وإلا عدد قاعدة
+    البيانات — فيظهر الرقم نفسه في كل مكان."""
+    alive = _get_realcheck_alive()
+    if alive is not None:
+        return alive
+    try:
+        return subdb.get_user_stats()['total']
+    except Exception:
+        return 0
+
+
 async def subscription_settings_panel(client, message, user_id=None, edit=False):
     """لوحة إعدادات الاشتراك للأدمن.
 
@@ -5056,9 +5069,9 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
     # العدد الحقيقي من آخر فحص (يستبعد من حظر البوت/غير المتفاعلين). إن وُجد
     # نعرضه كـ«المجموع»، وإلا نعرض عدد قاعدة البيانات.
     real_alive = _get_realcheck_alive()
-    total_display = real_alive if real_alive is not None else stats['total']
+    total_display = _current_member_count()
     free_display = max(0, total_display - stats['subscribed'])
-    db_note = (f"📦 في قاعدة البيانات: {stats['total']} (اضغط الفحص للتنظيف)\n"
+    db_note = (f"📦 في القاعدة: {stats['total']} (للتنظيف)\n"
                if real_alive is not None and real_alive != stats['total'] else "")
     try:
         gs = subdb.get_gender_stats()
@@ -5107,20 +5120,17 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
 
     text = (
         f"💎 **إعدادات الاشتراك**\n\n"
-        f"⏱️ **الحد الأقصى للمجاني:** {max_duration} دقيقة\n"
-        f"💰 **الأسعار:** شهري {price_m} | سنوي {price_y}\n"
-        f"📅 **المدد:** شهري 30 يوم | سنوي 365 يوم\n"
-        f"🔞 **حظر المحتوى الإباحي:** {'مُفعّل ✅' if adult_on else 'متوقف ❌'}\n"
-        f"⏯️ **التحميل للأعضاء:** {'يعمل ▶️' if dl_on else 'متوقف ⏸️'}\n\n"
-        f"📊 **الأعضاء الحقيقيون:**\n"
-        f"• المجموع: {total_display} عضو{' ✅' if real_alive is not None else ''}\n"
-        f"• المشتركون: {stats['subscribed']} 💎\n"
-        f"• العاديون: {free_display} 🆓\n"
-        f"• 👨 رجال: {gs['male']} | 👩 نساء: {gs['female']}\n"
-        f"• 🇸🇦 عربي: {lc['ar']} | 🇬🇧 إنجليزي: {lc['en']}\n"
+        f"⏱️ الحد المجاني: **{max_duration}** دقيقة\n"
+        f"💰 الأسعار: شهري {price_m} · سنوي {price_y}\n"
+        f"📅 المدد: 30 · 365 يوم\n"
+        f"🔞 الحظر الإباحي: {'✅ مُفعّل' if adult_on else '❌ متوقف'}\n"
+        f"⏯️ التحميل: {'▶️ يعمل' if dl_on else '⏸️ متوقف'}\n\n"
+        f"👥 **الأعضاء: {total_display}**{' ✅' if real_alive is not None else ''}\n"
+        f"💎 مشتركون: {stats['subscribed']} · 🆓 عاديون: {free_display}\n"
+        f"👨 رجال: {gs['male']} · 👩 نساء: {gs['female']}\n"
+        f"🇸🇦 عربي: {lc['ar']} · 🇬🇧 إنجليزي: {lc['en']}\n"
         f"{db_note}"
-        f"{_last_realcheck_line()}\n"
-        f"💡 اضغط «👥 فحص العدد الحقيقي» لحذف من حظر البوت وتحديث الأرقام.\n\n"
+        f"{_last_realcheck_line()}\n\n"
         f"**اختر الإعداد:**"
     )
 
@@ -5378,8 +5388,9 @@ async def handle_subscription_settings(client, callback_query):
             return
         await callback_query.message.edit_text(
             f"📨 **تذكير الأعضاء غير النشطين**\n\n"
+            f"👥 الأعضاء: **{_current_member_count()}**\n"
             f"⏳ الخمول: ≥ {days} أيام\n"
-            f"👥 العدد: **{len(inactive)}** عضو\n\n"
+            f"😴 غير النشطين: **{len(inactive)}** عضو\n\n"
             "سيُرسل لكل عضو تذكيراً **بلغته**، ويُحذف تذكيره السابق تلقائياً "
             "(يبقى الأحدث فقط).",
             reply_markup=InlineKeyboardMarkup([
@@ -5640,10 +5651,15 @@ async def handle_subscription_settings(client, callback_query):
         
         gs = subdb.get_gender_stats()
         lc = subdb.get_language_counts()
+        current = _current_member_count()
+        free_now = max(0, current - stats['subscribed'])
+        db_note = (f"📦 <b>في القاعدة:</b> {stats['total']} (للتنظيف)\n"
+                   if current != stats['total'] else "")
         text = "📊 <b>إحصائيات الأعضاء</b>\n\n"
-        text += f"👥 <b>إجمالي الأعضاء:</b> {stats['total']}\n"
+        text += f"👥 <b>الأعضاء:</b> {current}\n"
         text += f"💎 <b>المشتركون:</b> {stats['subscribed']}\n"
-        text += f"🆓 <b>العاديون:</b> {stats['free']}\n"
+        text += f"🆓 <b>العاديون:</b> {free_now}\n"
+        text += db_note
         text += f"👤 <b>الجنس:</b> 👨 {gs['male']} | 👩 {gs['female']}\n"
         text += f"🌐 <b>اللغة:</b> 🇸🇦 {lc['ar']} | 🇬🇧 {lc['en']}\n\n"
 
