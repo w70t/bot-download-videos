@@ -888,6 +888,20 @@ def _fetch_mirror_image_url(proxy_url, ua, timeout):
     return None
 
 
+def _is_instagram_video_only_url(url):
+    """هل الرابط ريل/IGTV إنستغرام (reel|reels|tv)؟ هذه الأنواع فيديو دائماً وليست
+    منشور صور، فنستبعدها من مسار الصور كي لا تُرسَل صورة الغلاف بدل الفيديو."""
+    import re
+    from urllib.parse import urlparse as _urlparse
+    if _platform_of(url) != 'instagram':
+        return False
+    try:
+        path = _urlparse(url).path
+    except Exception:
+        return False
+    return bool(re.search(r'/(?:reel|reels|tv)/[A-Za-z0-9_-]+', path, re.I))
+
+
 def resolve_instagram_images(url, timeout=20):
     """يعيد قائمة روابط صور منشور إنستغرام عبر مرآة InstaFix العامة بلا كوكيز،
     لتُحمَّل حين يعجز gallery-dl عن جلبها (تسجيل دخول مطلوب/حجب IP).
@@ -1849,6 +1863,14 @@ async def download_and_send_images(client, message, url, status_msg,
     (فيرجع المتصل لمسار الفيديو المعتاد). لا يكسر أي سلوك للفيديو القائم.
     """
     from pyrogram.types import InputMediaPhoto
+
+    # 🎥 حارس: ريلز/IGTV إنستغرام (reel|reels|tv) فيديو دائماً — ليست منشور صور.
+    # نمنع مسار الصور بالكامل لها حتى لا يُرسَل غلاف الريل كصورة (سواء من
+    # gallery-dl بخيار videos=false أو من المرآة العامة). فتبقى على مسار الفيديو
+    # ورسالة الفشل الواضحة عند تعذّر التحميل.
+    if _is_instagram_video_only_url(url):
+        logger.info("🎥 رابط ريل/IGTV إنستغرام — تخطّي مسار الصور (فيديو حصراً)")
+        return False
 
     dl_dir = os.path.join('videos', 'img_' + uuid.uuid4().hex)
     ckey = cache_key_for_url(url)
