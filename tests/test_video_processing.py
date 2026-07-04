@@ -60,6 +60,16 @@ def test_incompatible_audio_reencoded_not_silenced(tmp_path):
     assert '-c:a' in cmd and 'aac' in cmd
 
 
+def test_probe_failure_does_not_silence_audio(tmp_path):
+    # فشل ffprobe كلياً (كل القيم None): لا نعرف إن كان ثمة صوت، فلا نحقن
+    # صوتاً صامتاً حتى لا نُسقط صوتاً موجوداً — ننسخ v/a بأمان.
+    cmd = _run_finalize(tmp_path, (None, None, None, None, None))
+    joined = ' '.join(cmd)
+    assert 'anullsrc' not in joined
+    assert '-shortest' not in cmd
+    assert '-map' in cmd and '0:a?' in cmd  # مسار الصوت الأصلي محفوظ إن وُجد
+
+
 def test_faststart_and_metadata_strip_always(tmp_path):
     for probe in [('h264', None, 100, 100, 5), ('h264', 'aac', 100, 100, 5)]:
         cmd = _run_finalize(tmp_path, probe)

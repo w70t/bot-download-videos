@@ -87,9 +87,12 @@ def finalize_video(video_path):
 
     # هل الترميز متوافق مع مشغّل تلجرام؟ (None = غير معروف، نكتفي بالنسخ)
     v_compatible = vcodec in ('h264', 'avc1', None)
-    # acodec is None يعني لا مسار صوت في الملف (فرق جوهري عن "صوت متوافق").
-    has_audio = bool(acodec)
-    a_compatible = acodec in ('aac', 'mp4a')
+    a_compatible = acodec in ('aac', 'mp4a', None)
+    # نحقن الصوت الصامت فقط حين ينجح الفحص ويؤكّد غياب الصوت: vcodec موجود
+    # (أي ffprobe عمل وقرأ الفيديو) لكن acodec غائب. لو فشل الفحص كلياً
+    # (vcodec=acodec=None) لا نعرف، فنكتفي بالنسخ الآمن حتى لا نُسقط صوتاً موجوداً.
+    probe_ok = vcodec is not None
+    needs_silent_audio = probe_ok and not acodec
     v_args = ['-c:v', 'copy'] if v_compatible else \
         ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p']
     if not v_compatible:
@@ -97,7 +100,7 @@ def finalize_video(video_path):
 
     # مدخل صوت صامت (anullsrc) يُضاف حين لا يوجد صوت أصلاً، حتى لا يعرضه
     # تلجرام كصورة متحركة. -shortest يقصّه على طول الفيديو.
-    if has_audio:
+    if not needs_silent_audio:
         input_args = ['-i', video_path]
         map_args = ['-map', '0:v?', '-map', '0:a?']
         a_args = ['-c:a', 'copy'] if a_compatible else ['-c:a', 'aac', '-b:a', '128k']
