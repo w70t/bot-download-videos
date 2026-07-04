@@ -1477,6 +1477,44 @@ async def _edit_send_progress(msg, title, done, total, sent, fail, removed):
         pass
 
 
+async def _send_reminder_batch(client, progress_msg, targets):
+    """يرسل رسالة التذكير لقائمة (user_id, language, last_reminder_msg_id): يحذف
+    التذكير السابق لكل عضو ثم يرسل الأحدث بلغته، مع عدّاد حيّ ومعالجة الأخطاء
+    (FloodWait، ومن غادر يُحذف). يعيد (وصلت، فشلت، حُذفوا). مشترك بين إرسال
+    التذكير للخاملين وللجميع."""
+    total = len(targets)
+    sent_n = fail_n = removed_n = 0
+    for idx, (uid, ulang, old_msg) in enumerate(targets, 1):
+        try:
+            # احذف التذكير السابق ليبقى الأحدث فقط
+            if old_msg:
+                try:
+                    await client.delete_messages(uid, old_msg)
+                except Exception:
+                    pass
+            m = await client.send_message(uid, t('reminder_inactive', ulang or 'ar'))
+            subdb.set_last_reminder(uid, m.id)
+            sent_n += 1
+            await asyncio.sleep(0.05)
+        except FloodWait as e:
+            await asyncio.sleep(getattr(e, 'value', 5))
+            fail_n += 1
+        except GONE_USER_ERRORS:
+            try:
+                subdb.delete_user(uid)
+                removed_n += 1
+            except Exception:
+                pass
+            fail_n += 1
+        except Exception:
+            fail_n += 1
+        # عدّاد حيّ يتحدّث كل 15 عضواً
+        if idx % 15 == 0:
+            await _edit_send_progress(progress_msg, "📨 جاري إرسال التذكير...",
+                                      idx, total, sent_n, fail_n, removed_n)
+    return sent_n, fail_n, removed_n
+
+
 async def _try_send_from_cache(client, message, status_msg, ckey, quality,
                                user_id, user_name, user_username, url, lang):
     """يحاول إعادة إرسال الوسائط من الكاش بلا تحميل. يرجع True إن نجح ذلك."""
@@ -5383,84 +5421,44 @@ async def handle_subscription_settings(client, callback_query):
     if action == 'remind_inactive':
         days = int(os.getenv("REMINDER_INACTIVE_DAYS", "7"))
         inactive = subdb.get_inactive_users(days)
+        total_members = _current_member_count()
         rows = []
         if inactive:
-            rows.append([InlineKeyboardButton("📨 إرسال التذكير الآن", callback_data="sub_do_remind")])
-        # زر تجربة يرسل التذكير لحساب الأدمن نفسه (يتجاوز فلتر الخمول)
-        rows.append([InlineKeyboardButton("🧪 تجربة على حسابي", callback_data="sub_test_remind")])
+            rows.append([InlineKeyboardButton(
+                f"📨 إرسال للخاملين ({len(inactive)})", callback_data="sub_do_remind")])
+        # زر إرسال التذكير لكل الأعضاء (بلا فلتر خمول)
+        rows.append([InlineKeyboardButton(
+            f"📢 إرسال للجميع ({total_members})", callback_data="sub_do_remind_all")])
         rows.append([InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")])
         body = (
-            f"📨 **تذكير الأعضاء غير النشطين**\n\n"
-            f"👥 الأعضاء: **{_current_member_count()}**\n"
+            f"📨 **تذكير الأعضاء**\n\n"
+            f"👥 الأعضاء: **{total_members}**\n"
             f"⏳ الخمول: ≥ {days} أيام\n"
             f"😴 غير النشطين: **{len(inactive)}** عضو\n\n"
+            "يُرسل لكل عضو تذكيراً **بلغته**، ويُحذف تذكيره السابق تلقائياً "
+            "(يبقى الأحدث فقط).\n\n"
+            "• **للخاملين:** فقط من لم يحمّل منذ فترة.\n"
+            "• **للجميع:** كل الأعضاء بلا استثناء."
         )
-        if inactive:
-            body += ("سيُرسل لكل عضو تذكيراً **بلغته**، ويُحذف تذكيره السابق "
-                     "تلقائياً (يبقى الأحدث فقط).")
-        else:
-            body += ("لا يوجد أعضاء خاملون الآن.\nاضغط «🧪 تجربة على حسابي» "
-                     "للتأكد أن الإرسال يعمل.")
         await callback_query.message.edit_text(
             body, reply_markup=InlineKeyboardMarkup(rows))
         await callback_query.answer()
         return
 
-    if action == 'test_remind':
-        # يرسل رسالة التذكير لحساب الأدمن نفسه للتأكد أن الإرسال يعمل (يتجاوز الفلتر)
-        uid = callback_query.from_user.id
-        try:
-            ulang = subdb.get_user_language(uid) or 'ar'
-        except Exception:
-            ulang = 'ar'
-        try:
-            m = await client.send_message(uid, t('reminder_inactive', ulang))
-            subdb.set_last_reminder(uid, m.id)
-            await callback_query.answer(
-                "✅ أُرسل تذكير تجريبي إلى حسابك — تحقّق من الرسالة أعلاه.",
-                show_alert=True)
-        except Exception as e:
-            await callback_query.answer(f"❌ فشل الإرسال: {str(e)[:150]}", show_alert=True)
-        return
-
-    if action == 'do_remind':
-        days = int(os.getenv("REMINDER_INACTIVE_DAYS", "7"))
-        inactive = subdb.get_inactive_users(days)
+    if action in ('do_remind', 'do_remind_all'):
+        if action == 'do_remind_all':
+            targets = subdb.get_all_users_for_reminder()
+            scope = "لكل الأعضاء"
+        else:
+            days = int(os.getenv("REMINDER_INACTIVE_DAYS", "7"))
+            targets = subdb.get_inactive_users(days)
+            scope = "للأعضاء غير النشطين"
         progress = await callback_query.message.edit_text(
-            f"📤 جاري إرسال التذكير لـ {len(inactive)} عضو..."
+            f"📤 جاري إرسال التذكير {scope} ({len(targets)})..."
         )
-        total = len(inactive)
-        sent_n = fail_n = removed_n = 0
-        for idx, (uid, ulang, old_msg) in enumerate(inactive, 1):
-            try:
-                # احذف التذكير السابق ليبقى الأحدث فقط
-                if old_msg:
-                    try:
-                        await client.delete_messages(uid, old_msg)
-                    except Exception:
-                        pass
-                m = await client.send_message(uid, t('reminder_inactive', ulang))
-                subdb.set_last_reminder(uid, m.id)
-                sent_n += 1
-                await asyncio.sleep(0.05)
-            except FloodWait as e:
-                await asyncio.sleep(getattr(e, 'value', 5))
-                fail_n += 1
-            except GONE_USER_ERRORS:
-                try:
-                    subdb.delete_user(uid)
-                    removed_n += 1
-                except Exception:
-                    pass
-                fail_n += 1
-            except Exception:
-                fail_n += 1
-            # عدّاد حيّ يتحدّث كل 15 عضواً
-            if idx % 15 == 0:
-                await _edit_send_progress(progress, "📨 جاري إرسال التذكير...",
-                                          idx, total, sent_n, fail_n, removed_n)
+        sent_n, fail_n, removed_n = await _send_reminder_batch(client, progress, targets)
         await progress.edit_text(
-            f"✅ **اكتمل إرسال التذكير**\n\n"
+            f"✅ **اكتمل إرسال التذكير {scope}**\n\n"
             f"✅ وصلت: {sent_n}\n❌ فشلت: {fail_n}\n🗑️ حُذفوا (غادروا): {removed_n}"
         )
         await callback_query.answer()
