@@ -838,7 +838,7 @@ def _download_images_with_gallery_dl(url, dest_dir, cookie_file=None):
 
 def _download_images_from_urls(image_urls, dest_dir):
     """ينزّل قائمة روابط صور مباشرة إلى dest_dir ويعيد مسارات الملفات مرتّبة.
-    يُستخدم كبديل لصور تيك توك عبر المرآة حين يفشل gallery-dl (حجب IP)."""
+    يُستخدم كبديل لصور تيك توك/إنستغرام عبر المرآة حين يفشل gallery-dl."""
     import urllib.request
     os.makedirs(dest_dir, exist_ok=True)
     ua = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
@@ -856,8 +856,64 @@ def _download_images_from_urls(image_urls, dest_dir):
             if os.path.getsize(dest) > 0:
                 paths.append(dest)
         except Exception as e:
-            logger.warning(f"⚠️ فشل تنزيل صورة تيك توك من المرآة: {e}")
+            logger.warning(f"⚠️ فشل تنزيل صورة من المرآة العامة: {e}")
     return paths
+
+
+# مرايا إنستغرام العامة (InstaFix) لجلب صور الكاروسيل بلا كوكيز — نفس المرايا
+# المستخدمة للفيديو. تُضبط بمتغيّر البيئة INSTAGRAM_PROXY_HOSTS (مفصولة بفواصل).
+_INSTAGRAM_IMG_PROXY_HOSTS = [
+    h.strip() for h in os.getenv(
+        'INSTAGRAM_PROXY_HOSTS', 'kkinstagram.com'
+    ).split(',') if h.strip()
+]
+
+
+def resolve_instagram_images(url, timeout=20):
+    """يعيد قائمة روابط صور منشور إنستغرام (كاروسيل/صورة واحدة) عبر مرآة InstaFix
+    العامة بلا كوكيز، لتُحمَّل حين يعجز gallery-dl عن جلبها (تسجيل دخول مطلوب/حجب
+    IP). تعتمد على مسار /images/{shortcode}/{n} الذي يعيد توجيهاً مباشراً لكل صورة
+    (n=1,2,3...) وينتهي بخطأ عند تجاوز عدد الصور.
+
+    تعيد قائمة فارغة لغير روابط المنشورات أو عند أي فشل، فيبقى السلوك دون تغيير."""
+    import re
+    import urllib.request
+    from urllib.parse import urlparse as _urlparse
+    low = (url or '').lower()
+    if not any(h in low for h in ('instagram.com', 'instagr.am')):
+        return []
+    try:
+        path = _urlparse(url).path
+    except Exception:
+        return []
+    m = re.search(r'/(?:reel|reels|p|tv)/([A-Za-z0-9_-]+)', path, re.I)
+    if not m:
+        return []  # ستوري/بروفايل/رابط غير منشور — لا مرآة له
+    shortcode = m.group(1)
+    ua = 'Mozilla/5.0 (compatible; TelegramBot)'
+    for host in _INSTAGRAM_IMG_PROXY_HOSTS:
+        image_urls = []
+        for n in range(1, GALLERY_DL_MAX_IMAGES + 1):
+            proxy_url = f"https://{host}/images/{shortcode}/{n}"
+            try:
+                req = urllib.request.Request(proxy_url, headers={
+                    'User-Agent': ua, 'Accept': '*/*',
+                })
+                # urlopen يتبع التوجيه؛ geturl() = الرابط النهائي للصورة على CDN
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    ctype = (resp.headers.get_content_type() or '').lower()
+                    final = resp.geturl()
+                if ctype.startswith('image/') and is_safe_url(final):
+                    image_urls.append(final)
+                else:
+                    break  # ليست صورة (نهاية الكاروسيل أو صفحة هبوط)
+            except Exception:
+                break  # 404 عند تجاوز عدد الصور أو فشل المرآة
+        if image_urls:
+            logger.info(
+                f"🎯 صور إنستغرام عبر {host}: {len(image_urls)} صورة (بلا كوكيز)")
+            return image_urls
+    return []
 
 
 # الصيغ التي يقبلها تلجرام كصورة (photo). غير ذلك (webp/heic/gif) يُرفض بخطأ
@@ -1797,6 +1853,18 @@ async def download_and_send_images(client, message, url, status_msg,
                 if files:
                     logger.info(
                         f"✅ صور تيك توك عبر المرآة العامة ({len(files)} صورة، بلا كوكيز)")
+
+        # 🎯 بديل صور إنستغرام: gallery-dl يفشل بلا كوكيز صالحة (تسجيل دخول مطلوب)
+        #    → اجلب روابط صور الكاروسيل من مرآة InstaFix العامة (بلا كوكيز) ونزّلها
+        if not files and _platform_of(url) == 'instagram':
+            image_urls = await loop.run_in_executor(
+                None, lambda: resolve_instagram_images(url))
+            if image_urls:
+                files = await loop.run_in_executor(
+                    None, lambda: _download_images_from_urls(image_urls, dl_dir))
+                if files:
+                    logger.info(
+                        f"✅ صور إنستغرام عبر المرآة العامة ({len(files)} صورة، بلا كوكيز)")
 
         if not files:
             return False  # ليست صوراً → ارجع لمسار الفيديو
