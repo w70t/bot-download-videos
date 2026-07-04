@@ -138,6 +138,63 @@ def resolve_instagram_media(url: str, timeout: int = 20):
     return None
 
 
+# ═══════════════════════════════════════════════════════════════
+# مرآة تيك توك العامة (بديل عند حجب IP الخادم)
+# تيك توك يحجب عناوين مراكز البيانات فيعيد "Your IP address is blocked"،
+# فيفشل yt-dlp حتى مع كوكيز صالحة (الحجب على مستوى الـ IP قبل الكوكيز). مرآة
+# عامة (tikwm) تجلب الفيديو من عنوان IP مختلف وتعيد رابط mp4 مباشراً بلا علامة
+# مائية وبلا كوكيز، فنحمّله عبر yt-dlp عادياً. يمكن تغيير/إضافة مرايا بمتغيّر
+# البيئة TIKTOK_PROXY_HOSTS (مفصولة بفواصل) دون تعديل الكود إن تعطّلت مرآة.
+# ═══════════════════════════════════════════════════════════════
+_TIKTOK_API_HOSTS = [
+    h.strip() for h in os.getenv(
+        'TIKTOK_PROXY_HOSTS', 'tikwm.com'
+    ).split(',') if h.strip()
+]
+
+
+def resolve_tiktok_media(url: str, timeout: int = 20):
+    """يحوّل رابط تيك توك إلى رابط الفيديو المباشر (mp4) عبر مرآة عامة لا تتطلّب
+    كوكيز، ليُحمّل حين يحجب تيك توك عنوان IP الخادم فيعجز yt-dlp عن الوصول.
+
+    يعيد رابط mp4 مباشراً عند النجاح، أو None لغير روابط تيك توك أو عند أي فشل
+    (بما فيها منشورات الصور التي لا تُرجع فيديو) — فيبقى المسار الأصلي دون
+    تغيير في السلوك."""
+    import json
+    import urllib.parse
+    import urllib.request
+    low = (url or '').lower()
+    if 'tiktok.' not in low:
+        return None
+    for host in _TIKTOK_API_HOSTS:
+        api_url = f"https://{host}/api/?url={urllib.parse.quote(url, safe='')}"
+        try:
+            req = urllib.request.Request(api_url, headers={
+                'User-Agent': _BOT_UA,
+                'Accept': 'application/json',
+            })
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                payload = json.loads(resp.read(2_000_000).decode('utf-8', 'ignore'))
+            data = (payload or {}).get('data') or {}
+            # hdplay/play بلا علامة مائية، wmplay احتياطي بعلامة مائية
+            for key in ('hdplay', 'play', 'wmplay'):
+                media = data.get(key)
+                if not media or not isinstance(media, str):
+                    continue
+                # المرآة قد تعيد مساراً نسبياً (/video/...) أو رابطاً كاملاً
+                if media.startswith('/'):
+                    media = f"https://{host}{media}"
+                if media.lower().startswith(('http://', 'https://')) and is_safe_url(media):
+                    logger.info(f"🎯 تيك توك عبر {host}: {media[:90]}")
+                    return media
+            logger.info(
+                f"ℹ️ {host} لم يُرجع فيديو تيك توك (code={(payload or {}).get('code')})"
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ تعذّر حل تيك توك عبر {host}: {e}")
+    return None
+
+
 _MUSIC_LINK_MARKERS = ('shazam.com', 'music.apple.com', 'itunes.apple.com',
                        'open.spotify.com/track', 'spotify.link/')
 
