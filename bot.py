@@ -65,8 +65,17 @@ from video_processing import (
 from download_errors import (
     _is_drm_error, _is_geo_restricted_error, _is_youtube_cookie_issue,
     _is_facebook_cookie_issue, _is_cookie_file_issue, _is_restricted_content_error,
-    _is_http_403_error,
 )
+# ملاحظة نشر: بعض عمليات التحديث تزامن bot.py فقط دون download_errors.py،
+# لذا نستورد المصنّفات الأحدث دفاعياً مع بديل محلي إن كان الملف قديماً — حتى
+# لا يفشل إقلاع البوت باستيراد دالة غير موجودة.
+try:
+    from download_errors import _is_http_403_error
+except ImportError:
+    def _is_http_403_error(err):
+        """بديل محلي: خطأ HTTP 403 Forbidden أثناء تنزيل بيانات الفيديو."""
+        msg = str(err).lower()
+        return '403' in msg and ('forbidden' in msg or 'download video data' in msg)
 
 
 # ═══════════════════════════════════════════════════════════════
