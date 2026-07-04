@@ -966,6 +966,55 @@ def resolve_instagram_images(url, timeout=20):
     return []
 
 
+def resolve_instagram_images_ytdlp(url):
+    """يستخرج روابط كل صور كاروسيل إنستغرام عبر yt-dlp بلا كوكيز، ويعيدها مرتّبة.
+
+    لماذا هذا المسار: gallery-dl يتطلّب تسجيل دخول (يُحوّل لصفحة الدخول بلا كوكيز
+    وللرئيسية بكوكيز منتهية)، ومرايا InstaFix العامة تعيد أول صورة فقط أو ماتت.
+    أما yt-dlp — مع ignore_no_formats_error لأن الصور ليست "صيغ فيديو" — فيعيد
+    منشور الكاروسيل كعناصر (entries)، لكل عنصر رابط صورة CDN مستقل. وبلا كوكيز
+    لأن كوكيز الدخول المنتهية تكسر المحتوى العام (نفس سبب فشل الفيديو).
+
+    يعيد قائمة روابط صور (حتى GALLERY_DL_MAX_IMAGES)، أو فارغة لغير إنستغرام/عند
+    الفشل — فيُكمل المتصل لمرآة الصورة الواحدة كخطة أخيرة."""
+    if _platform_of(url) != 'instagram':
+        return []
+    opts = {
+        'quiet': True, 'no_warnings': True, 'skip_download': True,
+        'ignore_no_formats_error': True,  # منشور الصور لا يملك صيغة فيديو
+        'extract_flat': False, 'noplaylist': False,
+        'socket_timeout': 30, 'nocheckcertificate': _YTDLP_NO_CHECK_CERT,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                          'AppleWebKit/537.36 (KHTML, like Gecko) '
+                          'Chrome/120.0.0.0 Safari/537.36',
+        },
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        logger.warning(f"⚠️ تعذّر استخراج صور إنستغرام عبر yt-dlp: {e}")
+        return []
+    if not info:
+        return []
+    entries = info.get('entries') or [info]
+    out, seen = [], set()
+    for e in entries:
+        if not e:
+            continue
+        img = e.get('url') or e.get('display_url')
+        if not img:
+            thumbs = e.get('thumbnails') or []
+            img = thumbs[-1].get('url') if thumbs else None
+        if img and img not in seen and is_safe_url(img):
+            seen.add(img)
+            out.append(img)
+    if out:
+        logger.info(f"🎯 صور إنستغرام عبر yt-dlp (بلا كوكيز): {len(out)} صورة")
+    return out[:GALLERY_DL_MAX_IMAGES]
+
+
 # الصيغ التي يقبلها تلجرام كصورة (photo). غير ذلك (webp/heic/gif) يُرفض بخطأ
 # [400 PHOTO_EXT_INVALID] فنحوّله إلى JPEG قبل الإرسال.
 _TG_PHOTO_EXTS = ('.jpg', '.jpeg', '.png')
@@ -1960,17 +2009,24 @@ async def download_and_send_images(client, message, url, status_msg,
                     logger.info(
                         f"✅ صور تيك توك عبر المرآة العامة ({len(files)} صورة، بلا كوكيز)")
 
-        # 🎯 بديل صور إنستغرام: gallery-dl يفشل بلا كوكيز صالحة (تسجيل دخول مطلوب)
-        #    → اجلب روابط صور الكاروسيل من مرآة InstaFix العامة (بلا كوكيز) ونزّلها
+        # 🎯 بديل صور إنستغرام: gallery-dl يتطلّب تسجيل دخول (يُحوّل لصفحة الدخول
+        #    بلا كوكيز وللرئيسية بكوكيز منتهية). نجلب الروابط بترتيب أفضلية:
+        #    (أ) yt-dlp بلا كوكيز — يعيد كل صور الكاروسيل (الأدقّ والأكمل)،
+        #    (ب) مرآة InstaFix العامة — أول صورة فقط كخطة أخيرة.
         if not files and _platform_of(url) == 'instagram':
             image_urls = await loop.run_in_executor(
-                None, lambda: resolve_instagram_images(url))
+                None, lambda: resolve_instagram_images_ytdlp(url))
+            src = 'yt-dlp'
+            if not image_urls:
+                image_urls = await loop.run_in_executor(
+                    None, lambda: resolve_instagram_images(url))
+                src = 'المرآة العامة'
             if image_urls:
                 files = await loop.run_in_executor(
                     None, lambda: _download_images_from_urls(image_urls, dl_dir))
                 if files:
                     logger.info(
-                        f"✅ صور إنستغرام عبر المرآة العامة ({len(files)} صورة، بلا كوكيز)")
+                        f"✅ صور إنستغرام عبر {src} ({len(files)} صورة، بلا كوكيز)")
 
         if not files:
             return False  # ليست صوراً → ارجع لمسار الفيديو
