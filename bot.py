@@ -990,6 +990,54 @@ def _normalize_images_for_telegram(files):
     return out
 
 
+def _ensure_video_has_audio(file_path):
+    """يضيف مسار صوت صامت للفيديو الذي لا صوت فيه، حتى لا يعرضه تلجرام كـ"صورة
+    متحركة" (GIF) صامتة تُعاد تلقائياً بدل فيديو حقيقي بزر تشغيل. كثير من مقاطع
+    تيك توك/إنستغرام/تويتر تُنزَّل بلا مسار صوت.
+
+    مكتفٍ ذاتياً داخل bot.py (يستدعي ffprobe/ffmpeg مباشرة) ليعمل حتى حين تُزامَن
+    bot.py وحدها دون video_processing.py — كنمط الاستيراد الدفاعي أعلى الملف.
+    آمن وخامل (idempotent): لا يفعل شيئاً إن كان للفيديو صوت أصلاً (بما فيه صوت
+    صامت أضافه finalize_video)، ولا إن تعذّر الفحص (فلا يُسقط صوتاً موجوداً)."""
+    import json
+    try:
+        out = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'a',
+             '-show_entries', 'stream=codec_type', '-of', 'json', file_path],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60
+        ).stdout.decode('utf-8', 'ignore')
+        streams = json.loads(out or '{}').get('streams')
+    except Exception as e:
+        logger.warning(f"⚠️ تعذّر فحص صوت الفيديو (يُترك كما هو): {e}")
+        return
+    # streams=None ⇒ فشل الفحص فلا نلمس الملف؛ قائمة غير فارغة ⇒ فيه صوت.
+    if streams is None or any(s.get('codec_type') == 'audio' for s in streams):
+        return
+
+    logger.info("🔇 الفيديو بلا صوت — إضافة مسار صوت صامت لمنع عرضه كصورة متحركة")
+    tmp = os.path.splitext(file_path)[0] + '.snd.mp4'
+    try:
+        cmd = [
+            'ffmpeg', '-y', '-i', file_path,
+            '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+            '-map', '0:v:0', '-map', '1:a:0',
+            # الفيديو مُجهّز مسبقاً (H.264/faststart) فيكفي نسخه؛ نضيف صوتاً فقط
+            '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k', '-shortest',
+            '-movflags', '+faststart', tmp,
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=900)
+        if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+            os.replace(tmp, file_path)
+    except Exception as e:
+        logger.warning(f"⚠️ تعذّر إضافة صوت صامت للفيديو: {e}")
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+
+
 async def upload_media_with_progress(client, chat_id, file_path, caption, status_msg, user_id, is_video=True):
     """Upload media with progress tracking"""
     try:
@@ -2442,6 +2490,11 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             probed_w, probed_h, probed_dur = await loop.run_in_executor(
                 None, lambda: finalize_video(file_path)
             )
+
+            # يضمن وجود مسار صوت (يضيف صمتاً إن غاب) حتى لا يعرض تلجرام الفيديو
+            # كصورة متحركة. مكتفٍ ذاتياً في bot.py ليعمل مع مزامنة bot.py وحدها،
+            # وخامل إن كان finalize_video قد أضاف الصوت أصلاً (لا عمل مكرر).
+            await loop.run_in_executor(None, lambda: _ensure_video_has_audio(file_path))
 
             # الأبعاد/المدة من الملف أولاً ثم من معلومات yt-dlp (مهم للمنصات
             # التي لا توفّر أبعاداً مثل فيسبوك، فغيابها يُظهر صورة متجمّدة)
