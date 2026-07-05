@@ -2209,28 +2209,37 @@ async def download_and_upload(client, message, url, quality, callback_query=None
     try:
         os.makedirs(dl_dir, exist_ok=True)
         # إعدادات التحميل
-        # نُفضّل ترميز H.264 (avc1) + صوت AAC (m4a) لأنه متوافق 100% مع مشغّل
-        # تلجرام؛ ترميز VP9/AV1 داخل MP4 يسبب تجمّد الصورة أثناء التشغيل.
+        # نُفضّل ترميز H.264 + صوت AAC (m4a) لأنه متوافق 100% مع مشغّل تلجرام؛
+        # ترميز HEVC/H.265 وVP9/AV1 داخل MP4 يشغّله تلجرام بلا صوت على كثير من
+        # الأجهزة (أو يجمّد الصورة). المنصات ذات الصيغ المدمجة (فيديو+صوت في صيغة
+        # واحدة) مثل تيك توك تُصدّرها yt-dlp باسم ترميز "h264"/"h265" لا "avc1"،
+        # فمُحدِّد bestvideo[vcodec^=avc1] لا يطابقها فيسقط إلى best العام الذي
+        # يختار H.265 (bytevc1) الأعلى بت-ريت ⇒ فيديو بلا صوت متقطّع. لذا نضيف
+        # فرعاً صريحاً يفضّل H.264 المدمج داخل حدّ الدقة نفسه قبل best العام.
         # سلسلة احتياطية تنازلية لضمان نجاح التحميل دائماً.
         quality_formats = {
             'best': (
                 'bestvideo[height<=1080][vcodec^=avc1]+bestaudio[ext=m4a]/'
                 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/'
+                "best[height<=1080][vcodec~='^(avc1|h264)']/"
                 'best[height<=1080][ext=mp4]/best[height<=1080]/best'
             ),
             'medium': (
                 'bestvideo[height<=720][vcodec^=avc1]+bestaudio[ext=m4a]/'
                 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/'
+                "best[height<=720][vcodec~='^(avc1|h264)']/"
                 'best[height<=720][ext=mp4]/best[height<=720]/best'
             ),
             '480': (
                 'bestvideo[height<=480][vcodec^=avc1]+bestaudio[ext=m4a]/'
                 'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/'
+                "best[height<=480][vcodec~='^(avc1|h264)']/"
                 'best[height<=480][ext=mp4]/best[height<=480]/best'
             ),
             '360': (
                 'bestvideo[height<=360][vcodec^=avc1]+bestaudio[ext=m4a]/'
                 'bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/'
+                "best[height<=360][vcodec~='^(avc1|h264)']/"
                 'best[height<=360][ext=mp4]/best[height<=360]/best'
             ),
             'audio': 'bestaudio/best'  # النسخة الناجحة - تحميل أفضل جودة صوت
