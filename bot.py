@@ -2381,6 +2381,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         is_youtube_url = any(m in url.lower() for m in PLATFORM_URL_MARKERS['youtube'])
         is_facebook_url = any(m in url.lower() for m in PLATFORM_URL_MARKERS['facebook'])
         is_instagram_url = _platform_of(url) == 'instagram'
+        is_tiktok_url = _platform_of(url) == 'tiktok'
 
         def download(use_cookies=True, fmt=None, url_override=None, yt_clients=None):
             o = dict(ydl_opts)
@@ -2468,6 +2469,14 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             #    لملف فيديو مباشر عبر مرآة عامة (بلا كوكيز) وحمّله منها
             elif is_instagram_url and (_direct := await resolve_instagram_direct(url)):
                 logger.info("✅ تحميل إنستغرام عبر المرآة العامة (بديل yt-dlp، بلا كوكيز)")
+                info, file_path = await loop.run_in_executor(
+                    None, lambda: download(url_override=_direct))
+            # 🎯 تيك توك: فشل yt-dlp لحجب IP الخادم أو محتوى حسّاس يتطلّب تسجيل دخول
+            #    ("This post may not be comfortable...") → حل الرابط لملف فيديو مباشر
+            #    عبر مرآة عامة (بلا كوكيز) وحمّله منها. يعالج نفس الحالة الموجودة
+            #    في get_video_info لكنها كانت مفقودة هنا فيفشل التحميل رغم نجاح المعاينة.
+            elif is_tiktok_url and (_direct := await resolve_tiktok_direct(url)):
+                logger.info("✅ تحميل تيك توك عبر المرآة العامة (بديل yt-dlp، بلا كوكيز)")
                 info, file_path = await loop.run_in_executor(
                     None, lambda: download(url_override=_direct))
             # الصيغة المطلوبة غير متوفرة → أعد المحاولة بأفضل صيغة متاحة
