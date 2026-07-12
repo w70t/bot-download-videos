@@ -10,6 +10,8 @@ from link_resolvers import (
     _is_music_link, _music_search_query, resolve_snapchat_spotlight,
     resolve_instagram_media, resolve_tiktok_media, resolve_tiktok_images,
     resolve_twitter_media, _extract_twitter_media, all_mirror_hosts,
+    resolve_pinterest_media, resolve_pinterest_images, _pinterest_pin_id,
+    _extract_pinterest_video, _extract_pinterest_images, _upscale_pinimg,
 )
 
 
@@ -18,10 +20,11 @@ def test_all_mirror_hosts_lists_configured_mirrors():
     # قائمة أزواج (منصة، مضيف) تشمل المرايا الافتراضية
     assert all(isinstance(p, tuple) and len(p) == 2 for p in hosts)
     platforms = {p for p, _ in hosts}
-    assert {'instagram', 'tiktok', 'twitter'} <= platforms
+    assert {'instagram', 'tiktok', 'twitter', 'pinterest'} <= platforms
     host_names = {h for _, h in hosts}
     assert 'tikwm.com' in host_names
     assert 'api.vxtwitter.com' in host_names
+    assert 'www.pinterest.com' in host_names
 
 
 def test_is_music_link():
@@ -266,3 +269,102 @@ def test_twitter_resolver_handles_network_error():
     with patch('urllib.request.urlopen', side_effect=OSError('boom')):
         out = resolve_twitter_media('https://twitter.com/user/status/123')
     assert out is None
+
+
+# ── resolve_pinterest_media / resolve_pinterest_images ─────────
+
+def test_pinterest_pin_id_from_full_url():
+    # معرّف رقمي من رابط Pin كامل بلا أي طلب شبكي
+    assert _pinterest_pin_id('https://www.pinterest.com/pin/1234567890123/') == '1234567890123'
+    assert _pinterest_pin_id('https://pinterest.co.uk/pin/9876543210/?mt=login') == '9876543210'
+    # بروفايل/لوحة → None
+    assert _pinterest_pin_id('https://www.pinterest.com/someuser/board/') is None
+
+
+def test_pinterest_pin_id_expands_short_link():
+    # رابط pin.it مختصر → يُوسَّع باتّباع التحويل ثم يُستخرج المعرّف
+    full = 'https://www.pinterest.com/pin/1234567890123/sent/?invite_code=x'
+    with patch('urllib.request.urlopen', return_value=_FakeRedirect(full)):
+        assert _pinterest_pin_id('https://pin.it/AbCdEf123') == '1234567890123'
+
+
+def test_pinterest_resolvers_ignore_non_pinterest():
+    # روابط غير بينتريست → None/[] بلا أي طلب شبكي
+    assert resolve_pinterest_media('https://youtube.com/watch?v=1') is None
+    assert resolve_pinterest_media('') is None
+    assert resolve_pinterest_images('https://youtube.com/watch?v=1') == []
+    assert resolve_pinterest_images('') == []
+
+
+def test_pinterest_video_prefers_mp4_over_hls():
+    # video_list فيها HLS أعرض وmp4 أضيق → نفضّل mp4
+    pin = {'videos': {'video_list': {
+        'HLS': {'url': 'https://v.pinimg.com/x.m3u8', 'width': 1080},
+        'V_720P': {'url': 'https://v.pinimg.com/720p/x.mp4', 'width': 720},
+    }}}
+    assert _extract_pinterest_video(pin) == 'https://v.pinimg.com/720p/x.mp4'
+
+
+def test_pinterest_video_from_story_pages():
+    # Idea Pin: الفيديو داخل صفحات story_pin_data
+    vid = 'https://v.pinimg.com/videos/mc/720p/a.mp4'
+    pin = {'story_pin_data': {'pages': [
+        {'blocks': [{'video': {'video_list': {'V_720P': {'url': vid, 'width': 720}}}}]},
+    ]}}
+    assert _extract_pinterest_video(pin) == vid
+
+
+def test_pinterest_images_from_carousel():
+    # كاروسيل متعدد الصور → كل الصور بدقّة orig مرتّبة بلا تكرار
+    pin = {'carousel_data': {'carousel_slots': [
+        {'images': {'orig': {'url': 'https://i.pinimg.com/originals/a.jpg'}}},
+        {'images': {'orig': {'url': 'https://i.pinimg.com/originals/b.jpg'}}},
+    ]}}
+    assert _extract_pinterest_images(pin) == [
+        'https://i.pinimg.com/originals/a.jpg',
+        'https://i.pinimg.com/originals/b.jpg',
+    ]
+
+
+def test_pinterest_images_upscaled_to_originals():
+    # روابط مصغّرة (شكل pidgets مثل /236x/) → تُرفع للدقّة الأصلية /originals/
+    assert _upscale_pinimg('https://i.pinimg.com/236x/ab/cd/x.jpg') == \
+        'https://i.pinimg.com/originals/ab/cd/x.jpg'
+    pin = {'images': {'237x': {'url': 'https://i.pinimg.com/237x/ab/x.jpg', 'width': 237}}}
+    assert _extract_pinterest_images(pin) == ['https://i.pinimg.com/originals/ab/x.jpg']
+
+
+def test_pinterest_images_empty_for_video_pin():
+    # Pin فيديو: صورته غلاف فقط → [] كي لا يستقبل المستخدم صورة بدل الفيديو
+    pin = {'videos': {'video_list': {'V_720P': {'url': 'https://v.pinimg.com/x.mp4'}}},
+           'images': {'orig': {'url': 'https://i.pinimg.com/originals/cover.jpg'}}}
+    assert _extract_pinterest_images(pin) == []
+
+
+def test_pinterest_resolver_returns_video_from_pinresource_shape():
+    # رد PinResource (resource_response.data) → رابط الفيديو المباشر
+    vid = 'https://v.pinimg.com/videos/mc/720p/z.mp4'
+    payload = {'resource_response': {'data': {
+        'videos': {'video_list': {'V_720P': {'url': vid, 'width': 720}}}}}}
+    with patch('urllib.request.urlopen', return_value=_FakeJsonResp(payload)), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        out = resolve_pinterest_media('https://www.pinterest.com/pin/1234567890123/')
+    assert out == vid
+
+
+def test_pinterest_images_from_pidgets_shape():
+    # رد pidgets (data قائمة) لصورة مفردة → قائمة برابط الدقّة الأصلية
+    payload = {'status': 'success', 'data': [
+        {'images': {'237x': {'url': 'https://i.pinimg.com/237x/ab/cd/x.jpg', 'width': 237}}},
+    ]}
+    with patch('urllib.request.urlopen', return_value=_FakeJsonResp(payload)), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        out = resolve_pinterest_images('https://www.pinterest.com/pin/1234567890123/')
+    assert out == ['https://i.pinimg.com/originals/ab/cd/x.jpg']
+
+
+def test_pinterest_resolver_handles_network_error():
+    # فشل الطلب الشبكي → None/[] بلا استثناء
+    with patch('urllib.request.urlopen', side_effect=OSError('boom')):
+        assert resolve_pinterest_media('https://www.pinterest.com/pin/1234567890123/') is None
+        assert resolve_pinterest_images('https://www.pinterest.com/pin/1234567890123/') == []
