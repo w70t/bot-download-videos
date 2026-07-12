@@ -50,7 +50,8 @@ from cookies_manager import (
 from link_resolvers import (
     resolve_snapchat_spotlight, _is_music_link, resolve_music_link,
     resolve_instagram_media, resolve_tiktok_media, resolve_twitter_media,
-    resolve_tiktok_images, all_mirror_hosts,
+    resolve_tiktok_images, resolve_pinterest_media, resolve_pinterest_images,
+    all_mirror_hosts,
 )
 from content_filter import (
     ADULT_DOMAINS, _custom_adult_domains, _custom_adult_keywords,
@@ -644,6 +645,34 @@ async def _twitter_video_fallback(url: str):
         return None
 
 
+async def resolve_pinterest_direct(url: str):
+    """يحل رابط Pin بينتريست إلى رابط الفيديو المباشر عبر واجهة بينتريست العامة
+    (بلا كوكيز). يعيد الرابط المباشر أو None. طلب شبكي متزامن يُنفَّذ خارج حلقة الأحداث."""
+    if _platform_of(url) != 'pinterest':
+        return None
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, resolve_pinterest_media, url)
+
+
+async def _pinterest_video_fallback(url: str):
+    """خطة بديلة لبينتريست عند فشل yt-dlp (تغييرات الموقع/حجب): يحل الرابط لملف
+    فيديو مباشر عبر واجهة بينتريست العامة ثم يستخرج معلوماته. يعيد dict أو None."""
+    direct = await resolve_pinterest_direct(url)
+    if not direct:
+        return None
+    loop = asyncio.get_event_loop()
+    try:
+        info = await loop.run_in_executor(
+            None, lambda: _extract_direct_media(direct, 'Pinterest Video')
+        )
+        if info:
+            logger.info("✅ بينتريست عبر الواجهة العامة (بديل yt-dlp، بلا كوكيز)")
+        return info
+    except Exception as e:
+        logger.warning(f"⚠️ فشل استخراج بينتريست البديل: {e}")
+        return None
+
+
 async def get_video_info(url: str):
     """استخراج معلومات الفيديو"""
     _last_info_error.set(None)
@@ -755,11 +784,16 @@ async def get_video_info(url: str):
         tw = await _twitter_video_fallback(url)
         if tw:
             return tw
+        # 🎯 خطة بديلة لبينتريست: فشل yt-dlp (تغييرات الموقع/حجب) → واجهة بينتريست
+        #    العامة تعيد رابط الفيديو المباشر بلا كوكيز
+        pn = await _pinterest_video_fallback(url)
+        if pn:
+            return pn
         return None
 
 
 # ═══════════════════════════════════════════════════════════════
-# تحميل صور إنستغرام/تيك توك (كاروسيل/سلايدشو) عبر gallery-dl
+# تحميل صور إنستغرام/تيك توك/بينتريست (كاروسيل/سلايدشو) عبر gallery-dl
 # yt-dlp يتجاهل الصور (يسقط الصيغ والمصغّرات للمنشورات المصوّرة)، لذا
 # نستخدم gallery-dl المتخصص في معارض الصور ثم نرسلها كألبوم في تلجرام.
 # ═══════════════════════════════════════════════════════════════
@@ -812,6 +846,7 @@ def _download_images_with_gallery_dl(url, dest_dir, cookie_file=None):
         '-o', 'tiktok.audio=false',
         '-o', 'tiktok.covers=false',
         '-o', 'instagram.videos=false',
+        '-o', 'pinterest.videos=false',
     ]
     if cookie_file:
         cmd += ['--cookies', cookie_file]
@@ -1469,10 +1504,10 @@ async def process_download_from_queue(task: DownloadTask):
         
         if not info:
             user_name = message.from_user.first_name or "User"
-            # 🖼️ قد يفشل yt-dlp تماماً في استخراج سلايدشو تيك توك / كاروسيل إنستغرام
-            #    (منشور صور بلا فيديو، خاصة روابط vm.tiktok.com المختصرة) فيرجع None.
-            #    جرّب مسار الصور عبر gallery-dl قبل اعتبار الرابط فاشلاً.
-            if _platform_of(url) in ('instagram', 'tiktok'):
+            # 🖼️ قد يفشل yt-dlp تماماً في استخراج سلايدشو تيك توك / كاروسيل
+            #    إنستغرام/بينتريست (منشور صور بلا فيديو، خاصة الروابط المختصرة)
+            #    فيرجع None. جرّب مسار الصور عبر gallery-dl قبل اعتبار الرابط فاشلاً.
+            if _platform_of(url) in ('instagram', 'tiktok', 'pinterest'):
                 if await download_and_send_images(
                     app, message, url, status, user_id, user_name,
                     message.from_user.username, lang
@@ -1964,7 +1999,7 @@ async def _try_send_images_from_cache(client, message, status_msg, ckey,
 
 async def download_and_send_images(client, message, url, status_msg,
                                    user_id, user_name, user_username, lang, info=None):
-    """ينزّل صور منشور إنستغرام/تيك توك (كاروسيل/سلايدشو) ويرسلها كألبوم.
+    """ينزّل صور منشور إنستغرام/تيك توك/بينتريست (كاروسيل/سلايدشو) ويرسلها كألبوم.
 
     يعيد True إذا عُثر على صور وأُرسلت، وFalse إن لم يكن منشوراً مصوّراً
     (فيرجع المتصل لمسار الفيديو المعتاد). لا يكسر أي سلوك للفيديو القائم.
@@ -2027,6 +2062,18 @@ async def download_and_send_images(client, message, url, status_msg,
                 if files:
                     logger.info(
                         f"✅ صور إنستغرام عبر {src} ({len(files)} صورة، بلا كوكيز)")
+
+        # 🎯 بديل صور بينتريست: gallery-dl قد يفشل (حجب/تغييرات الموقع) → اجلب
+        #    روابط الصور (كاروسيل/Idea Pin/مفردة) من واجهة بينتريست العامة بلا كوكيز
+        if not files and _platform_of(url) == 'pinterest':
+            image_urls = await loop.run_in_executor(
+                None, lambda: resolve_pinterest_images(url))
+            if image_urls:
+                files = await loop.run_in_executor(
+                    None, lambda: _download_images_from_urls(image_urls, dl_dir))
+                if files:
+                    logger.info(
+                        f"✅ صور بينتريست عبر الواجهة العامة ({len(files)} صورة، بلا كوكيز)")
 
         if not files:
             return False  # ليست صوراً → ارجع لمسار الفيديو
@@ -2382,6 +2429,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         is_facebook_url = any(m in url.lower() for m in PLATFORM_URL_MARKERS['facebook'])
         is_instagram_url = _platform_of(url) == 'instagram'
         is_tiktok_url = _platform_of(url) == 'tiktok'
+        is_pinterest_url = _platform_of(url) == 'pinterest'
 
         def download(use_cookies=True, fmt=None, url_override=None, yt_clients=None):
             o = dict(ydl_opts)
@@ -2477,6 +2525,12 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             #    في get_video_info لكنها كانت مفقودة هنا فيفشل التحميل رغم نجاح المعاينة.
             elif is_tiktok_url and (_direct := await resolve_tiktok_direct(url)):
                 logger.info("✅ تحميل تيك توك عبر المرآة العامة (بديل yt-dlp، بلا كوكيز)")
+                info, file_path = await loop.run_in_executor(
+                    None, lambda: download(url_override=_direct))
+            # 🎯 بينتريست: فشل yt-dlp (تغييرات الموقع/حجب) → حل الرابط لملف فيديو
+            #    مباشر عبر واجهة بينتريست العامة (بلا كوكيز) وحمّله منها
+            elif is_pinterest_url and (_direct := await resolve_pinterest_direct(url)):
+                logger.info("✅ تحميل بينتريست عبر الواجهة العامة (بديل yt-dlp، بلا كوكيز)")
                 info, file_path = await loop.run_in_executor(
                     None, lambda: download(url_override=_direct))
             # الصيغة المطلوبة غير متوفرة → أعد المحاولة بأفضل صيغة متاحة
@@ -4768,10 +4822,10 @@ async def handle_url(client, message):
         if not info:
             # Send alert to admin
             user_name = message.from_user.first_name or "User"
-            # 🖼️ قد يفشل yt-dlp تماماً في استخراج سلايدشو تيك توك / كاروسيل إنستغرام
-            #    (منشور صور بلا فيديو، خاصة روابط vm.tiktok.com المختصرة) فيرجع None.
-            #    جرّب مسار الصور عبر gallery-dl قبل اعتبار الرابط فاشلاً.
-            if _platform_of(url) in ('instagram', 'tiktok'):
+            # 🖼️ قد يفشل yt-dlp تماماً في استخراج سلايدشو تيك توك / كاروسيل
+            #    إنستغرام/بينتريست (منشور صور بلا فيديو، خاصة الروابط المختصرة)
+            #    فيرجع None. جرّب مسار الصور عبر gallery-dl قبل اعتبار الرابط فاشلاً.
+            if _platform_of(url) in ('instagram', 'tiktok', 'pinterest'):
                 if await download_and_send_images(
                     client, message, url, status, user_id, user_name,
                     message.from_user.username, lang
@@ -4832,10 +4886,10 @@ async def handle_url(client, message):
                 )
                 return
     
-    # 🖼️ منشور مصوّر بلا فيديو (كاروسيل إنستغرام / سلايدشو تيك توك) → أرسل الصور
-    #    كألبوم عبر gallery-dl. المنشورات المختلطة (صور+فيديو) تبقى على مسار الفيديو
-    #    المعتاد دون أي تغيير في سلوكه.
-    if _platform_of(url) in ('instagram', 'tiktok') and not _info_has_video(info):
+    # 🖼️ منشور مصوّر بلا فيديو (كاروسيل إنستغرام/بينتريست / سلايدشو تيك توك) →
+    #    أرسل الصور كألبوم عبر gallery-dl. المنشورات المختلطة (صور+فيديو) تبقى
+    #    على مسار الفيديو المعتاد دون أي تغيير في سلوكه.
+    if _platform_of(url) in ('instagram', 'tiktok', 'pinterest') and not _info_has_video(info):
         img_user_name = message.from_user.first_name or "User"
         handled = await download_and_send_images(
             client, message, url, status, user_id, img_user_name, username, lang, info

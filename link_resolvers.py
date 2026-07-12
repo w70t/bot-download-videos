@@ -349,6 +349,237 @@ def resolve_twitter_media(url: str, timeout: int = 20):
     return None
 
 
+# ═══════════════════════════════════════════════════════════════
+# بينتريست: فيديو وصور متعددة (كاروسيل/Idea Pins) عبر واجهات بينتريست العامة
+# yt-dlp قد يفشل مع بينتريست (تغييرات الموقع/حجب)، وgallery-dl قد يتعطّل للصور.
+# واجهتا بينتريست العامتان — PinResource على الموقع نفسه وpidgets على
+# api.pinterest.com — تعيدان بيانات الـPin كاملة بلا كوكيز ولا تسجيل دخول:
+# روابط mp4 المباشرة وكل صور الكاروسيل بدقّتها الأصلية. تُجرَّب المضيفات
+# بالترتيب؛ غيّر/أضف مضيفات بمتغيّر البيئة PINTEREST_PROXY_HOSTS (مفصولة
+# بفواصل) دون تعديل الكود إن تعطّل مضيف.
+# ═══════════════════════════════════════════════════════════════
+_PINTEREST_API_HOSTS = [
+    h.strip() for h in os.getenv(
+        'PINTEREST_PROXY_HOSTS', 'www.pinterest.com,api.pinterest.com'
+    ).split(',') if h.strip()
+]
+
+_PINTEREST_PIN_RE = re.compile(r'/pin/(\d{5,30})')
+
+
+def _pinterest_pin_id(url: str, timeout: int = 15):
+    """يستخرج معرّف الـPin الرقمي من الرابط، ويوسّع روابط pin.it المختصرة
+    باتّباع التحويل أولاً. يعيد None لغير روابط الـPin (بروفايل/لوحة/بحث)."""
+    import urllib.request
+    low = (url or '').lower()
+    if 'pin.it/' in low:
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': _BROWSER_UA})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                url = r.geturl() or url
+        except Exception as e:
+            logger.warning(f"⚠️ تعذّر توسيع رابط بينتريست المختصر: {e}")
+            return None
+    m = _PINTEREST_PIN_RE.search(url or '')
+    return m.group(1) if m else None
+
+
+def _pinterest_api_url(host: str, pin_id: str) -> str:
+    """رابط الاستعلام عن الـPin حسب نوع المضيف: pidgets لمضيفات api.*،
+    وPinResource (واجهة الويب الداخلية غير المسجّلة) لمضيف الموقع نفسه."""
+    import json
+    import urllib.parse
+    if host.startswith('api.'):
+        return f"https://{host}/v3/pidgets/pins/info/?pin_ids={pin_id}"
+    data = json.dumps({'options': {'id': pin_id,
+                                   'field_set_key': 'unauth_react_main_pin'},
+                       'context': {}}, separators=(',', ':'))
+    q = urllib.parse.urlencode({'source_url': f'/pin/{pin_id}/', 'data': data})
+    return f"https://{host}/resource/PinResource/get/?{q}"
+
+
+def _pinterest_fetch_pin(pin_id: str, timeout: int):
+    """يجلب بيانات الـPin من أول مضيف يستجيب ويعيد dict الـPin أو None.
+    يطبّع شكلي الرد: PinResource (resource_response.data كائن) وpidgets
+    (data قائمة أول عنصر فيها هو الـPin)."""
+    import json
+    import urllib.request
+    for host in _PINTEREST_API_HOSTS:
+        api_url = _pinterest_api_url(host, pin_id)
+        try:
+            req = urllib.request.Request(api_url, headers={
+                'User-Agent': _BROWSER_UA,
+                'Accept': 'application/json',
+            })
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                payload = json.loads(resp.read(4_000_000).decode('utf-8', 'ignore'))
+        except Exception as e:
+            logger.warning(f"⚠️ تعذّر جلب بيانات بينتريست عبر {host}: {e}")
+            continue
+        pin = None
+        if isinstance(payload, dict):
+            rr = payload.get('resource_response')
+            if isinstance(rr, dict) and isinstance(rr.get('data'), dict):
+                pin = rr['data']
+            elif isinstance(payload.get('data'), list) and payload['data'] \
+                    and isinstance(payload['data'][0], dict):
+                pin = payload['data'][0]
+        if pin:
+            logger.info(f"🎯 بيانات Pin بينتريست {pin_id} عبر {host}")
+            return pin
+        logger.info(f"ℹ️ {host} لم يُرجع بيانات Pin لـ {pin_id}")
+    return None
+
+
+def _best_pinterest_video(video_list):
+    """يختار أفضل رابط فيديو من video_list (تفضيل mp4 على HLS ثم أعلى عرض)."""
+    if not isinstance(video_list, dict):
+        return None
+    best_url, best_score = None, (-1, -1)
+    for v in video_list.values():
+        if not isinstance(v, dict):
+            continue
+        u = v.get('url')
+        if not isinstance(u, str) or not u.lower().startswith(('http://', 'https://')):
+            continue
+        is_mp4 = 0 if '.m3u8' in u.lower() else 1
+        score = (is_mp4, int(v.get('width') or 0))
+        if score > best_score:
+            best_url, best_score = u, score
+    return best_url
+
+
+def _pinterest_story_pages(pin):
+    """صفحات الـIdea Pin (story) إن وُجدت، وإلا قائمة فارغة."""
+    story = pin.get('story_pin_data')
+    if isinstance(story, dict) and isinstance(story.get('pages'), list):
+        return story['pages']
+    return []
+
+
+def _extract_pinterest_video(pin):
+    """يستخرج رابط الفيديو المباشر من بيانات الـPin (فيديو عادي أو أول فيديو
+    في صفحات Idea Pin)، أو None لمنشور صور."""
+    if not isinstance(pin, dict):
+        return None
+    vids = pin.get('videos')
+    if isinstance(vids, dict):
+        u = _best_pinterest_video(vids.get('video_list'))
+        if u:
+            return u
+    for page in _pinterest_story_pages(pin):
+        blocks = page.get('blocks') if isinstance(page, dict) else None
+        for b in (blocks or []):
+            v = b.get('video') if isinstance(b, dict) else None
+            if isinstance(v, dict):
+                u = _best_pinterest_video(v.get('video_list'))
+                if u:
+                    return u
+    return None
+
+
+def _best_pinterest_image(images):
+    """أفضل رابط صورة من dict الأحجام (orig/originals أولاً ثم الأعرض)."""
+    if not isinstance(images, dict):
+        return None
+    for key in ('orig', 'originals'):
+        d = images.get(key)
+        if isinstance(d, dict) and isinstance(d.get('url'), str):
+            return d['url']
+    best_url, best_w = None, -1
+    for d in images.values():
+        if isinstance(d, dict) and isinstance(d.get('url'), str):
+            w = int(d.get('width') or 0)
+            if w > best_w:
+                best_url, best_w = d['url'], w
+    return best_url
+
+
+# رابط i.pinimg.com بحجم مصغّر (مثل /236x/ أو /564x1128/) → الدقّة الأصلية
+_PINIMG_SIZE_RE = re.compile(r'(pinimg\.com)/\d+x\d*/')
+
+
+def _upscale_pinimg(u):
+    """يرفع رابط صورة pinimg المصغّر إلى /originals/ (الدقّة الكاملة)."""
+    return _PINIMG_SIZE_RE.sub(r'\1/originals/', u) if isinstance(u, str) else u
+
+
+def _extract_pinterest_images(pin):
+    """يستخرج روابط كل صور الـPin مرتّبة: كاروسيل متعدد الصور، أو صفحات
+    Idea Pin، أو الصورة المفردة. يعيد [] لمنشور فيديو — صورته مجرّد غلاف
+    فلا نعيدها كي لا يستقبل المستخدم صورة بدل الفيديو."""
+    if not isinstance(pin, dict):
+        return []
+    out = []
+
+    def _add(u):
+        u = _upscale_pinimg(u)
+        if (isinstance(u, str) and u.lower().startswith(('http://', 'https://'))
+                and u not in out):
+            out.append(u)
+
+    carousel = pin.get('carousel_data')
+    slots = carousel.get('carousel_slots') if isinstance(carousel, dict) else None
+    for slot in (slots or []):
+        if isinstance(slot, dict):
+            _add(_best_pinterest_image(slot.get('images')))
+    if out:
+        return out
+
+    for page in _pinterest_story_pages(pin):
+        blocks = page.get('blocks') if isinstance(page, dict) else None
+        for b in (blocks or []):
+            if not isinstance(b, dict) or isinstance(b.get('video'), dict):
+                continue  # صفحات الفيديو لمسار الفيديو، لا كصور غلاف
+            img = b.get('image')
+            if isinstance(img, dict):
+                _add(_best_pinterest_image(img.get('images')) or img.get('url'))
+    if out:
+        return out
+
+    if _extract_pinterest_video(pin):
+        return []
+    _add(_best_pinterest_image(pin.get('images')))
+    return out
+
+
+def resolve_pinterest_media(url: str, timeout: int = 20):
+    """يحوّل رابط Pin بينتريست إلى رابط الفيديو المباشر (mp4/HLS) عبر واجهات
+    بينتريست العامة بلا كوكيز، ليُحمّل حين يفشل yt-dlp. يعيد None لغير روابط
+    بينتريست أو لمنشورات الصور أو عند أي فشل — فيبقى المسار الأصلي دون تغيير."""
+    low = (url or '').lower()
+    if not any(m in low for m in PLATFORM_URL_MARKERS['pinterest']):
+        return None
+    pin_id = _pinterest_pin_id(url, timeout=min(timeout, 15))
+    if not pin_id:
+        return None
+    pin = _pinterest_fetch_pin(pin_id, timeout)
+    media = _extract_pinterest_video(pin) if pin else None
+    if media and is_safe_url(media):
+        logger.info(f"🎯 فيديو بينتريست {pin_id}: {media[:90]}")
+        return media
+    return None
+
+
+def resolve_pinterest_images(url: str, timeout: int = 20):
+    """يعيد قائمة روابط صور الـPin (كاروسيل/Idea Pin/صورة مفردة) بدقّتها
+    الأصلية عبر واجهات بينتريست العامة بلا كوكيز، حين يفشل gallery-dl.
+    قائمة فارغة لغير بينتريست أو لمنشور فيديو أو عند أي فشل."""
+    low = (url or '').lower()
+    if not any(m in low for m in PLATFORM_URL_MARKERS['pinterest']):
+        return []
+    pin_id = _pinterest_pin_id(url, timeout=min(timeout, 15))
+    if not pin_id:
+        return []
+    pin = _pinterest_fetch_pin(pin_id, timeout)
+    if not pin:
+        return []
+    images = [u for u in _extract_pinterest_images(pin) if is_safe_url(u)]
+    if images:
+        logger.info(f"🎯 صور بينتريست {pin_id}: {len(images)} صورة (بلا كوكيز)")
+    return images
+
+
 def all_mirror_hosts():
     """يعيد قائمة (المنصة، المضيف) لكل مرايا البدائل المُهيّأة — لفحص الصحّة."""
     hosts = []
@@ -358,6 +589,8 @@ def all_mirror_hosts():
         hosts.append(('tiktok', h))
     for h in _TWITTER_API_HOSTS:
         hosts.append(('twitter', h))
+    for h in _PINTEREST_API_HOSTS:
+        hosts.append(('pinterest', h))
     return hosts
 
 
