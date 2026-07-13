@@ -3830,13 +3830,13 @@ async def start(client, message):
             # مشترك - عرض زر الاشتراك + تحميلاتي/الدعوة + تغيير اللغة
             keyboard = ReplyKeyboardMarkup([
                 [KeyboardButton(t('btn_my_subscription', lang))],
-                [KeyboardButton(t('btn_my_downloads', lang)), KeyboardButton(t('btn_invite', lang)), KeyboardButton(t('btn_edit_gender', lang))],
+                [KeyboardButton(t('btn_my_downloads', lang)), KeyboardButton(t('btn_invite', lang))],
                 [KeyboardButton(t('btn_change_language', lang))]
             ], resize_keyboard=True)
         else:
             # غير مشترك - تحميلاتي/الدعوة + تغيير اللغة
             keyboard = ReplyKeyboardMarkup([
-                [KeyboardButton(t('btn_my_downloads', lang)), KeyboardButton(t('btn_invite', lang)), KeyboardButton(t('btn_edit_gender', lang))],
+                [KeyboardButton(t('btn_my_downloads', lang)), KeyboardButton(t('btn_invite', lang))],
                 [KeyboardButton(t('btn_change_language', lang))]
             ], resize_keyboard=True)
     
@@ -6523,13 +6523,36 @@ async def handle_message_type(client, callback_query):
         g = parts[1] if len(parts) > 1 and parts[1] in ('all', 'male', 'female') else 'all'
         tlang = parts[2] if len(parts) > 2 and parts[2] in ('all', 'ar', 'en') else 'all'
         count = len(_broadcast_targets(g, tlang))
+        # الخطوة 3: شكل الرسالة — نظيفة (بلا أزرار نعم/لا) أو مع أزرار تفاعل
+        # تُغذّي الإحصائية الحية. النظيفة أهدأ للعضو، والتفاعلية تقيس التجاوب.
         await callback_query.message.edit_text(
             f"📢 **بث إلى:** {_gender_flag(g)} {_lang_flag(tlang)} ({count} مستخدم)\n\n"
+            "**اختر شكل الرسالة:**\n\n"
+            "✨ **نظيفة** — نص فقط + زر رد (مرتّبة وهادئة)\n"
+            "📊 **تفاعلية** — مع أزرار ✅/❌ وإحصائية حية لمن تفاعل",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✨ رسالة نظيفة", callback_data=f"msg_bcp_{g}_{tlang}_clean")],
+                [InlineKeyboardButton("📊 مع أزرار تفاعل", callback_data=f"msg_bcp_{g}_{tlang}_poll")],
+                [InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")],
+            ])
+        )
+
+    elif action.startswith('bcp_'):
+        parts = action.split('_')  # ['bcp', gender, lang, mode]
+        g = parts[1] if len(parts) > 1 and parts[1] in ('all', 'male', 'female') else 'all'
+        tlang = parts[2] if len(parts) > 2 and parts[2] in ('all', 'ar', 'en') else 'all'
+        with_poll = len(parts) > 3 and parts[3] == 'poll'
+        count = len(_broadcast_targets(g, tlang))
+        shape = "📊 تفاعلية (نعم/لا + إحصائية)" if with_poll else "✨ نظيفة"
+        await callback_query.message.edit_text(
+            f"📢 **بث إلى:** {_gender_flag(g)} {_lang_flag(tlang)} ({count} مستخدم)\n"
+            f"**الشكل:** {shape}\n\n"
             "أرسل الآن نص الرسالة التي تريد بثّها.",
             reply_markup=_sub_settings_back_kb()
         )
         pending_downloads[user_id] = {
-            'waiting_for': 'broadcast_message', 'target_lang': tlang, 'target_gender': g}
+            'waiting_for': 'broadcast_message', 'target_lang': tlang,
+            'target_gender': g, 'with_poll': with_poll}
 
     elif action == 'direct_user':
         await callback_query.message.edit_text(
@@ -7118,18 +7141,24 @@ async def handle_admin_input(client, message):
                 target_gender = data.get('target_gender', 'all')
                 all_users = _broadcast_targets(target_gender, target_lang)
 
-            # إنشاء استبيان بث جديد بإحصائية حيّة
-            broadcast_counter += 1
-            bid = broadcast_counter
-            broadcast_polls[bid] = {
-                'admin_id': user_id,
-                'total': len(all_users),
-                'yes': {},
-                'no': {},
-                'stats_chat': None,
-                'stats_msg_id': None,
-                'last_edit': 0,
-            }
+            # شكل الرسالة: تفاعلية (نعم/لا + إحصائية حية) أو نظيفة (نص + زر رد
+            # فقط). بث المستثنين نظيف دائماً — أشخاص معدودون لا معنى لإحصائيتهم.
+            with_poll = bool(data.get('with_poll')) and not data.get('target_exempt')
+
+            bid = None
+            if with_poll:
+                # إنشاء استبيان بث جديد بإحصائية حيّة
+                broadcast_counter += 1
+                bid = broadcast_counter
+                broadcast_polls[bid] = {
+                    'admin_id': user_id,
+                    'total': len(all_users),
+                    'yes': {},
+                    'no': {},
+                    'stats_chat': None,
+                    'stats_msg_id': None,
+                    'last_edit': 0,
+                }
 
             progress = await message.reply_text(
                 f"📤 **جاري الإرسال...**\n\n"
@@ -7146,12 +7175,15 @@ async def handle_admin_input(client, message):
                     # Get each user's preferred language
                     user_lang = subdb.get_user_language(uid)
 
-                    # أزرار: نعم / لا + رد للمطور
-                    kb = InlineKeyboardMarkup([
-                        [InlineKeyboardButton(t('btn_yes', user_lang), callback_data=f"bcyes_{bid}"),
-                         InlineKeyboardButton(t('btn_no', user_lang), callback_data=f"bcno_{bid}")],
-                        [InlineKeyboardButton(t('reply_button', user_lang), callback_data=f"reply_msg_{user_id}")],
-                    ])
+                    # أزرار: (نعم / لا في الوضع التفاعلي فقط) + رد للمطور
+                    kb_rows = []
+                    if with_poll:
+                        kb_rows.append(
+                            [InlineKeyboardButton(t('btn_yes', user_lang), callback_data=f"bcyes_{bid}"),
+                             InlineKeyboardButton(t('btn_no', user_lang), callback_data=f"bcno_{bid}")])
+                    kb_rows.append(
+                        [InlineKeyboardButton(t('reply_button', user_lang), callback_data=f"reply_msg_{user_id}")])
+                    kb = InlineKeyboardMarkup(kb_rows)
 
                     await client.send_message(
                         chat_id=uid,
@@ -7180,17 +7212,18 @@ async def handle_admin_input(client, message):
                                               idx, total_targets, success_count,
                                               fail_count, removed_count)
 
-            # عدد من وصلتهم الرسالة فعلاً هو الأساس لحساب "لم يتفاعلوا"
-            broadcast_polls[bid]['total'] = success_count
+            if with_poll:
+                # عدد من وصلتهم الرسالة فعلاً هو الأساس لحساب "لم يتفاعلوا"
+                broadcast_polls[bid]['total'] = success_count
 
-            # رسالة الإحصائية الحيّة للأدمن (تتحدث عند كل ضغطة)
-            stats_msg = await message.reply_text(
-                _broadcast_stats_text(bid),
-                reply_markup=_broadcast_stats_kb(bid),
-                parse_mode=enums.ParseMode.HTML
-            )
-            broadcast_polls[bid]['stats_chat'] = stats_msg.chat.id
-            broadcast_polls[bid]['stats_msg_id'] = stats_msg.id
+                # رسالة الإحصائية الحيّة للأدمن (تتحدث عند كل ضغطة)
+                stats_msg = await message.reply_text(
+                    _broadcast_stats_text(bid),
+                    reply_markup=_broadcast_stats_kb(bid),
+                    parse_mode=enums.ParseMode.HTML
+                )
+                broadcast_polls[bid]['stats_chat'] = stats_msg.chat.id
+                broadcast_polls[bid]['stats_msg_id'] = stats_msg.id
 
             try:
                 await progress.edit_text(
@@ -7203,7 +7236,8 @@ async def handle_admin_input(client, message):
                 pass
 
             del pending_downloads[user_id]
-            logger.info(f"📢 Broadcast #{bid}: {success_count} نجح, {fail_count} فشل, {removed_count} محذوف")
+            logger.info(f"📢 Broadcast {'#' + str(bid) if bid else '(نظيف)'}: "
+                        f"{success_count} نجح, {fail_count} فشل, {removed_count} محذوف")
         
         elif waiting_for == 'exempt_add':
             uid, name = _resolve_member_ref(message.text)
@@ -7438,7 +7472,7 @@ async def handle_language_selection(client, callback_query):
     else:
         from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton
         keyboard = ReplyKeyboardMarkup([
-            [KeyboardButton(t('btn_my_downloads', lang)), KeyboardButton(t('btn_invite', lang)), KeyboardButton(t('btn_edit_gender', lang))],
+            [KeyboardButton(t('btn_my_downloads', lang)), KeyboardButton(t('btn_invite', lang))],
             [KeyboardButton(t('btn_change_language', lang))]
         ], resize_keyboard=True)
 
