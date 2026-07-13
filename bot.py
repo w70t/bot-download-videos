@@ -5732,6 +5732,7 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
          InlineKeyboardButton("📢 بث جماعي", callback_data="sub_broadcast")],
         [InlineKeyboardButton("📨 تذكير غير النشطين", callback_data="sub_remind_inactive"),
          InlineKeyboardButton("💾 نسخة احتياطية", callback_data="sub_backup_channel")],
+        [InlineKeyboardButton("⭐ قائمة الاستثناء", callback_data="sub_exempt")],
     ])
 
     text = (
@@ -7482,6 +7483,60 @@ async def handle_change_language_button(client, message):
         )
 
 
+async def _register_bot_commands(client):
+    """يسجّل قائمة أوامر تلجرام (قائمة /) عند الإقلاع فلا حاجة لحفظ الأوامر:
+    للأعضاء يظهر /start فقط، وللأدمن (في محادثته وحدها) تظهر كل أوامر الإدارة
+    مع وصف عربي لكل أمر. أي فشل هنا لا يمس عمل البوت."""
+    from pyrogram.types import (
+        BotCommand, BotCommandScopeChat, BotCommandScopeDefault,
+    )
+    # المهمة تُنشأ قبل app.run() → انتظر اتصال العميل أولاً
+    for _ in range(120):
+        if getattr(client, 'is_connected', False):
+            break
+        await asyncio.sleep(1)
+    else:
+        logger.warning("⚠️ لم يتصل العميل — تخطّي تسجيل قائمة الأوامر")
+        return
+
+    try:
+        await client.set_bot_commands(
+            [BotCommand("start", "بدء البوت / Start the bot")],
+            scope=BotCommandScopeDefault()
+        )
+    except Exception as e:
+        logger.warning(f"⚠️ تعذّر تسجيل أوامر الأعضاء: {e}")
+
+    admin_id = os.getenv("ADMIN_ID")
+    if not (admin_id and str(admin_id).lstrip('-').isdigit()):
+        return
+    admin_cmds = [
+        BotCommand("start", "🏠 بدء البوت"),
+        BotCommand("exempt", "⭐ إضافة عضو لقائمة الاستثناء"),
+        BotCommand("unexempt", "⭐ حذف عضو من قائمة الاستثناء"),
+        BotCommand("exemptlist", "⭐ عرض قائمة الاستثناء"),
+        BotCommand("health", "🩺 فحص صحة البوت"),
+        BotCommand("backup", "💾 نسخة احتياطية فورية"),
+        BotCommand("history", "📥 سجل التحميلات"),
+        BotCommand("dlstats", "📊 إحصائيات التحميل"),
+        BotCommand("realusers", "👥 فحص الأعضاء الحقيقيين"),
+        BotCommand("cookies", "🍪 إدارة الكوكيز"),
+        BotCommand("update", "⬆️ تحديث أدوات التحميل"),
+        BotCommand("uncache", "🧹 حذف رابط من الكاش"),
+        BotCommand("unban", "✅ رفع الحظر عن عضو"),
+        BotCommand("banned", "📛 قائمة المحظورين"),
+        BotCommand("blockacc", "🚫 حظر حساب مصدر"),
+        BotCommand("unblockacc", "♻️ رفع حظر حساب مصدر"),
+        BotCommand("blockedaccs", "📋 الحسابات المصدر المحظورة"),
+    ]
+    try:
+        await client.set_bot_commands(
+            admin_cmds, scope=BotCommandScopeChat(chat_id=int(admin_id)))
+        logger.info("✅ سُجّلت قائمة أوامر تلجرام (الأعضاء + الأدمن)")
+    except Exception as e:
+        logger.warning(f"⚠️ تعذّر تسجيل أوامر الأدمن: {e}")
+
+
 logger.info("🚀 بدء البوت...")
 # ═══════════════════════════════════════════════════════════════
 # Main
@@ -7508,6 +7563,7 @@ def main():
     loop.create_task(daily_report_task())
     loop.create_task(daily_cleanup_task())
     loop.create_task(_auto_backup_loop(app))  # نسخ احتياطي تلقائي لقناة النسخ
+    loop.create_task(_register_bot_commands(app))  # قائمة أوامر / في تلجرام
     
     try:
         app.run()
