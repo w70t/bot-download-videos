@@ -28,15 +28,34 @@ ADULT_DOMAINS = {
     'hanime.tv', 'hentaihaven.xxx', 'nhentai.net', 'hentai.tv', 'fakings.com',
     'xmoviesforyou.com', 'fux.com', 'keezmovies.com', 'extremetube.com',
     'gotporn.com', 'pornhat.com', 'analdin.com', 'hdzog.com', 'thothub.tv',
+    # نطاقات إضافية (مرايا شائعة ومواقع حالية)
+    'xhamster2.com', 'xhamster3.com', 'xhamsterlive.com', 'xhamster42.desi',
+    'xnxx.tv', 'xnxx2.com', 'xvideos.es', 'xvideos2020.xyz', 'xvv1deos.com',
+    'spankwire.com', 'pornzog.com', '4tube.com', 'porndig.com', 'porn300.com',
+    'vxxx.com', 'ok.xxx', 'pornxp.com', 'daftsex.com', 'noodlemagazine.com',
+    'erome.com', 'camwhores.tv', 'recurbate.com', 'fapello.com',
+    'coomer.party', 'coomer.su', 'kemono.party', 'kemono.su', 'simpcity.su',
+    'e-hentai.org', 'hentaigasm.com', 'muchohentai.com',
+    'javhd.com', 'javmost.com', 'missav.com', 'missav.ws', 'supjav.com',
+    'luxuretv.com', 'heavy-r.com', 'efukt.com', 'shooshtime.com',
+    'ashemaletube.com', 'tranny.one', 'pornpics.com', 'sex.com',
 }
 
 # كلمات مفتاحية صريحة (عربي + إنجليزي). تُفحص في النطاق ومسار الرابط والعنوان.
+# ملاحظة: المطابقة بالاحتواء (substring) — لا تُضف كلمات قصيرة تقع داخل كلمات
+# بريئة (مثل 'كس' داخل 'مكسور' أو 'sex' داخل 'sussex').
 ADULT_KEYWORDS = [
     'porn', 'xxx', 'xnxx', 'sexvideo', 'sex-video', 'nsfw', 'hentai',
     'camgirl', 'camslut', 'fuck', 'blowjob', 'creampie', 'cumshot',
-    'milf', 'hardcore', 'bigtits', 'pussy', 'anal', 'escort',
+    'milf', 'hardcore', 'bigtits', 'pussy', 'escort',
+    # 'anal' وحدها تطابق analysis/canal البريئة → صيغ محددة فقط
+    'anal sex', 'analsex', 'anal-sex',
+    'onlyfans', 'fansly', 'deepthroat', 'gangbang', 'threesome',
+    'masturbat', 'dildo', 'redgifs', 'javhd', 'stripchat', 'chaturbate',
     'سكس', 'اباحي', 'إباحي', 'اباحية', 'إباحية', 'نيك', 'خلاعة', 'عاهرة',
     'شرموطة', 'متناكة', 'سحاق', 'لواط',
+    # 'بورنو' لا 'بورن' — حتى لا يُحظر نادي بورنموث الرياضي
+    'بورنو', 'سكسي', 'قحبة', 'قحاب', 'شراميط', 'ممحونة', 'ديوث',
 ]
 
 

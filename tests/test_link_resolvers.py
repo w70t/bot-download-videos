@@ -425,14 +425,30 @@ def test_substack_note_resolves_video_and_title():
         'name': 'ARCHI',
         'body': 'أشرس معركة ستخوضها\nسطر ثانٍ',
         'attachments': [{'type': 'video',
-                         'media_upload_id': 'afa5cef9-9d23-4860-9649-9a3c15dcbaf7'}],
+                         'media_upload_id': 'afa5cef9-9d23-4860-9649-9a3c15dcbaf7',
+                         'mediaUpload': {'explicit': False}}],
     }}}
     with patch('urllib.request.urlopen', return_value=_FakeJsonResp(payload)), \
             patch.object(link_resolvers, 'is_safe_url', return_value=True):
-        direct, title = resolve_substack_note('https://substack.com/@flza7/note/c-292715374')
+        direct, title, explicit = resolve_substack_note(
+            'https://substack.com/@flza7/note/c-292715374')
     assert direct == ('https://substack.com/api/v1/video/upload/'
                       'afa5cef9-9d23-4860-9649-9a3c15dcbaf7/src')
     assert title == 'أشرس معركة ستخوضها'
+    assert explicit is False
+
+
+def test_substack_note_flags_explicit_media():
+    # وسائط مصنّفة صريحة لدى Substack → يعود العلم True ليرفضها فلتر المحتوى
+    payload = {'item': {'comment': {
+        'body': 'x',
+        'attachments': [{'type': 'video', 'media_upload_id': 'abc-123',
+                         'mediaUpload': {'explicit': True}}],
+    }}}
+    with patch('urllib.request.urlopen', return_value=_FakeJsonResp(payload)), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        direct, _title, explicit = resolve_substack_note('https://substack.com/note/c-1')
+    assert direct and explicit is True
 
 
 def test_substack_note_title_falls_back_to_author():
@@ -443,24 +459,24 @@ def test_substack_note_title_falls_back_to_author():
     }}}
     with patch('urllib.request.urlopen', return_value=_FakeJsonResp(payload)), \
             patch.object(link_resolvers, 'is_safe_url', return_value=True):
-        _direct, title = resolve_substack_note('https://substack.com/note/c-1')
+        _direct, title, _explicit = resolve_substack_note('https://substack.com/note/c-1')
     assert title == 'ARCHI'
 
 
 def test_substack_note_without_video():
-    # ملاحظة نصية/صور بلا فيديو → (None, None)
+    # ملاحظة نصية/صور بلا فيديو → (None, None, False)
     payload = {'item': {'comment': {'body': 'نص فقط', 'attachments': [
         {'type': 'image', 'media_upload_id': 'x'}]}}}
     with patch('urllib.request.urlopen', return_value=_FakeJsonResp(payload)):
-        assert resolve_substack_note('https://substack.com/note/c-1') == (None, None)
+        assert resolve_substack_note('https://substack.com/note/c-1') == (None, None, False)
 
 
 def test_substack_resolver_ignores_non_note_urls():
-    # غير الملاحظات → (None, None) بلا أي طلب شبكي
-    assert resolve_substack_note('https://someblog.substack.com/p/post') == (None, None)
-    assert resolve_substack_note('') == (None, None)
+    # غير الملاحظات → (None, None, False) بلا أي طلب شبكي
+    assert resolve_substack_note('https://someblog.substack.com/p/post') == (None, None, False)
+    assert resolve_substack_note('') == (None, None, False)
 
 
 def test_substack_resolver_handles_network_error():
     with patch('urllib.request.urlopen', side_effect=OSError('boom')):
-        assert resolve_substack_note('https://substack.com/note/c-1') == (None, None)
+        assert resolve_substack_note('https://substack.com/note/c-1') == (None, None, False)

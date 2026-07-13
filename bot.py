@@ -763,22 +763,31 @@ async def _pinterest_video_fallback(url: str):
 
 async def resolve_substack_direct(url: str):
     """يحل رابط ملاحظة Substack إلى رابط الفيديو المباشر (وسيط /src) عبر واجهة
-    Substack العامة بلا كوكيز. يعيد الرابط أو None. طلب شبكي خارج حلقة الأحداث."""
+    Substack العامة بلا كوكيز. يعيد الرابط أو None (ومنه المحتوى الصريح حين
+    يكون فلتر المحتوى الإباحي مفعّلاً). طلب شبكي خارج حلقة الأحداث."""
     if not is_substack_note(url):
         return None
     loop = asyncio.get_event_loop()
-    direct, _title = await loop.run_in_executor(None, resolve_substack_note, url)
+    direct, _title, explicit = await loop.run_in_executor(None, resolve_substack_note, url)
+    if direct and explicit and adult_filter_enabled():
+        logger.info("🔞 فيديو Substack صريح — رُفض (فلتر المحتوى مفعّل)")
+        return None
     return direct
 
 
 async def _substack_video_fallback(url: str):
     """خطة بديلة لملاحظات Substack: yt-dlp لا يدعمها أصلاً (صفحة جافاسكربت
-    وفيديو Mux موقّع) → واجهة Substack العامة تعطي رابط الفيديو + العنوان."""
+    وفيديو Mux موقّع) → واجهة Substack العامة تعطي رابط الفيديو + العنوان.
+    الوسائط المصنّفة صريحة لدى Substack تُرفض ما دام فلتر المحتوى مفعّلاً."""
     if not is_substack_note(url):
         return None
     loop = asyncio.get_event_loop()
-    direct, title = await loop.run_in_executor(None, resolve_substack_note, url)
+    direct, title, explicit = await loop.run_in_executor(None, resolve_substack_note, url)
     if not direct:
+        return None
+    if explicit and adult_filter_enabled():
+        logger.info("🔞 فيديو Substack صريح — رُفض مسار الواجهة (فلتر المحتوى مفعّل)")
+        _last_info_error.set('restricted')
         return None
     try:
         info = await loop.run_in_executor(
@@ -3035,6 +3044,11 @@ async def handle_redownload(client, callback_query):
         await callback_query.message.reply_text(
             t('error_occurred', lang, error="not found")
         )
+        return
+    # 🔞 فلتر المحتوى يسري على إعادة التحميل من السجل أيضاً — يلتقط النطاقات
+    # والكلمات التي أضافها الأدمن بعد التحميل الأصلي
+    if adult_filter_enabled() and is_adult_url(item['url']):
+        await callback_query.message.reply_text(t('adult_blocked', lang))
         return
     # 🖼️ عنصر صور: أعد تحميله عبر مسار الصور (gallery-dl) لا مسار الفيديو
     if item.get('kind') == 'image':
