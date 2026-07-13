@@ -12,6 +12,7 @@ from link_resolvers import (
     resolve_twitter_media, _extract_twitter_media, all_mirror_hosts,
     resolve_pinterest_media, resolve_pinterest_images, _pinterest_pin_id,
     _extract_pinterest_video, _extract_pinterest_images, _upscale_pinimg,
+    is_substack_note, resolve_substack_note,
 )
 
 
@@ -368,3 +369,62 @@ def test_pinterest_resolver_handles_network_error():
     with patch('urllib.request.urlopen', side_effect=OSError('boom')):
         assert resolve_pinterest_media('https://www.pinterest.com/pin/1234567890123/') is None
         assert resolve_pinterest_images('https://www.pinterest.com/pin/1234567890123/') == []
+
+
+# ── resolve_substack_note ───────────────────────────────────────
+
+def test_is_substack_note():
+    assert is_substack_note('https://substack.com/@flza7/note/c-292715374?r=x')
+    assert is_substack_note('https://open.substack.com/@user.name/note/c-123456')
+    assert is_substack_note('https://substack.com/note/c-987654')
+    assert not is_substack_note('https://substack.com/@flza7')  # بروفايل
+    assert not is_substack_note('https://someblog.substack.com/p/post-title')  # مقال
+    assert not is_substack_note('https://youtube.com/watch?v=1')
+    assert not is_substack_note('')
+
+
+def test_substack_note_resolves_video_and_title():
+    # ملاحظة بمرفق فيديو → رابط وسيط /src الثابت + العنوان من نص الملاحظة
+    payload = {'item': {'comment': {
+        'name': 'ARCHI',
+        'body': 'أشرس معركة ستخوضها\nسطر ثانٍ',
+        'attachments': [{'type': 'video',
+                         'media_upload_id': 'afa5cef9-9d23-4860-9649-9a3c15dcbaf7'}],
+    }}}
+    with patch('urllib.request.urlopen', return_value=_FakeJsonResp(payload)), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        direct, title = resolve_substack_note('https://substack.com/@flza7/note/c-292715374')
+    assert direct == ('https://substack.com/api/v1/video/upload/'
+                      'afa5cef9-9d23-4860-9649-9a3c15dcbaf7/src')
+    assert title == 'أشرس معركة ستخوضها'
+
+
+def test_substack_note_title_falls_back_to_author():
+    # ملاحظة بلا نص → العنوان اسم صاحبها
+    payload = {'item': {'comment': {
+        'name': 'ARCHI', 'body': '',
+        'attachments': [{'type': 'video', 'media_upload_id': 'abc-123'}],
+    }}}
+    with patch('urllib.request.urlopen', return_value=_FakeJsonResp(payload)), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        _direct, title = resolve_substack_note('https://substack.com/note/c-1')
+    assert title == 'ARCHI'
+
+
+def test_substack_note_without_video():
+    # ملاحظة نصية/صور بلا فيديو → (None, None)
+    payload = {'item': {'comment': {'body': 'نص فقط', 'attachments': [
+        {'type': 'image', 'media_upload_id': 'x'}]}}}
+    with patch('urllib.request.urlopen', return_value=_FakeJsonResp(payload)):
+        assert resolve_substack_note('https://substack.com/note/c-1') == (None, None)
+
+
+def test_substack_resolver_ignores_non_note_urls():
+    # غير الملاحظات → (None, None) بلا أي طلب شبكي
+    assert resolve_substack_note('https://someblog.substack.com/p/post') == (None, None)
+    assert resolve_substack_note('') == (None, None)
+
+
+def test_substack_resolver_handles_network_error():
+    with patch('urllib.request.urlopen', side_effect=OSError('boom')):
+        assert resolve_substack_note('https://substack.com/note/c-1') == (None, None)

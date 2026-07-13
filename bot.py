@@ -51,7 +51,7 @@ from link_resolvers import (
     resolve_snapchat_spotlight, _is_music_link, resolve_music_link,
     resolve_instagram_media, resolve_tiktok_media, resolve_twitter_media,
     resolve_tiktok_images, resolve_pinterest_media, resolve_pinterest_images,
-    all_mirror_hosts,
+    is_substack_note, resolve_substack_note, all_mirror_hosts,
 )
 from content_filter import (
     ADULT_DOMAINS, _custom_adult_domains, _custom_adult_keywords,
@@ -759,6 +759,37 @@ async def _pinterest_video_fallback(url: str):
         return None
 
 
+async def resolve_substack_direct(url: str):
+    """يحل رابط ملاحظة Substack إلى رابط الفيديو المباشر (وسيط /src) عبر واجهة
+    Substack العامة بلا كوكيز. يعيد الرابط أو None. طلب شبكي خارج حلقة الأحداث."""
+    if not is_substack_note(url):
+        return None
+    loop = asyncio.get_event_loop()
+    direct, _title = await loop.run_in_executor(None, resolve_substack_note, url)
+    return direct
+
+
+async def _substack_video_fallback(url: str):
+    """خطة بديلة لملاحظات Substack: yt-dlp لا يدعمها أصلاً (صفحة جافاسكربت
+    وفيديو Mux موقّع) → واجهة Substack العامة تعطي رابط الفيديو + العنوان."""
+    if not is_substack_note(url):
+        return None
+    loop = asyncio.get_event_loop()
+    direct, title = await loop.run_in_executor(None, resolve_substack_note, url)
+    if not direct:
+        return None
+    try:
+        info = await loop.run_in_executor(
+            None, lambda: _extract_direct_media(direct, title or 'Substack Video')
+        )
+        if info:
+            logger.info("✅ ملاحظة Substack عبر الواجهة العامة (بلا كوكيز)")
+        return info
+    except Exception as e:
+        logger.warning(f"⚠️ فشل استخراج ملاحظة Substack: {e}")
+        return None
+
+
 async def get_video_info(url: str):
     """استخراج معلومات الفيديو"""
     _last_info_error.set(None)
@@ -875,6 +906,10 @@ async def get_video_info(url: str):
         pn = await _pinterest_video_fallback(url)
         if pn:
             return pn
+        # 🎯 ملاحظات Substack: yt-dlp لا يدعمها → واجهة Substack العامة (بلا كوكيز)
+        sb = await _substack_video_fallback(url)
+        if sb:
+            return sb
         return None
 
 
@@ -2617,6 +2652,12 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             #    مباشر عبر واجهة بينتريست العامة (بلا كوكيز) وحمّله منها
             elif is_pinterest_url and (_direct := await resolve_pinterest_direct(url)):
                 logger.info("✅ تحميل بينتريست عبر الواجهة العامة (بديل yt-dlp، بلا كوكيز)")
+                info, file_path = await loop.run_in_executor(
+                    None, lambda: download(url_override=_direct))
+            # 🎯 ملاحظات Substack: yt-dlp لا يدعم صفحاتها → حمّل من وسيط الفيديو
+            #    الموقّع عبر واجهة Substack العامة (بلا كوكيز)
+            elif is_substack_note(url) and (_direct := await resolve_substack_direct(url)):
+                logger.info("✅ تحميل ملاحظة Substack عبر الواجهة العامة (بلا كوكيز)")
                 info, file_path = await loop.run_in_executor(
                     None, lambda: download(url_override=_direct))
             # الصيغة المطلوبة غير متوفرة → أعد المحاولة بأفضل صيغة متاحة
