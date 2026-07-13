@@ -384,6 +384,22 @@ async def add_forced_channel_from_admin(client, message, user_id):
     if fc:
         chat_id, username, title = fc.id, fc.username, fc.title
         url = f"https://t.me/{username}" if username else None
+        if not url:
+            # 🔒 قروب/قناة خاصة (بلا @username): ولّد رابط دعوة ليظهر زر
+            # الانضمام للأعضاء — يتطلب أن يكون البوت مشرفاً بصلاحية «إضافة
+            # أعضاء». مع المعرّف الحقيقي من التوجيه يصير الفرض تحققاً حقيقياً.
+            try:
+                url = await client.export_chat_invite_link(chat_id)
+            except Exception as e:
+                logger.warning(f"⚠️ تعذّر توليد رابط دعوة للخاص {chat_id}: {e}")
+                await message.reply_text(
+                    "🔒 هذا قروب/قناة **خاصة**، ولأعرضها للأعضاء أحتاج توليد "
+                    "رابط دعوة — ولم أستطع.\n\n"
+                    "✅ الحل: اجعل البوت **مشرفاً** فيها بصلاحية "
+                    "**«دعوة المستخدمين عبر رابط»** ثم أعد توجيه رسالة منها، "
+                    "وسيُفرض الاشتراك فيها بتحقق حقيقي."
+                )
+                return
 
     # 2) نص: رابط دعوة خاص أو @username/رابط عام
     if not chat_id and raw:
@@ -391,10 +407,15 @@ async def add_forced_channel_from_admin(client, message, user_id):
         if 't.me/' in token:
             token = token.split('t.me/')[-1].strip('/')
         if token.startswith('+') or token.startswith('joinchat/'):
-            # قناة/قروب خاص عبر رابط دعوة — لا يمكن التحقق منه (إعلاني)
             url = raw if raw.startswith('http') else f"https://t.me/{token}"
-            chat_id = url  # المعرّف الفريد هو الرابط نفسه
-            title = None
+            # 🔒 جرّب حلّ رابط الدعوة لمعرّف حقيقي (ينجح إن كان البوت داخل
+            # القروب) → فرض بتحقق حقيقي. وإلا يبقى زراً إعلانياً كما السابق.
+            try:
+                chat = await client.get_chat(url)
+                chat_id, username, title = chat.id, chat.username, chat.title
+            except Exception:
+                chat_id = url  # المعرّف الفريد هو الرابط نفسه (إعلاني فقط)
+                title = None
         else:
             uname = token.split('/')[0].split('?')[0].lstrip('@')
             try:
@@ -422,10 +443,15 @@ async def add_forced_channel_from_admin(client, message, user_id):
     except Exception:
         verifiable = False
 
-    note = ("✅ البوت مشرف هنا → **تحقق حقيقي** من اشتراك الأعضاء."
-            if verifiable else
-            "⚠️ البوت **ليس مشرفاً** هنا، ولا يمكن التحقق من الاشتراك (قيد تلجرام).\n"
-            "هذه القناة **لن تُفرض** حتى تجعل البوت مشرفاً فيها.")
+    if verifiable:
+        note = "✅ البوت مشرف هنا → **تحقق حقيقي** من اشتراك الأعضاء."
+    else:
+        note = ("⚠️ البوت **ليس مشرفاً** هنا، ولا يمكن التحقق من الاشتراك (قيد تلجرام).\n"
+                "هذه القناة **لن تُفرض** حتى تجعل البوت مشرفاً فيها.")
+        if isinstance(chat_id, str) and chat_id.startswith('http'):
+            # رابط دعوة خاص لم يُحل لمعرّف حقيقي — أرشد الأدمن للطريقة المضمونة
+            note += ("\n\n🔒 لقروب خاص بتحقق حقيقي: اجعل البوت مشرفاً فيه "
+                     "ثم **وجّه لي رسالة منه** بدل رابط الدعوة.")
 
     if subdb.add_forced_channel(chat_id, username, title, url):
         label = title or (f"@{username}" if username else url)
@@ -6159,7 +6185,10 @@ async def handle_subscription_settings(client, callback_query):
             "• رابط القناة/القروب (يشمل روابط الدعوة الخاصة)\n"
             "• أو وجّه لي رسالة من القناة/القروب\n\n"
             "💡 إن كان البوت مشرفاً فسيتحقق فعلياً من الاشتراك، وإلا سيظهر "
-            "الزر للإعلان ويُحتسب عند ضغط «تحقق». (يُكتشف تلقائياً)",
+            "الزر للإعلان ويُحتسب عند ضغط «تحقق». (يُكتشف تلقائياً)\n\n"
+            "🔒 **لقروب/قناة خاصة:** اجعل البوت مشرفاً فيها بصلاحية "
+            "«دعوة المستخدمين» ثم **وجّه لي رسالة منها** — أوّلد رابط الدعوة "
+            "تلقائياً ويُفرض الاشتراك بتحقق حقيقي.",
             reply_markup=_sub_settings_back_kb()
         )
         pending_downloads[callback_query.from_user.id] = {'waiting_for': 'add_forced_channel'}
