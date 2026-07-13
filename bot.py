@@ -293,12 +293,72 @@ def forced_sub_enabled():
     return subdb.get_setting('forced_sub_enabled', '1') == '1'
 
 
+# ═══════════════════════════════════════════════════════════════
+# قائمة الاستثناء (VIP) — أعضاء يحدّدهم الأدمن (أهل/أصدقاء):
+# لا يصلهم البث الجماعي ولا رسائل التذكير (فلا يعرفون ما يُرسل للأعضاء)،
+# ومعفيون من الاشتراك الإجباري. تُدار من لوحة الأدمن أو بأمر /exempt.
+# ═══════════════════════════════════════════════════════════════
+
+def _exempt_ids():
+    """معرّفات أعضاء قائمة الاستثناء (من إعداد exempt_user_ids المفصول بفواصل)."""
+    raw = subdb.get_setting('exempt_user_ids', '') or ''
+    return {int(x) for x in (p.strip() for p in raw.split(',')) if x.isdigit()}
+
+
+def _save_exempt_ids(ids):
+    subdb.set_setting('exempt_user_ids', ','.join(str(i) for i in sorted(ids)))
+
+
+def _add_exempt(uid):
+    """يضيف عضواً لقائمة الاستثناء. يرجع True إن أُضيف (False إن كان موجوداً)."""
+    ids = _exempt_ids()
+    if uid in ids:
+        return False
+    ids.add(uid)
+    _save_exempt_ids(ids)
+    return True
+
+
+def _remove_exempt(uid):
+    """يحذف عضواً من قائمة الاستثناء. يرجع True إن حُذف."""
+    ids = _exempt_ids()
+    if uid not in ids:
+        return False
+    ids.discard(uid)
+    _save_exempt_ids(ids)
+    return True
+
+
+def _broadcast_targets(gender='all', lang='all'):
+    """جمهور البث الجماعي بعد استبعاد قائمة الاستثناء — تُستخدم في عدّادات
+    شاشات البث وفي الإرسال الفعلي حتى تتطابق الأرقام مع الواقع."""
+    exempt = _exempt_ids()
+    return [u for u in subdb.get_target_users(gender, lang) if u not in exempt]
+
+
+def _resolve_member_ref(ref):
+    """يحوّل مدخل الأدمن (ID رقمي أو @username) إلى (user_id, الاسم).
+    المعرّف الرقمي يُقبل حتى لو لم يكن العضو في قاعدة البيانات (يعمل الإعفاء
+    فور دخوله)، أما اليوزر فيجب أن يكون عضواً معروفاً. يرجع (None, None) عند الفشل."""
+    ref = (ref or '').strip()
+    if ref.lstrip('-').isdigit():
+        uid = int(ref)
+        row = subdb.find_user_by_id(uid)
+        return uid, (row[2] if row else None)
+    row = subdb.find_user_by_username(ref)
+    if row:
+        return row[0], row[2]
+    return None, None
+
+
 async def enforce_forced_subscription(client, message, user_id, lang):
     """يفحص الاشتراك الإجباري؛ إن كان ناقصاً يعرض شاشة الاشتراك ويُرجع True
-    (أي يجب إيقاف المعالجة). الأدمن مُعفى، ويُحترم زر التفعيل/الإيقاف."""
+    (أي يجب إيقاف المعالجة). الأدمن وقائمة الاستثناء مُعفون، ويُحترم زر التفعيل/الإيقاف."""
     if not forced_sub_enabled():
         return False
     if is_admin(user_id):
+        return False
+    if user_id in _exempt_ids():
         return False
     missing = await get_missing_forced_channels(client, user_id)
     if not missing:
@@ -3611,6 +3671,82 @@ async def cmd_blockedaccs(client, message):
     await message.reply_text(f"📋 **الحسابات المحظورة ({len(accs)}):**\n{body}\n\nلرفع الحظر: /unblockacc <الحساب>")
 
 
+@app.on_message(filters.command("exempt"))
+async def cmd_exempt(client, message):
+    """إضافة عضو لقائمة الاستثناء: لا بث/تذكير + إعفاء من الاشتراك الإجباري. للأدمن فقط."""
+    if not is_admin(message.from_user.id):
+        return
+    parts = getattr(message, 'command', []) or []
+    if len(parts) < 2:
+        await message.reply_text(
+            "الاستخدام: /exempt <ID أو @username>\n"
+            "مثال: /exempt 123456789 أو /exempt @someuser\n\n"
+            "العضو المستثنى: 🔕 لا يصله بث ولا تذكير، ✅ معفى من الاشتراك الإجباري.\n"
+            "القائمة: /exemptlist — الحذف: /unexempt"
+        )
+        return
+    uid, name = _resolve_member_ref(parts[1])
+    if not uid:
+        await message.reply_text(
+            "❌ لم يتم العثور على العضو. أرسل ID رقمياً (يُقبل دائماً) "
+            "أو @username لعضو استخدم البوت مسبقاً."
+        )
+        return
+    if _add_exempt(uid):
+        shown = name or "غير معروف بعد (يُفعّل الإعفاء فور دخوله)"
+        await message.reply_text(
+            f"⭐ أُضيف لقائمة الاستثناء: {shown} (`{uid}`)\n"
+            "🔕 لن يصله بث أو تذكير، و✅ معفى من الاشتراك الإجباري."
+        )
+    else:
+        await message.reply_text(f"ℹ️ العضو `{uid}` في قائمة الاستثناء مسبقاً.")
+
+
+@app.on_message(filters.command("unexempt"))
+async def cmd_unexempt(client, message):
+    """حذف عضو من قائمة الاستثناء. للأدمن فقط."""
+    if not is_admin(message.from_user.id):
+        return
+    parts = getattr(message, 'command', []) or []
+    if len(parts) < 2:
+        await message.reply_text("الاستخدام: /unexempt <ID أو @username>")
+        return
+    uid, name = _resolve_member_ref(parts[1])
+    if not uid:
+        await message.reply_text("❌ لم يتم العثور على العضو.")
+        return
+    if _remove_exempt(uid):
+        await message.reply_text(
+            f"✅ حُذف من قائمة الاستثناء: {name or uid} (`{uid}`)\n"
+            "سيصله البث والتذكير ويُطبّق عليه الاشتراك الإجباري كأي عضو."
+        )
+    else:
+        await message.reply_text(f"ℹ️ العضو `{uid}` ليس في قائمة الاستثناء.")
+
+
+@app.on_message(filters.command("exemptlist"))
+async def cmd_exemptlist(client, message):
+    """عرض قائمة الاستثناء. للأدمن فقط."""
+    if not is_admin(message.from_user.id):
+        return
+    ids = sorted(_exempt_ids())
+    if not ids:
+        await message.reply_text(
+            "⭐ قائمة الاستثناء فارغة.\nأضِف عضواً بـ: /exempt <ID أو @username>")
+        return
+    lines = []
+    for uid in ids:
+        row = subdb.find_user_by_id(uid)
+        name = (row[2] if row and row[2] else None) or (
+            f"@{row[1]}" if row and row[1] else "غير معروف بعد")
+        lines.append(f"  • `{uid}` — {name}")
+    await message.reply_text(
+        f"⭐ **قائمة الاستثناء ({len(ids)}):**\n" + "\n".join(lines) +
+        "\n\n🔕 لا يصلهم بث/تذكير، ✅ معفيون من الاشتراك الإجباري.\n"
+        "للحذف: /unexempt <ID>"
+    )
+
+
 @app.on_message(filters.text & filters.regex(
     r'^(📥 تحميلاتي|📥 My Downloads|🎁 ادعُ أصدقاءك|🎁 Invite Friends|🧍 تعديل جنسي|🧍 Edit my gender)$'))
 async def handle_feature_buttons(client, message):
@@ -5444,6 +5580,41 @@ async def show_forced_sub_panel(client, callback_query):
         text += "\n⚠️ القنوات التي ليس البوت مشرفاً فيها لا يمكن التحقق منها (قيد تلجرام) فلا تُفرض. اجعل البوت مشرفاً ليعمل التحقق."
 
     rows.append([InlineKeyboardButton("➕ إضافة قناة/قروب", callback_data="sub_fsub_add")])
+    rows.append([InlineKeyboardButton("⭐ قائمة الاستثناء (معفيون)", callback_data="sub_exempt")])
+    rows.append([InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")])
+    await callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(rows))
+    await callback_query.answer()
+
+
+async def show_exempt_panel(client, callback_query):
+    """لوحة قائمة الاستثناء: عرض الأعضاء المستثنين مع حذف لكل عضو، إضافة عضو،
+    وبث خاص للمستثنين فقط. المستثنون لا يصلهم البث/التذكير ومعفيون من
+    الاشتراك الإجباري."""
+    ids = sorted(_exempt_ids())
+    text = (
+        "⭐ **قائمة الاستثناء**\n\n"
+        "الأعضاء هنا:\n"
+        "• 🔕 لا يصلهم البث الجماعي\n"
+        "• 🔕 لا تصلهم رسائل التذكير\n"
+        "• ✅ معفيون من الاشتراك الإجباري\n\n"
+    )
+    rows = []
+    if not ids:
+        text += "القائمة فارغة حالياً."
+    else:
+        text += f"👥 المستثنون ({len(ids)}):\n"
+        for uid in ids:
+            row = subdb.find_user_by_id(uid)
+            name = (row[2] if row and row[2] else None) or (
+                f"@{row[1]}" if row and row[1] else "غير معروف بعد")
+            text += f"• `{uid}` — {name}\n"
+            rows.append([InlineKeyboardButton(
+                f"🗑️ حذف: {str(name)[:20]} ({uid})",
+                callback_data=f"sub_exemptdel_{uid}")])
+    rows.append([InlineKeyboardButton("➕ إضافة عضو", callback_data="sub_exempt_add")])
+    if ids:
+        rows.append([InlineKeyboardButton(
+            f"📨 إرسال للمستثنين فقط ({len(ids)})", callback_data="sub_exempt_send")])
     rows.append([InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")])
     await callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(rows))
     await callback_query.answer()
@@ -5561,6 +5732,7 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
          InlineKeyboardButton("📢 بث جماعي", callback_data="sub_broadcast")],
         [InlineKeyboardButton("📨 تذكير غير النشطين", callback_data="sub_remind_inactive"),
          InlineKeyboardButton("💾 نسخة احتياطية", callback_data="sub_backup_channel")],
+        [InlineKeyboardButton("⭐ قائمة الاستثناء", callback_data="sub_exempt")],
     ])
 
     text = (
@@ -5825,17 +5997,65 @@ async def handle_subscription_settings(client, callback_query):
         await callback_query.answer()
         return
 
+    if action == 'exempt':
+        await show_exempt_panel(client, callback_query)
+        return
+
+    if action == 'exempt_add':
+        await callback_query.message.edit_text(
+            "⭐ **إضافة عضو لقائمة الاستثناء**\n\n"
+            "أرسل **User ID** أو **@username** للعضو.\n\n"
+            "**أمثلة:**\n• `123456789`\n• `@username`\n\n"
+            "بعد الإضافة: لن يصله أي بث أو تذكير، ويُعفى من الاشتراك الإجباري.",
+            reply_markup=_sub_settings_back_kb()
+        )
+        pending_downloads[callback_query.from_user.id] = {'waiting_for': 'exempt_add'}
+        await callback_query.answer()
+        return
+
+    if action.startswith('exemptdel_'):
+        try:
+            uid = int(action.replace('exemptdel_', ''))
+        except ValueError:
+            uid = None
+        if uid and _remove_exempt(uid):
+            await callback_query.answer(f"✅ حُذف {uid} من قائمة الاستثناء")
+        else:
+            await callback_query.answer("ℹ️ ليس في القائمة")
+        await show_exempt_panel(client, callback_query)
+        return
+
+    if action == 'exempt_send':
+        ids = _exempt_ids()
+        if not ids:
+            await callback_query.answer("ℹ️ القائمة فارغة", show_alert=True)
+            return
+        await callback_query.message.edit_text(
+            f"📨 **إرسال للمستثنين فقط** ({len(ids)} عضو)\n\n"
+            "هذه الرسالة تصل **فقط** لأعضاء قائمة الاستثناء — "
+            "لن يصل شيء لبقية الأعضاء.\n\n"
+            "أرسل الآن نص الرسالة:",
+            reply_markup=_sub_settings_back_kb()
+        )
+        pending_downloads[callback_query.from_user.id] = {
+            'waiting_for': 'broadcast_message', 'target_exempt': True}
+        await callback_query.answer()
+        return
+
     if action == 'remind_inactive':
         days = int(os.getenv("REMINDER_INACTIVE_DAYS", "7"))
-        inactive = subdb.get_inactive_users(days)
+        exempt = _exempt_ids()
+        inactive = [x for x in subdb.get_inactive_users(days) if x[0] not in exempt]
         total_members = _current_member_count()
         rows = []
         if inactive:
             rows.append([InlineKeyboardButton(
                 f"📨 إرسال للخاملين ({len(inactive)})", callback_data="sub_do_remind")])
-        # زر إرسال التذكير لكل الأعضاء (بلا فلتر خمول)
+        # زر إرسال التذكير لكل الأعضاء (بلا فلتر خمول، عدا قائمة الاستثناء)
         rows.append([InlineKeyboardButton(
             f"📢 إرسال للجميع ({total_members})", callback_data="sub_do_remind_all")])
+        rows.append([InlineKeyboardButton(
+            f"⭐ قائمة الاستثناء ({len(exempt)})", callback_data="sub_exempt")])
         rows.append([InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")])
         body = (
             f"📨 **تذكير الأعضاء**\n\n"
@@ -5845,7 +6065,8 @@ async def handle_subscription_settings(client, callback_query):
             "يُرسل لكل عضو تذكيراً **بلغته**، ويُحذف تذكيره السابق تلقائياً "
             "(يبقى الأحدث فقط).\n\n"
             "• **للخاملين:** فقط من لم يحمّل منذ فترة.\n"
-            "• **للجميع:** كل الأعضاء بلا استثناء."
+            "• **للجميع:** كل الأعضاء.\n"
+            "• ⭐ أعضاء قائمة الاستثناء لا يصلهم أي تذكير."
         )
         await callback_query.message.edit_text(
             body, reply_markup=InlineKeyboardMarkup(rows))
@@ -5853,12 +6074,15 @@ async def handle_subscription_settings(client, callback_query):
         return
 
     if action in ('do_remind', 'do_remind_all'):
+        exempt = _exempt_ids()
         if action == 'do_remind_all':
-            targets = subdb.get_all_users_for_reminder()
+            targets = [x for x in subdb.get_all_users_for_reminder()
+                       if x[0] not in exempt]
             scope = "لكل الأعضاء"
         else:
             days = int(os.getenv("REMINDER_INACTIVE_DAYS", "7"))
-            targets = subdb.get_inactive_users(days)
+            targets = [x for x in subdb.get_inactive_users(days)
+                       if x[0] not in exempt]
             scope = "للأعضاء غير النشطين"
         progress = await callback_query.message.edit_text(
             f"📤 جاري إرسال التذكير {scope} ({len(targets)})..."
@@ -6163,18 +6387,22 @@ async def handle_subscription_settings(client, callback_query):
     
     elif action == 'broadcast':
         # عرض شاشة اختيار نوع الإرسال
+        exempt_n = len(_exempt_ids())
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("📧 إرسال لجميع المستخدمين", callback_data="msg_broadcast_all")],
             [InlineKeyboardButton("👤 إرسال لمستخدم محدد", callback_data="msg_direct_user")],
+            [InlineKeyboardButton(f"⭐ قائمة الاستثناء ({exempt_n})", callback_data="sub_exempt")],
             [InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")]
         ])
-        
+
         stats = subdb.get_user_stats()
+        exempt_note = (f"\n⭐ **مستثنون من البث:** {exempt_n}" if exempt_n else "")
         await callback_query.message.edit_text(
             "📢 **نظام الإرسال الجماعي**\n\n"
             f"👥 **عدد المستخدمين:** {stats['total']}\n"
             f"💎 **المشتركون:** {stats['subscribed']}\n"
-            f"🆓 **العاديون:** {stats['free']}\n\n"
+            f"🆓 **العاديون:** {stats['free']}"
+            f"{exempt_note}\n\n"
             "**اختر نوع الإرسال:**",
             reply_markup=keyboard
         )
@@ -6275,10 +6503,11 @@ async def handle_message_type(client, callback_query):
         g = action.split('_', 1)[1]  # all/male/female
         if g not in ('all', 'male', 'female'):
             g = 'all'
-        # الخطوة 2: اختيار اللغة المستهدفة (مع عدد كل فئة ضمن هذا الجنس)
-        all_n = len(subdb.get_target_users(g, 'all'))
-        ar_n = len(subdb.get_target_users(g, 'ar'))
-        en_n = len(subdb.get_target_users(g, 'en'))
+        # الخطوة 2: اختيار اللغة المستهدفة (مع عدد كل فئة ضمن هذا الجنس،
+        # بعد استبعاد قائمة الاستثناء حتى يطابق العدد المرسَل فعلاً)
+        all_n = len(_broadcast_targets(g, 'all'))
+        ar_n = len(_broadcast_targets(g, 'ar'))
+        en_n = len(_broadcast_targets(g, 'en'))
         await callback_query.message.edit_text(
             f"📢 **بث إلى:** {_gender_flag(g)}\n\nاختر اللغة:",
             reply_markup=InlineKeyboardMarkup([
@@ -6293,7 +6522,7 @@ async def handle_message_type(client, callback_query):
         parts = action.split('_')  # ['bcl', gender, lang]
         g = parts[1] if len(parts) > 1 and parts[1] in ('all', 'male', 'female') else 'all'
         tlang = parts[2] if len(parts) > 2 and parts[2] in ('all', 'ar', 'en') else 'all'
-        count = len(subdb.get_target_users(g, tlang))
+        count = len(_broadcast_targets(g, tlang))
         await callback_query.message.edit_text(
             f"📢 **بث إلى:** {_gender_flag(g)} {_lang_flag(tlang)} ({count} مستخدم)\n\n"
             "أرسل الآن نص الرسالة التي تريد بثّها.",
@@ -6880,10 +7109,14 @@ async def handle_admin_input(client, message):
             global broadcast_counter
             broadcast_text = message.text.strip()
 
-            # الجمهور المستهدف حسب اللغة المختارة (all/ar/en)
-            target_lang = data.get('target_lang', 'all')
-            target_gender = data.get('target_gender', 'all')
-            all_users = subdb.get_target_users(target_gender, target_lang)
+            # الجمهور المستهدف: بث خاص للمستثنين فقط، أو بث عام حسب الجنس/اللغة
+            # مع استبعاد قائمة الاستثناء (لا يعرفون بما يُرسل للأعضاء)
+            if data.get('target_exempt'):
+                all_users = sorted(_exempt_ids())
+            else:
+                target_lang = data.get('target_lang', 'all')
+                target_gender = data.get('target_gender', 'all')
+                all_users = _broadcast_targets(target_gender, target_lang)
 
             # إنشاء استبيان بث جديد بإحصائية حيّة
             broadcast_counter += 1
@@ -6972,9 +7205,28 @@ async def handle_admin_input(client, message):
             del pending_downloads[user_id]
             logger.info(f"📢 Broadcast #{bid}: {success_count} نجح, {fail_count} فشل, {removed_count} محذوف")
         
+        elif waiting_for == 'exempt_add':
+            uid, name = _resolve_member_ref(message.text)
+            del pending_downloads[user_id]
+            if not uid:
+                await message.reply_text(
+                    "❌ **لم يتم العثور على العضو**\n\n"
+                    "أرسل ID رقمياً (يُقبل دائماً) أو @username لعضو استخدم البوت مسبقاً."
+                )
+                return
+            if _add_exempt(uid):
+                shown = name or "غير معروف بعد (يُفعّل الإعفاء فور دخوله)"
+                await message.reply_text(
+                    f"⭐ **أُضيف لقائمة الاستثناء**\n\n"
+                    f"👤 {shown}\n🆔 `{uid}`\n\n"
+                    "🔕 لن يصله بث أو تذكير، و✅ معفى من الاشتراك الإجباري."
+                )
+            else:
+                await message.reply_text(f"ℹ️ العضو `{uid}` موجود في القائمة مسبقاً.")
+
         elif waiting_for == 'direct_msg_user_id':
             user_input = message.text.strip()
-            
+
             # محاولة البحث بواسطة ID أو Username
             target_user = None
             if user_input.isdigit():
@@ -7231,6 +7483,60 @@ async def handle_change_language_button(client, message):
         )
 
 
+async def _register_bot_commands(client):
+    """يسجّل قائمة أوامر تلجرام (قائمة /) عند الإقلاع فلا حاجة لحفظ الأوامر:
+    للأعضاء يظهر /start فقط، وللأدمن (في محادثته وحدها) تظهر كل أوامر الإدارة
+    مع وصف عربي لكل أمر. أي فشل هنا لا يمس عمل البوت."""
+    from pyrogram.types import (
+        BotCommand, BotCommandScopeChat, BotCommandScopeDefault,
+    )
+    # المهمة تُنشأ قبل app.run() → انتظر اتصال العميل أولاً
+    for _ in range(120):
+        if getattr(client, 'is_connected', False):
+            break
+        await asyncio.sleep(1)
+    else:
+        logger.warning("⚠️ لم يتصل العميل — تخطّي تسجيل قائمة الأوامر")
+        return
+
+    try:
+        await client.set_bot_commands(
+            [BotCommand("start", "بدء البوت / Start the bot")],
+            scope=BotCommandScopeDefault()
+        )
+    except Exception as e:
+        logger.warning(f"⚠️ تعذّر تسجيل أوامر الأعضاء: {e}")
+
+    admin_id = os.getenv("ADMIN_ID")
+    if not (admin_id and str(admin_id).lstrip('-').isdigit()):
+        return
+    admin_cmds = [
+        BotCommand("start", "🏠 بدء البوت"),
+        BotCommand("exempt", "⭐ إضافة عضو لقائمة الاستثناء"),
+        BotCommand("unexempt", "⭐ حذف عضو من قائمة الاستثناء"),
+        BotCommand("exemptlist", "⭐ عرض قائمة الاستثناء"),
+        BotCommand("health", "🩺 فحص صحة البوت"),
+        BotCommand("backup", "💾 نسخة احتياطية فورية"),
+        BotCommand("history", "📥 سجل التحميلات"),
+        BotCommand("dlstats", "📊 إحصائيات التحميل"),
+        BotCommand("realusers", "👥 فحص الأعضاء الحقيقيين"),
+        BotCommand("cookies", "🍪 إدارة الكوكيز"),
+        BotCommand("update", "⬆️ تحديث أدوات التحميل"),
+        BotCommand("uncache", "🧹 حذف رابط من الكاش"),
+        BotCommand("unban", "✅ رفع الحظر عن عضو"),
+        BotCommand("banned", "📛 قائمة المحظورين"),
+        BotCommand("blockacc", "🚫 حظر حساب مصدر"),
+        BotCommand("unblockacc", "♻️ رفع حظر حساب مصدر"),
+        BotCommand("blockedaccs", "📋 الحسابات المصدر المحظورة"),
+    ]
+    try:
+        await client.set_bot_commands(
+            admin_cmds, scope=BotCommandScopeChat(chat_id=int(admin_id)))
+        logger.info("✅ سُجّلت قائمة أوامر تلجرام (الأعضاء + الأدمن)")
+    except Exception as e:
+        logger.warning(f"⚠️ تعذّر تسجيل أوامر الأدمن: {e}")
+
+
 logger.info("🚀 بدء البوت...")
 # ═══════════════════════════════════════════════════════════════
 # Main
@@ -7257,6 +7563,7 @@ def main():
     loop.create_task(daily_report_task())
     loop.create_task(daily_cleanup_task())
     loop.create_task(_auto_backup_loop(app))  # نسخ احتياطي تلقائي لقناة النسخ
+    loop.create_task(_register_bot_commands(app))  # قائمة أوامر / في تلجرام
     
     try:
         app.run()
