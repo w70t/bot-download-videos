@@ -10,6 +10,7 @@ from link_resolvers import (
     _is_music_link, _music_search_query, resolve_snapchat_spotlight,
     resolve_instagram_media, resolve_tiktok_media, resolve_tiktok_images,
     resolve_twitter_media, _extract_twitter_media, all_mirror_hosts,
+    twitter_mirror_lookup, _twitter_payload_sensitive,
     resolve_pinterest_media, resolve_pinterest_images, _pinterest_pin_id,
     _extract_pinterest_video, _extract_pinterest_images, _upscale_pinimg,
     is_substack_note, resolve_substack_note,
@@ -270,6 +271,41 @@ def test_twitter_resolver_handles_network_error():
     with patch('urllib.request.urlopen', side_effect=OSError('boom')):
         out = resolve_twitter_media('https://twitter.com/user/status/123')
     assert out is None
+
+
+def test_twitter_payload_sensitive_shapes():
+    # vxtwitter: العلم في جذر الرد | fxtwitter: داخل tweet | غيابه = غير حسّاس
+    assert _twitter_payload_sensitive({'possibly_sensitive': True})
+    assert _twitter_payload_sensitive({'sensitive': True})
+    assert _twitter_payload_sensitive({'tweet': {'possibly_sensitive': True}})
+    assert not _twitter_payload_sensitive({'possibly_sensitive': False})
+    assert not _twitter_payload_sensitive({'tweet': {}})
+    assert not _twitter_payload_sensitive({})
+    assert not _twitter_payload_sensitive(None)
+
+
+def test_twitter_mirror_lookup_returns_sensitive_flag():
+    # تغريدة حسّاسة (NSFW): المرآة تعيد الفيديو + علم الحساسية → البوت يرفضها
+    # حين يكون فلتر المحتوى مفعّلاً
+    vid = 'https://video.twimg.com/amplify_video/9/vid/avc1/n.mp4'
+    payload = {'possibly_sensitive': True,
+               'media_extended': [{'type': 'video', 'url': vid}]}
+    with patch('urllib.request.urlopen', return_value=_FakeJsonResp(payload)), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        media, sensitive = twitter_mirror_lookup('https://x.com/u/status/123')
+    assert media == vid
+    assert sensitive is True
+
+
+def test_twitter_mirror_lookup_normal_tweet_not_sensitive():
+    vid = 'https://video.twimg.com/amplify_video/9/vid/avc1/ok.mp4'
+    payload = {'possibly_sensitive': False,
+               'media_extended': [{'type': 'video', 'url': vid}]}
+    with patch('urllib.request.urlopen', return_value=_FakeJsonResp(payload)), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        media, sensitive = twitter_mirror_lookup('https://x.com/u/status/123')
+    assert media == vid
+    assert sensitive is False
 
 
 # ── resolve_pinterest_media / resolve_pinterest_images ─────────

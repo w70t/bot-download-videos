@@ -317,18 +317,30 @@ def _extract_twitter_media(payload):
     return None
 
 
-def resolve_twitter_media(url: str, timeout: int = 20):
-    """يحوّل رابط تويتر/X إلى رابط الفيديو المباشر (mp4) عبر مرآة عامة بلا كوكيز،
-    ليُحمّل حين يفشل yt-dlp (حجب/تقييد). يعيد رابط mp4 أو None لغير روابط تويتر
-    أو للمنشورات بلا فيديو أو عند أي فشل — فيبقى المسار الأصلي دون تغيير."""
+def _twitter_payload_sensitive(payload):
+    """هل تغريدة رد المرآة مُعلَّمة كمحتوى حسّاس (NSFW) في X؟
+    يدعم شكلي vxtwitter (علم في الجذر) وfxtwitter (داخل tweet)."""
+    if not isinstance(payload, dict):
+        return False
+    if payload.get('possibly_sensitive') or payload.get('sensitive'):
+        return True
+    tweet = payload.get('tweet')
+    return bool(isinstance(tweet, dict) and
+                (tweet.get('possibly_sensitive') or tweet.get('sensitive')))
+
+
+def twitter_mirror_lookup(url: str, timeout: int = 20):
+    """يستعلم مرايا تويتر ويعيد (رابط الفيديو المباشر أو None، هل التغريدة
+    حسّاسة/NSFW؟). علم الحساسية يتيح للبوت رفض المحتوى الإباحي عبر المرآة —
+    نفس تصنيف age_limit الذي يعطيه yt-dlp حين ينجح الاستخراج المباشر."""
     import json
     import urllib.request
     low = (url or '').lower()
     if not any(m in low for m in PLATFORM_URL_MARKERS['twitter']):
-        return None
+        return None, False
     m = _TWITTER_STATUS_RE.search(url or '')
     if not m:
-        return None  # ليس رابط منشور (بروفايل/بحث) — لا مرآة له
+        return None, False  # ليس رابط منشور (بروفايل/بحث) — لا مرآة له
     status_id = m.group(1)
     for host in _TWITTER_API_HOSTS:
         api_url = _twitter_api_url(host, status_id)
@@ -341,12 +353,23 @@ def resolve_twitter_media(url: str, timeout: int = 20):
                 payload = json.loads(resp.read(2_000_000).decode('utf-8', 'ignore'))
             media = _extract_twitter_media(payload)
             if media and media.lower().startswith(('http://', 'https://')) and is_safe_url(media):
-                logger.info(f"🎯 تويتر عبر {host}: {media[:90]}")
-                return media
+                sensitive = _twitter_payload_sensitive(payload)
+                logger.info(f"🎯 تويتر عبر {host}: {media[:90]}"
+                            + (" (⚠️ حسّاس)" if sensitive else ""))
+                return media, sensitive
             logger.info(f"ℹ️ {host} لم يُرجع فيديو تويتر")
         except Exception as e:
             logger.warning(f"⚠️ تعذّر حل تويتر عبر {host}: {e}")
-    return None
+    return None, False
+
+
+def resolve_twitter_media(url: str, timeout: int = 20):
+    """يحوّل رابط تويتر/X إلى رابط الفيديو المباشر (mp4) عبر مرآة عامة بلا كوكيز،
+    ليُحمّل حين يفشل yt-dlp (حجب/تقييد). يعيد رابط mp4 أو None لغير روابط تويتر
+    أو للمنشورات بلا فيديو أو عند أي فشل — فيبقى المسار الأصلي دون تغيير.
+    (لا يفحص الحساسية — استخدم twitter_mirror_lookup للفحص مع فلتر المحتوى)."""
+    media, _sensitive = twitter_mirror_lookup(url, timeout)
+    return media
 
 
 # ═══════════════════════════════════════════════════════════════
