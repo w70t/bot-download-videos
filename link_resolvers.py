@@ -580,6 +580,67 @@ def resolve_pinterest_images(url: str, timeout: int = 20):
     return images
 
 
+# ═══════════════════════════════════════════════════════════════
+# ملاحظات Substack (فيديو Notes) عبر واجهة Substack العامة
+# روابط substack.com/@user/note/c-<id> صفحات جافاسكربت: لا og:video فيها ولا
+# يدعمها yt-dlp، والفيديو على Mux بتشغيل موقّع (روابط stream.mux.com المباشرة
+# ترفض بـ403). الحل: واجهة Substack العامة (بلا كوكيز):
+#   1) /api/v1/reader/comment/<id> → بيانات الملاحظة ومرفق الفيديو
+#   2) /api/v1/video/upload/<media_id>/src → تحويل 307 لرابط mp4 موقّع
+# نعيد رابط /src الثابت (لا التوقيع المؤقت) فيتجدد التوقيع عند كل تحميل
+# ويبقى مفتاح الكاش ثابتاً.
+# ═══════════════════════════════════════════════════════════════
+_SUBSTACK_NOTE_RE = re.compile(r'substack\.com/(?:@[\w.-]+/)?note/c-(\d+)', re.I)
+
+
+def is_substack_note(url: str) -> bool:
+    """هل الرابط ملاحظة Substack (Notes)؟"""
+    return bool(_SUBSTACK_NOTE_RE.search(url or ''))
+
+
+def resolve_substack_note(url: str, timeout: int = 20):
+    """يحوّل رابط ملاحظة Substack إلى (رابط الفيديو المباشر، العنوان) عبر واجهة
+    Substack العامة بلا كوكيز. الرابط المعاد هو وسيط /src الثابت الذي يحوّل
+    لملف mp4 موقّعاً حديثاً عند كل طلب (yt-dlp يتبع التحويل عادياً).
+
+    يعيد (None, None) لغير روابط الملاحظات أو لملاحظة بلا فيديو أو عند أي فشل
+    — فيبقى المسار الأصلي (رسالة الفشل المعتادة) دون تغيير."""
+    import json
+    import urllib.request
+    m = _SUBSTACK_NOTE_RE.search(url or '')
+    if not m:
+        return None, None
+    comment_id = m.group(1)
+    api_url = f"https://substack.com/api/v1/reader/comment/{comment_id}"
+    try:
+        req = urllib.request.Request(api_url, headers={
+            'User-Agent': _BROWSER_UA,
+            'Accept': 'application/json',
+        })
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read(4_000_000).decode('utf-8', 'ignore'))
+    except Exception as e:
+        logger.warning(f"⚠️ تعذّر جلب ملاحظة Substack {comment_id}: {e}")
+        return None, None
+    comment = ((payload or {}).get('item') or {}).get('comment') or {}
+    for att in comment.get('attachments') or []:
+        if not isinstance(att, dict):
+            continue
+        media_id = att.get('media_upload_id')
+        if att.get('type') == 'video' and media_id and re.fullmatch(r'[\w-]+', str(media_id)):
+            direct = f"https://substack.com/api/v1/video/upload/{media_id}/src"
+            # عنوان ودود: أول سطر من نص الملاحظة، وإلا اسم صاحبها، وإلا عام
+            body = (comment.get('body') or '').strip()
+            title = body.split('\n')[0][:80] if body else ''
+            if not title:
+                title = (comment.get('name') or '').strip() or 'Substack Video'
+            if is_safe_url(direct):
+                logger.info(f"🎯 فيديو ملاحظة Substack {comment_id}: {direct}")
+                return direct, title
+    logger.info(f"ℹ️ ملاحظة Substack {comment_id} بلا مرفق فيديو")
+    return None, None
+
+
 def all_mirror_hosts():
     """يعيد قائمة (المنصة، المضيف) لكل مرايا البدائل المُهيّأة — لفحص الصحّة."""
     hosts = []
@@ -591,6 +652,7 @@ def all_mirror_hosts():
         hosts.append(('twitter', h))
     for h in _PINTEREST_API_HOSTS:
         hosts.append(('pinterest', h))
+    hosts.append(('substack', 'substack.com'))
     return hosts
 
 
