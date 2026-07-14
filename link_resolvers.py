@@ -317,18 +317,30 @@ def _extract_twitter_media(payload):
     return None
 
 
-def resolve_twitter_media(url: str, timeout: int = 20):
-    """يحوّل رابط تويتر/X إلى رابط الفيديو المباشر (mp4) عبر مرآة عامة بلا كوكيز،
-    ليُحمّل حين يفشل yt-dlp (حجب/تقييد). يعيد رابط mp4 أو None لغير روابط تويتر
-    أو للمنشورات بلا فيديو أو عند أي فشل — فيبقى المسار الأصلي دون تغيير."""
+def _twitter_payload_sensitive(payload):
+    """هل تغريدة رد المرآة مُعلَّمة كمحتوى حسّاس (NSFW) في X؟
+    يدعم شكلي vxtwitter (علم في الجذر) وfxtwitter (داخل tweet)."""
+    if not isinstance(payload, dict):
+        return False
+    if payload.get('possibly_sensitive') or payload.get('sensitive'):
+        return True
+    tweet = payload.get('tweet')
+    return bool(isinstance(tweet, dict) and
+                (tweet.get('possibly_sensitive') or tweet.get('sensitive')))
+
+
+def twitter_mirror_lookup(url: str, timeout: int = 20):
+    """يستعلم مرايا تويتر ويعيد (رابط الفيديو المباشر أو None، هل التغريدة
+    حسّاسة/NSFW؟). علم الحساسية يتيح للبوت رفض المحتوى الإباحي عبر المرآة —
+    نفس تصنيف age_limit الذي يعطيه yt-dlp حين ينجح الاستخراج المباشر."""
     import json
     import urllib.request
     low = (url or '').lower()
     if not any(m in low for m in PLATFORM_URL_MARKERS['twitter']):
-        return None
+        return None, False
     m = _TWITTER_STATUS_RE.search(url or '')
     if not m:
-        return None  # ليس رابط منشور (بروفايل/بحث) — لا مرآة له
+        return None, False  # ليس رابط منشور (بروفايل/بحث) — لا مرآة له
     status_id = m.group(1)
     for host in _TWITTER_API_HOSTS:
         api_url = _twitter_api_url(host, status_id)
@@ -341,12 +353,23 @@ def resolve_twitter_media(url: str, timeout: int = 20):
                 payload = json.loads(resp.read(2_000_000).decode('utf-8', 'ignore'))
             media = _extract_twitter_media(payload)
             if media and media.lower().startswith(('http://', 'https://')) and is_safe_url(media):
-                logger.info(f"🎯 تويتر عبر {host}: {media[:90]}")
-                return media
+                sensitive = _twitter_payload_sensitive(payload)
+                logger.info(f"🎯 تويتر عبر {host}: {media[:90]}"
+                            + (" (⚠️ حسّاس)" if sensitive else ""))
+                return media, sensitive
             logger.info(f"ℹ️ {host} لم يُرجع فيديو تويتر")
         except Exception as e:
             logger.warning(f"⚠️ تعذّر حل تويتر عبر {host}: {e}")
-    return None
+    return None, False
+
+
+def resolve_twitter_media(url: str, timeout: int = 20):
+    """يحوّل رابط تويتر/X إلى رابط الفيديو المباشر (mp4) عبر مرآة عامة بلا كوكيز،
+    ليُحمّل حين يفشل yt-dlp (حجب/تقييد). يعيد رابط mp4 أو None لغير روابط تويتر
+    أو للمنشورات بلا فيديو أو عند أي فشل — فيبقى المسار الأصلي دون تغيير.
+    (لا يفحص الحساسية — استخدم twitter_mirror_lookup للفحص مع فلتر المحتوى)."""
+    media, _sensitive = twitter_mirror_lookup(url, timeout)
+    return media
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -599,17 +622,18 @@ def is_substack_note(url: str) -> bool:
 
 
 def resolve_substack_note(url: str, timeout: int = 20):
-    """يحوّل رابط ملاحظة Substack إلى (رابط الفيديو المباشر، العنوان) عبر واجهة
-    Substack العامة بلا كوكيز. الرابط المعاد هو وسيط /src الثابت الذي يحوّل
-    لملف mp4 موقّعاً حديثاً عند كل طلب (yt-dlp يتبع التحويل عادياً).
+    """يحوّل رابط ملاحظة Substack إلى (رابط الفيديو المباشر، العنوان، هل هو
+    محتوى صريح؟) عبر واجهة Substack العامة بلا كوكيز. الرابط المعاد هو وسيط
+    /src الثابت الذي يحوّل لملف mp4 موقّعاً حديثاً عند كل طلب.
 
-    يعيد (None, None) لغير روابط الملاحظات أو لملاحظة بلا فيديو أو عند أي فشل
-    — فيبقى المسار الأصلي (رسالة الفشل المعتادة) دون تغيير."""
+    علم explicit يأتي من تصنيف Substack نفسه للوسائط — يتيح للبوت رفض
+    المحتوى الإباحي حين يكون فلتر المحتوى مفعّلاً. يعيد (None, None, False)
+    لغير روابط الملاحظات أو لملاحظة بلا فيديو أو عند أي فشل."""
     import json
     import urllib.request
     m = _SUBSTACK_NOTE_RE.search(url or '')
     if not m:
-        return None, None
+        return None, None, False
     comment_id = m.group(1)
     api_url = f"https://substack.com/api/v1/reader/comment/{comment_id}"
     try:
@@ -621,7 +645,7 @@ def resolve_substack_note(url: str, timeout: int = 20):
             payload = json.loads(resp.read(4_000_000).decode('utf-8', 'ignore'))
     except Exception as e:
         logger.warning(f"⚠️ تعذّر جلب ملاحظة Substack {comment_id}: {e}")
-        return None, None
+        return None, None, False
     comment = ((payload or {}).get('item') or {}).get('comment') or {}
     for att in comment.get('attachments') or []:
         if not isinstance(att, dict):
@@ -629,16 +653,19 @@ def resolve_substack_note(url: str, timeout: int = 20):
         media_id = att.get('media_upload_id')
         if att.get('type') == 'video' and media_id and re.fullmatch(r'[\w-]+', str(media_id)):
             direct = f"https://substack.com/api/v1/video/upload/{media_id}/src"
+            media = att.get('mediaUpload') if isinstance(att.get('mediaUpload'), dict) else {}
+            explicit = bool(media.get('explicit'))
             # عنوان ودود: أول سطر من نص الملاحظة، وإلا اسم صاحبها، وإلا عام
             body = (comment.get('body') or '').strip()
             title = body.split('\n')[0][:80] if body else ''
             if not title:
                 title = (comment.get('name') or '').strip() or 'Substack Video'
             if is_safe_url(direct):
-                logger.info(f"🎯 فيديو ملاحظة Substack {comment_id}: {direct}")
-                return direct, title
+                logger.info(f"🎯 فيديو ملاحظة Substack {comment_id}: {direct}"
+                            + (" (⚠️ صريح)" if explicit else ""))
+                return direct, title, explicit
     logger.info(f"ℹ️ ملاحظة Substack {comment_id} بلا مرفق فيديو")
-    return None, None
+    return None, None, False
 
 
 def all_mirror_hosts():

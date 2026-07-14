@@ -49,7 +49,7 @@ from cookies_manager import (
 )
 from link_resolvers import (
     resolve_snapchat_spotlight, _is_music_link, resolve_music_link,
-    resolve_instagram_media, resolve_tiktok_media, resolve_twitter_media,
+    resolve_instagram_media, resolve_tiktok_media, twitter_mirror_lookup,
     resolve_tiktok_images, resolve_pinterest_media, resolve_pinterest_images,
     is_substack_note, resolve_substack_note, all_mirror_hosts,
 )
@@ -703,22 +703,24 @@ async def _tiktok_video_fallback(url: str):
         return None
 
 
-async def resolve_twitter_direct(url: str):
-    """يحل رابط تويتر/X إلى رابط الفيديو المباشر عبر مرآة عامة (بلا كوكيز).
-    يعيد رابط mp4 المباشر أو None. طلب شبكي متزامن يُنفَّذ خارج حلقة الأحداث."""
+async def _twitter_video_fallback(url: str):
+    """خطة بديلة لتويتر/X عند فشل yt-dlp (حجب/تقييد): يحل الرابط لملف فيديو مباشر
+    عبر مرآة عامة ثم يستخرج معلوماته. يعيد dict أو None.
+
+    🔞 حماية: yt-dlp يفشل مع التغريدات الحسّاسة (NSFW) بلا كوكيز، فكانت المرآة
+    تعيد الفيديو بمعلومات نظيفة (بلا age_limit/عنوان) يعبر فلتر المحتوى. الآن
+    نقرأ علم الحساسية من رد المرآة نفسه ونرفض المحتوى الحسّاس ما دام فلتر
+    المحتوى الإباحي مفعّلاً — فيصل المستخدم رسالة «محتوى مقيّد» الواضحة."""
     if _platform_of(url) != 'twitter':
         return None
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, resolve_twitter_media, url)
-
-
-async def _twitter_video_fallback(url: str):
-    """خطة بديلة لتويتر/X عند فشل yt-dlp (حجب/تقييد): يحل الرابط لملف فيديو مباشر
-    عبر مرآة عامة ثم يستخرج معلوماته. يعيد dict أو None."""
-    direct = await resolve_twitter_direct(url)
+    direct, sensitive = await loop.run_in_executor(None, twitter_mirror_lookup, url)
     if not direct:
         return None
-    loop = asyncio.get_event_loop()
+    if sensitive and adult_filter_enabled():
+        logger.info("🔞 تغريدة حسّاسة (NSFW) — رُفض مسار المرآة (فلتر المحتوى مفعّل)")
+        _last_info_error.set('restricted')
+        return None
     try:
         info = await loop.run_in_executor(
             None, lambda: _extract_direct_media(direct, 'Twitter Video')
@@ -761,22 +763,31 @@ async def _pinterest_video_fallback(url: str):
 
 async def resolve_substack_direct(url: str):
     """يحل رابط ملاحظة Substack إلى رابط الفيديو المباشر (وسيط /src) عبر واجهة
-    Substack العامة بلا كوكيز. يعيد الرابط أو None. طلب شبكي خارج حلقة الأحداث."""
+    Substack العامة بلا كوكيز. يعيد الرابط أو None (ومنه المحتوى الصريح حين
+    يكون فلتر المحتوى الإباحي مفعّلاً). طلب شبكي خارج حلقة الأحداث."""
     if not is_substack_note(url):
         return None
     loop = asyncio.get_event_loop()
-    direct, _title = await loop.run_in_executor(None, resolve_substack_note, url)
+    direct, _title, explicit = await loop.run_in_executor(None, resolve_substack_note, url)
+    if direct and explicit and adult_filter_enabled():
+        logger.info("🔞 فيديو Substack صريح — رُفض (فلتر المحتوى مفعّل)")
+        return None
     return direct
 
 
 async def _substack_video_fallback(url: str):
     """خطة بديلة لملاحظات Substack: yt-dlp لا يدعمها أصلاً (صفحة جافاسكربت
-    وفيديو Mux موقّع) → واجهة Substack العامة تعطي رابط الفيديو + العنوان."""
+    وفيديو Mux موقّع) → واجهة Substack العامة تعطي رابط الفيديو + العنوان.
+    الوسائط المصنّفة صريحة لدى Substack تُرفض ما دام فلتر المحتوى مفعّلاً."""
     if not is_substack_note(url):
         return None
     loop = asyncio.get_event_loop()
-    direct, title = await loop.run_in_executor(None, resolve_substack_note, url)
+    direct, title, explicit = await loop.run_in_executor(None, resolve_substack_note, url)
     if not direct:
+        return None
+    if explicit and adult_filter_enabled():
+        logger.info("🔞 فيديو Substack صريح — رُفض مسار الواجهة (فلتر المحتوى مفعّل)")
+        _last_info_error.set('restricted')
         return None
     try:
         info = await loop.run_in_executor(
@@ -881,6 +892,13 @@ async def get_video_info(url: str):
         if _is_restricted_content_error(error_msg):
             _last_info_error.set('restricted')
             logger.warning(f"🔞 محتوى مقيّد/حسّاس يتعذّر استخراجه: {error_msg[:200]}")
+            return None
+        # 🔞 خطأ NSFW صريح (تغريدات X الحسّاسة: "NSFW tweet requires
+        #    authentication") مع فلتر المحتوى مفعّلاً → أوقف كل مسارات المرايا
+        #    البديلة قبل أن تعيد الفيديو بمعلومات نظيفة تعبر الفلتر
+        if adult_filter_enabled() and 'nsfw' in error_msg.lower():
+            _last_info_error.set('restricted')
+            logger.warning(f"🔞 محتوى NSFW محجوب (الفلتر مفعّل): {error_msg[:150]}")
             return None
         # معالجة خاصة لأخطاء Facebook parsing
         if 'Cannot parse data' in error_msg or 'facebook' in error_msg.lower():
@@ -3026,6 +3044,11 @@ async def handle_redownload(client, callback_query):
         await callback_query.message.reply_text(
             t('error_occurred', lang, error="not found")
         )
+        return
+    # 🔞 فلتر المحتوى يسري على إعادة التحميل من السجل أيضاً — يلتقط النطاقات
+    # والكلمات التي أضافها الأدمن بعد التحميل الأصلي
+    if adult_filter_enabled() and is_adult_url(item['url']):
+        await callback_query.message.reply_text(t('adult_blocked', lang))
         return
     # 🖼️ عنصر صور: أعد تحميله عبر مسار الصور (gallery-dl) لا مسار الفيديو
     if item.get('kind') == 'image':

@@ -10,6 +10,7 @@ from link_resolvers import (
     _is_music_link, _music_search_query, resolve_snapchat_spotlight,
     resolve_instagram_media, resolve_tiktok_media, resolve_tiktok_images,
     resolve_twitter_media, _extract_twitter_media, all_mirror_hosts,
+    twitter_mirror_lookup, _twitter_payload_sensitive,
     resolve_pinterest_media, resolve_pinterest_images, _pinterest_pin_id,
     _extract_pinterest_video, _extract_pinterest_images, _upscale_pinimg,
     is_substack_note, resolve_substack_note,
@@ -272,6 +273,41 @@ def test_twitter_resolver_handles_network_error():
     assert out is None
 
 
+def test_twitter_payload_sensitive_shapes():
+    # vxtwitter: العلم في جذر الرد | fxtwitter: داخل tweet | غيابه = غير حسّاس
+    assert _twitter_payload_sensitive({'possibly_sensitive': True})
+    assert _twitter_payload_sensitive({'sensitive': True})
+    assert _twitter_payload_sensitive({'tweet': {'possibly_sensitive': True}})
+    assert not _twitter_payload_sensitive({'possibly_sensitive': False})
+    assert not _twitter_payload_sensitive({'tweet': {}})
+    assert not _twitter_payload_sensitive({})
+    assert not _twitter_payload_sensitive(None)
+
+
+def test_twitter_mirror_lookup_returns_sensitive_flag():
+    # تغريدة حسّاسة (NSFW): المرآة تعيد الفيديو + علم الحساسية → البوت يرفضها
+    # حين يكون فلتر المحتوى مفعّلاً
+    vid = 'https://video.twimg.com/amplify_video/9/vid/avc1/n.mp4'
+    payload = {'possibly_sensitive': True,
+               'media_extended': [{'type': 'video', 'url': vid}]}
+    with patch('urllib.request.urlopen', return_value=_FakeJsonResp(payload)), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        media, sensitive = twitter_mirror_lookup('https://x.com/u/status/123')
+    assert media == vid
+    assert sensitive is True
+
+
+def test_twitter_mirror_lookup_normal_tweet_not_sensitive():
+    vid = 'https://video.twimg.com/amplify_video/9/vid/avc1/ok.mp4'
+    payload = {'possibly_sensitive': False,
+               'media_extended': [{'type': 'video', 'url': vid}]}
+    with patch('urllib.request.urlopen', return_value=_FakeJsonResp(payload)), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        media, sensitive = twitter_mirror_lookup('https://x.com/u/status/123')
+    assert media == vid
+    assert sensitive is False
+
+
 # ── resolve_pinterest_media / resolve_pinterest_images ─────────
 
 def test_pinterest_pin_id_from_full_url():
@@ -389,14 +425,30 @@ def test_substack_note_resolves_video_and_title():
         'name': 'ARCHI',
         'body': 'أشرس معركة ستخوضها\nسطر ثانٍ',
         'attachments': [{'type': 'video',
-                         'media_upload_id': 'afa5cef9-9d23-4860-9649-9a3c15dcbaf7'}],
+                         'media_upload_id': 'afa5cef9-9d23-4860-9649-9a3c15dcbaf7',
+                         'mediaUpload': {'explicit': False}}],
     }}}
     with patch('urllib.request.urlopen', return_value=_FakeJsonResp(payload)), \
             patch.object(link_resolvers, 'is_safe_url', return_value=True):
-        direct, title = resolve_substack_note('https://substack.com/@flza7/note/c-292715374')
+        direct, title, explicit = resolve_substack_note(
+            'https://substack.com/@flza7/note/c-292715374')
     assert direct == ('https://substack.com/api/v1/video/upload/'
                       'afa5cef9-9d23-4860-9649-9a3c15dcbaf7/src')
     assert title == 'أشرس معركة ستخوضها'
+    assert explicit is False
+
+
+def test_substack_note_flags_explicit_media():
+    # وسائط مصنّفة صريحة لدى Substack → يعود العلم True ليرفضها فلتر المحتوى
+    payload = {'item': {'comment': {
+        'body': 'x',
+        'attachments': [{'type': 'video', 'media_upload_id': 'abc-123',
+                         'mediaUpload': {'explicit': True}}],
+    }}}
+    with patch('urllib.request.urlopen', return_value=_FakeJsonResp(payload)), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        direct, _title, explicit = resolve_substack_note('https://substack.com/note/c-1')
+    assert direct and explicit is True
 
 
 def test_substack_note_title_falls_back_to_author():
@@ -407,24 +459,24 @@ def test_substack_note_title_falls_back_to_author():
     }}}
     with patch('urllib.request.urlopen', return_value=_FakeJsonResp(payload)), \
             patch.object(link_resolvers, 'is_safe_url', return_value=True):
-        _direct, title = resolve_substack_note('https://substack.com/note/c-1')
+        _direct, title, _explicit = resolve_substack_note('https://substack.com/note/c-1')
     assert title == 'ARCHI'
 
 
 def test_substack_note_without_video():
-    # ملاحظة نصية/صور بلا فيديو → (None, None)
+    # ملاحظة نصية/صور بلا فيديو → (None, None, False)
     payload = {'item': {'comment': {'body': 'نص فقط', 'attachments': [
         {'type': 'image', 'media_upload_id': 'x'}]}}}
     with patch('urllib.request.urlopen', return_value=_FakeJsonResp(payload)):
-        assert resolve_substack_note('https://substack.com/note/c-1') == (None, None)
+        assert resolve_substack_note('https://substack.com/note/c-1') == (None, None, False)
 
 
 def test_substack_resolver_ignores_non_note_urls():
-    # غير الملاحظات → (None, None) بلا أي طلب شبكي
-    assert resolve_substack_note('https://someblog.substack.com/p/post') == (None, None)
-    assert resolve_substack_note('') == (None, None)
+    # غير الملاحظات → (None, None, False) بلا أي طلب شبكي
+    assert resolve_substack_note('https://someblog.substack.com/p/post') == (None, None, False)
+    assert resolve_substack_note('') == (None, None, False)
 
 
 def test_substack_resolver_handles_network_error():
     with patch('urllib.request.urlopen', side_effect=OSError('boom')):
-        assert resolve_substack_note('https://substack.com/note/c-1') == (None, None)
+        assert resolve_substack_note('https://substack.com/note/c-1') == (None, None, False)
