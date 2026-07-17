@@ -104,25 +104,37 @@ _BROWSER_UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
                '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
 
 
-def resolve_instagram_media(url: str, timeout: int = 20):
-    """يحوّل رابط ريلز/منشور إنستغرام إلى رابط الفيديو المباشر (mp4) عبر مرآة
-    عامة لا تتطلّب كوكيز، ليُحمّل حين يعجز yt-dlp عن الوصول المجهول.
+def _is_real_instagram_host(u: str) -> bool:
+    """هل مضيف الرابط هو instagram.com نفسه (لا مرآة ولا CDN)؟
+    scontent.cdninstagram.com (وسائط ناجحة) لا يطابق — فقط الموقع الفعلي."""
+    try:
+        host = (urlparse(u).hostname or '').lower()
+    except Exception:
+        return False
+    return host == 'instagram.com' or host.endswith('.instagram.com')
 
-    يعيد رابط mp4 مباشراً عند النجاح، أو None لغير روابط إنستغرام أو لمنشورات
-    الصور (المرآة تعيد صورة لا فيديو) أو عند أي فشل — فيبقى المسار الأصلي
-    (كوكيز إن توفّرت، أو مسار الصور عبر gallery-dl)."""
+
+def instagram_mirror_lookup(url: str, timeout: int = 20):
+    """يستعلم مرايا إنستغرام ويعيد (رابط الفيديو المباشر أو None، هل المنشور
+    غير متاح — خاص/محذوف؟).
+
+    علم عدم الإتاحة: حين تصل المرآة لإنستغرام ويرفض تسليم المنشور، تعيد
+    توجيهاً لصفحة instagram.com نفسها (جدار تسجيل الدخول) بدل ملف الوسائط —
+    إشارة موثوقة أن المنشور من حساب خاص أو محذوف، فيعرض البوت رسالة واضحة
+    بدل «رابط غير صحيح» المضلّلة. أعطال المرآة (504/انقطاع) لا ترفع العلم."""
     import urllib.request
     low = (url or '').lower()
     if not any(h in low for h in ('instagram.com', 'instagr.am')):
-        return None
+        return None, False
     try:
         path = urlparse(url).path
     except Exception:
-        return None
+        return None, False
     m = _INSTAGRAM_MEDIA_RE.search(path)
     if not m:
-        return None  # ستوري/بروفايل/رابط غير منشور — لا مرآة له
+        return None, False  # ستوري/بروفايل/رابط غير منشور — لا مرآة له
     media_path = m.group(0)
+    unavailable = False
     for proxy_host in _INSTAGRAM_PROXY_HOSTS:
         proxy_url = f"https://{proxy_host}{media_path}"
         try:
@@ -136,11 +148,30 @@ def resolve_instagram_media(url: str, timeout: int = 20):
                 final = resp.geturl()
             if ctype.startswith('video/') and is_safe_url(final):
                 logger.info(f"🎯 إنستغرام عبر {proxy_host}: {final[:90]}")
-                return final
+                return final, False
+            if not ctype.startswith('image/') and _is_real_instagram_host(final):
+                # المرآة أحالتنا لصفحة إنستغرام الفعلية (جدار الدخول) — المنشور
+                # خاص/محذوف. (الصور تبقى لمسار الصور: منشور مصوّر عام سليم)
+                unavailable = True
+                logger.info(f"🔒 {proxy_host} أحال لصفحة إنستغرام (منشور خاص/"
+                            f"محذوف؟) لـ {media_path}")
+                continue
             logger.info(f"ℹ️ {proxy_host} لم يُرجع فيديو (نوع={ctype}) لـ {media_path}")
         except Exception as e:
             logger.warning(f"⚠️ تعذّر حل إنستغرام عبر {proxy_host} ({media_path}): {e}")
-    return None
+    return None, unavailable
+
+
+def resolve_instagram_media(url: str, timeout: int = 20):
+    """يحوّل رابط ريلز/منشور إنستغرام إلى رابط الفيديو المباشر (mp4) عبر مرآة
+    عامة لا تتطلّب كوكيز، ليُحمّل حين يعجز yt-dlp عن الوصول المجهول.
+
+    يعيد رابط mp4 مباشراً عند النجاح، أو None لغير روابط إنستغرام أو لمنشورات
+    الصور (المرآة تعيد صورة لا فيديو) أو عند أي فشل — فيبقى المسار الأصلي
+    (كوكيز إن توفّرت، أو مسار الصور عبر gallery-dl).
+    (لا يميّز المنشور الخاص/المحذوف — استخدم instagram_mirror_lookup لذلك)."""
+    media, _unavailable = instagram_mirror_lookup(url, timeout)
+    return media
 
 
 # ═══════════════════════════════════════════════════════════════

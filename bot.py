@@ -49,7 +49,8 @@ from cookies_manager import (
 )
 from link_resolvers import (
     resolve_snapchat_spotlight, _is_music_link, resolve_music_link,
-    resolve_instagram_media, resolve_tiktok_media, twitter_mirror_lookup,
+    resolve_instagram_media, instagram_mirror_lookup, resolve_tiktok_media,
+    twitter_mirror_lookup,
     resolve_tiktok_images, resolve_pinterest_media, resolve_pinterest_images,
     is_substack_note, resolve_substack_note, all_mirror_hosts,
 )
@@ -658,11 +659,19 @@ async def resolve_instagram_direct(url: str):
 
 async def _instagram_video_fallback(url: str):
     """خطة بديلة لإنستغرام عند فشل yt-dlp (الوصول المجهول محجوب): يحل الرابط
-    لملف فيديو مباشر عبر مرآة عامة ثم يستخرج معلوماته. يعيد dict أو None."""
-    direct = await resolve_instagram_direct(url)
-    if not direct:
+    لملف فيديو مباشر عبر مرآة عامة ثم يستخرج معلوماته. يعيد dict أو None.
+
+    حين تحيل المرآة لصفحة إنستغرام نفسها (جدار الدخول) فالمنشور خاص/محذوف —
+    يُسجَّل ذلك في _last_info_error ليعرض البوت رسالة واضحة بدل «رابط غير صحيح»."""
+    if _platform_of(url) != 'instagram':
         return None
     loop = asyncio.get_event_loop()
+    direct, unavailable = await loop.run_in_executor(
+        None, instagram_mirror_lookup, url)
+    if not direct:
+        if unavailable:
+            _last_info_error.set('ig_unavailable')
+        return None
     try:
         info = await loop.run_in_executor(
             None, lambda: _extract_direct_media(direct, 'Instagram Video')
@@ -1656,6 +1665,11 @@ async def process_download_from_queue(task: DownloadTask):
             if _last_info_error.get() == 'restricted':
                 await send_error_to_admin(user_id, user_name, "Restricted/sensitive content", url)
                 await status.edit_text(t('content_restricted', lang))
+                return
+            # منشور إنستغرام خاص/محذوف (المرآة أُحيلت لجدار الدخول) → رسالة واضحة
+            if _last_info_error.get() == 'ig_unavailable':
+                await send_error_to_admin(user_id, user_name, "Instagram post private/removed", url)
+                await status.edit_text(t('post_unavailable', lang))
                 return
             await send_error_to_admin(user_id, user_name, "Failed to extract video info", url)
             await status.edit_text(t('invalid_url', lang))
@@ -5062,6 +5076,11 @@ async def handle_url(client, message):
             if _last_info_error.get() == 'restricted':
                 await send_error_to_admin(user_id, user_name, "Restricted/sensitive content", url)
                 await status.edit_text(t('content_restricted', lang))
+                return
+            # منشور إنستغرام خاص/محذوف (المرآة أُحيلت لجدار الدخول) → رسالة واضحة
+            if _last_info_error.get() == 'ig_unavailable':
+                await send_error_to_admin(user_id, user_name, "Instagram post private/removed", url)
+                await status.edit_text(t('post_unavailable', lang))
                 return
             await send_error_to_admin(user_id, user_name, "Failed to extract video info", url)
             await status.edit_text(t('invalid_url', lang))

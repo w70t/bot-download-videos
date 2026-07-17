@@ -8,7 +8,8 @@ import json
 import link_resolvers
 from link_resolvers import (
     _is_music_link, _music_search_query, resolve_snapchat_spotlight,
-    resolve_instagram_media, resolve_tiktok_media, resolve_tiktok_images,
+    resolve_instagram_media, instagram_mirror_lookup, _is_real_instagram_host,
+    resolve_tiktok_media, resolve_tiktok_images,
     resolve_twitter_media, _extract_twitter_media, all_mirror_hosts,
     twitter_mirror_lookup, _twitter_payload_sensitive,
     resolve_pinterest_media, resolve_pinterest_images, _pinterest_pin_id,
@@ -109,6 +110,59 @@ def test_instagram_resolver_handles_network_error():
     with patch('urllib.request.urlopen', side_effect=OSError('boom')):
         out = resolve_instagram_media('https://www.instagram.com/reel/ABC123/')
     assert out is None
+
+
+# ── instagram_mirror_lookup (علم المنشور الخاص/المحذوف) ─────────
+
+def test_is_real_instagram_host():
+    # صفحة إنستغرام الفعلية (جدار الدخول) تطابق؛ الـCDN والمرايا لا تطابق
+    assert _is_real_instagram_host('https://www.instagram.com/reel/X/')
+    assert _is_real_instagram_host('https://instagram.com/accounts/login/')
+    assert not _is_real_instagram_host('https://scontent.cdninstagram.com/o1/v/x.mp4')
+    assert not _is_real_instagram_host('https://kkinstagram.com/reel/X')
+    assert not _is_real_instagram_host('')
+
+
+def test_instagram_lookup_returns_video_not_unavailable():
+    # المرآة تُرجع فيديو → (الرابط المباشر، False)
+    final = 'https://scontent.cdninstagram.com/o1/v/abc.mp4?oe=1'
+    with patch('urllib.request.urlopen', return_value=_FakeResp('video/mp4', final)), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        media, unavailable = instagram_mirror_lookup(
+            'https://www.instagram.com/reel/ABC123/?igsh=x')
+    assert media == final
+    assert unavailable is False
+
+
+def test_instagram_lookup_flags_private_or_removed_post():
+    # المرآة أحالت لصفحة إنستغرام نفسها (جدار الدخول) بدل الوسائط → المنشور
+    # خاص/محذوف: (None, True) ليعرض البوت رسالة واضحة بدل «رابط غير صحيح»
+    wall = 'https://www.instagram.com/reel/ABC123/'
+    with patch('urllib.request.urlopen', return_value=_FakeResp('text/html', wall)):
+        media, unavailable = instagram_mirror_lookup(
+            'https://www.instagram.com/reel/ABC123/?igsh=x')
+    assert media is None
+    assert unavailable is True
+
+
+def test_instagram_lookup_image_post_not_flagged():
+    # منشور صور عام (المرآة تُرجع صورة) → لا علم؛ يكمل مسار الصور عادياً
+    with patch('urllib.request.urlopen',
+               return_value=_FakeResp('image/jpeg',
+                                      'https://scontent.cdninstagram.com/v/p.jpg')):
+        media, unavailable = instagram_mirror_lookup(
+            'https://www.instagram.com/p/ABC123/')
+    assert media is None
+    assert unavailable is False
+
+
+def test_instagram_lookup_mirror_outage_not_flagged():
+    # عطل المرآة (504/انقطاع) → (None, False): لا نتّهم المنشور بالخصوصية
+    with patch('urllib.request.urlopen', side_effect=OSError('504')):
+        media, unavailable = instagram_mirror_lookup(
+            'https://www.instagram.com/reel/ABC123/')
+    assert media is None
+    assert unavailable is False
 
 
 # ── resolve_tiktok_media ────────────────────────────────────────
