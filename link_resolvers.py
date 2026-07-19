@@ -403,6 +403,94 @@ def resolve_twitter_media(url: str, timeout: int = 20):
     return media
 
 
+def _extract_twitter_media_list(payload):
+    """يستخرج كل وسائط التغريدة مرتّبة كما وردت فيها: قائمة عناصر
+    {'type': 'photo'|'video', 'url': ...} (يدعم شكلي vx/fxtwitter).
+    الـGIF يُعامل كفيديو (المرآة تعيده ملف mp4). قائمة فارغة لغياب الوسائط."""
+    if not isinstance(payload, dict):
+        return []
+    out, seen = [], set()
+
+    def _add(kind, u):
+        if (isinstance(u, str)
+                and u.lower().startswith(('http://', 'https://'))
+                and u not in seen):
+            seen.add(u)
+            out.append({'type': kind, 'url': u})
+
+    # vxtwitter: media_extended قائمة مرتّبة بأنواع صريحة (image/video/gif)
+    for it in (payload.get('media_extended') or []):
+        if not isinstance(it, dict):
+            continue
+        if it.get('type') == 'image':
+            _add('photo', it.get('url'))
+        elif it.get('type') in ('video', 'gif'):
+            _add('video', it.get('url'))
+    if out:
+        return out
+
+    # fxtwitter: tweet.media.all قائمة مرتّبة (photo/video/gif)،
+    # وphotos/videos منفصلتان احتياطاً للردود التي بلا all
+    media = (payload.get('tweet') or {}).get('media') or {}
+    for it in (media.get('all') or []):
+        if not isinstance(it, dict):
+            continue
+        if it.get('type') in ('photo', 'image'):
+            _add('photo', it.get('url'))
+        elif it.get('type') in ('video', 'gif'):
+            _add('video', it.get('url'))
+    if out:
+        return out
+    for it in (media.get('photos') or []):
+        if isinstance(it, dict):
+            _add('photo', it.get('url'))
+    for it in (media.get('videos') or []):
+        if isinstance(it, dict):
+            _add('video', it.get('url'))
+    return out
+
+
+def twitter_mirror_media(url: str, timeout: int = 20):
+    """يستعلم مرايا تويتر ويعيد (قائمة كل وسائط التغريدة مرتّبة، هل التغريدة
+    حسّاسة/NSFW؟). كل عنصر {'type': 'photo'|'video', 'url': ...}.
+
+    يغطي ما يعجز عنه yt-dlp: تغريدات الصور (يفشل بـ"No video could be found
+    in this tweet") والتغريدات المختلطة/متعددة الفيديو (يستخرج الفيديو فقط
+    ويُسقط الصور). قائمة فارغة لغير روابط المنشورات أو عند أي فشل."""
+    import json
+    import urllib.request
+    low = (url or '').lower()
+    if not any(m in low for m in PLATFORM_URL_MARKERS['twitter']):
+        return [], False
+    m = _TWITTER_STATUS_RE.search(url or '')
+    if not m:
+        return [], False  # ليس رابط منشور (بروفايل/بحث) — لا مرآة له
+    status_id = m.group(1)
+    for host in _TWITTER_API_HOSTS:
+        api_url = _twitter_api_url(host, status_id)
+        try:
+            req = urllib.request.Request(api_url, headers={
+                'User-Agent': _BOT_UA,
+                'Accept': 'application/json',
+            })
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                payload = json.loads(resp.read(2_000_000).decode('utf-8', 'ignore'))
+            items = [it for it in _extract_twitter_media_list(payload)
+                     if is_safe_url(it['url'])]
+            if items:
+                sensitive = _twitter_payload_sensitive(payload)
+                photos = sum(1 for it in items if it['type'] == 'photo')
+                logger.info(
+                    f"🎯 وسائط تويتر عبر {host}: {photos} صورة + "
+                    f"{len(items) - photos} فيديو"
+                    + (" (⚠️ حسّاس)" if sensitive else ""))
+                return items, sensitive
+            logger.info(f"ℹ️ {host} لم يُرجع وسائط تويتر")
+        except Exception as e:
+            logger.warning(f"⚠️ تعذّر جلب وسائط تويتر عبر {host}: {e}")
+    return [], False
+
+
 # ═══════════════════════════════════════════════════════════════
 # بينتريست: فيديو وصور متعددة (كاروسيل/Idea Pins) عبر واجهات بينتريست العامة
 # yt-dlp قد يفشل مع بينتريست (تغييرات الموقع/حجب)، وgallery-dl قد يتعطّل للصور.
