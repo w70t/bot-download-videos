@@ -12,6 +12,7 @@ from link_resolvers import (
     resolve_tiktok_media, resolve_tiktok_images,
     resolve_twitter_media, _extract_twitter_media, all_mirror_hosts,
     twitter_mirror_lookup, _twitter_payload_sensitive,
+    _extract_twitter_media_list, twitter_mirror_media,
     resolve_pinterest_media, resolve_pinterest_images, _pinterest_pin_id,
     _extract_pinterest_video, _extract_pinterest_images, _upscale_pinimg,
     is_substack_note, resolve_substack_note,
@@ -360,6 +361,97 @@ def test_twitter_mirror_lookup_normal_tweet_not_sensitive():
         media, sensitive = twitter_mirror_lookup('https://x.com/u/status/123')
     assert media == vid
     assert sensitive is False
+
+
+# ── twitter_mirror_media (كل وسائط التغريدة: صور + فيديو) ───────
+
+def test_twitter_media_list_vxtwitter_mixed_keeps_order():
+    # تغريدة مختلطة (صورة، فيديو، صورة): يُحافَظ على الترتيب والأنواع
+    img1 = 'https://pbs.twimg.com/media/a.jpg'
+    vid = 'https://video.twimg.com/amplify_video/1/vid/avc1/x.mp4'
+    img2 = 'https://pbs.twimg.com/media/b.jpg'
+    payload = {'media_extended': [
+        {'type': 'image', 'url': img1},
+        {'type': 'video', 'url': vid},
+        {'type': 'image', 'url': img2},
+    ]}
+    assert _extract_twitter_media_list(payload) == [
+        {'type': 'photo', 'url': img1},
+        {'type': 'video', 'url': vid},
+        {'type': 'photo', 'url': img2},
+    ]
+
+
+def test_twitter_media_list_gif_treated_as_video():
+    gif = 'https://video.twimg.com/tweet_video/g.mp4'
+    payload = {'media_extended': [{'type': 'gif', 'url': gif}]}
+    assert _extract_twitter_media_list(payload) == [{'type': 'video', 'url': gif}]
+
+
+def test_twitter_media_list_fxtwitter_shapes():
+    # fxtwitter: tweet.media.all المرتّبة أولاً، وphotos/videos احتياطاً
+    img = 'https://pbs.twimg.com/media/c.jpg'
+    vid = 'https://video.twimg.com/amplify_video/2/vid/avc1/y.mp4'
+    with_all = {'tweet': {'media': {'all': [
+        {'type': 'photo', 'url': img}, {'type': 'video', 'url': vid},
+    ]}}}
+    assert _extract_twitter_media_list(with_all) == [
+        {'type': 'photo', 'url': img},
+        {'type': 'video', 'url': vid},
+    ]
+    without_all = {'tweet': {'media': {
+        'photos': [{'type': 'photo', 'url': img}],
+        'videos': [{'type': 'video', 'url': vid}],
+    }}}
+    assert _extract_twitter_media_list(without_all) == [
+        {'type': 'photo', 'url': img},
+        {'type': 'video', 'url': vid},
+    ]
+
+
+def test_twitter_media_list_empty_shapes():
+    assert _extract_twitter_media_list(None) == []
+    assert _extract_twitter_media_list({}) == []
+    assert _extract_twitter_media_list({'tweet': {'media': {}}}) == []
+    # روابط غير http وعناصر مشوّهة تُتجاهل
+    assert _extract_twitter_media_list(
+        {'media_extended': [{'type': 'image', 'url': 'ftp://x'}, 'junk', {}]}) == []
+
+
+def test_twitter_mirror_media_returns_items_and_flag():
+    img = 'https://pbs.twimg.com/media/a.jpg'
+    vid = 'https://video.twimg.com/amplify_video/1/vid/avc1/x.mp4'
+    payload = {'possibly_sensitive': False,
+               'media_extended': [{'type': 'image', 'url': img},
+                                  {'type': 'video', 'url': vid}]}
+    with patch('urllib.request.urlopen', return_value=_FakeJsonResp(payload)), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        items, sensitive = twitter_mirror_media('https://x.com/u/status/123')
+    assert items == [{'type': 'photo', 'url': img}, {'type': 'video', 'url': vid}]
+    assert sensitive is False
+
+
+def test_twitter_mirror_media_sensitive_flag_passthrough():
+    payload = {'possibly_sensitive': True,
+               'media_extended': [{'type': 'image',
+                                   'url': 'https://pbs.twimg.com/media/n.jpg'}]}
+    with patch('urllib.request.urlopen', return_value=_FakeJsonResp(payload)), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        items, sensitive = twitter_mirror_media('https://x.com/u/status/123')
+    assert len(items) == 1
+    assert sensitive is True
+
+
+def test_twitter_mirror_media_ignores_non_status():
+    # روابط غير تويتر أو بلا معرّف منشور → قائمة فارغة بلا أي طلب شبكي
+    assert twitter_mirror_media('https://youtube.com/watch?v=1') == ([], False)
+    assert twitter_mirror_media('https://x.com/someuser') == ([], False)
+    assert twitter_mirror_media('') == ([], False)
+
+
+def test_twitter_mirror_media_handles_network_error():
+    with patch('urllib.request.urlopen', side_effect=OSError('boom')):
+        assert twitter_mirror_media('https://twitter.com/u/status/123') == ([], False)
 
 
 # ── resolve_pinterest_media / resolve_pinterest_images ─────────

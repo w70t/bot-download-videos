@@ -50,7 +50,7 @@ from cookies_manager import (
 from link_resolvers import (
     resolve_snapchat_spotlight, _is_music_link, resolve_music_link,
     resolve_instagram_media, instagram_mirror_lookup, resolve_tiktok_media,
-    twitter_mirror_lookup,
+    twitter_mirror_lookup, twitter_mirror_media,
     resolve_tiktok_images, resolve_pinterest_media, resolve_pinterest_images,
     is_substack_note, resolve_substack_note, all_mirror_hosts,
 )
@@ -62,7 +62,7 @@ from content_filter import (
     adult_filter_enabled, downloads_enabled,
 )
 from video_processing import (
-    get_file_size_mb, generate_video_thumbnail, finalize_video,
+    get_file_size_mb, generate_video_thumbnail, finalize_video, probe_video,
 )
 from download_errors import (
     _is_drm_error, _is_geo_restricted_error, _is_youtube_cookie_issue,
@@ -995,6 +995,7 @@ def _download_images_with_gallery_dl(url, dest_dir, cookie_file=None):
         '-o', 'tiktok.covers=false',
         '-o', 'instagram.videos=false',
         '-o', 'pinterest.videos=false',
+        '-o', 'twitter.videos=false',
     ]
     if cookie_file:
         cmd += ['--cookies', cookie_file]
@@ -1051,6 +1052,41 @@ def _download_images_from_urls(image_urls, dest_dir):
         except Exception as e:
             logger.warning(f"⚠️ فشل تنزيل صورة من المرآة العامة: {e}")
     return paths
+
+
+# امتدادات الفيديو المقبولة لوسائط التغريدة المباشرة (غيرها يُحفظ mp4)
+_TWEET_VIDEO_EXTS = ('.mp4', '.mov', '.webm')
+
+
+def _download_tweet_media_files(items, dest_dir):
+    """ينزّل وسائط تغريدة (صور وفيديوهات معاً) من روابطها المباشرة إلى dest_dir
+    بترتيبها الأصلي في التغريدة، ويعيد قائمة (النوع، المسار). كل عنصر
+    {'type': 'photo'|'video', 'url': ...} كما تعيده twitter_mirror_media.
+    العنصر الذي يفشل تنزيله يُتخطّى (لا نُفشِل الألبوم كله)."""
+    import urllib.request
+    os.makedirs(dest_dir, exist_ok=True)
+    ua = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+          '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+    out = []
+    for i, it in enumerate(items[:GALLERY_DL_MAX_IMAGES], 1):
+        kind, src = it.get('type'), it.get('url')
+        if kind not in ('photo', 'video') or not src:
+            continue
+        try:
+            ext = os.path.splitext(src.split('?', 1)[0])[1].lower()
+            if kind == 'photo' and ext not in _IMAGE_EXTS:
+                ext = '.jpg'
+            elif kind == 'video' and ext not in _TWEET_VIDEO_EXTS:
+                ext = '.mp4'
+            dest = os.path.join(dest_dir, f"{i:03d}{ext}")
+            req = urllib.request.Request(src, headers={'User-Agent': ua})
+            with urllib.request.urlopen(req, timeout=120) as resp, open(dest, 'wb') as fh:
+                shutil.copyfileobj(resp, fh)
+            if os.path.getsize(dest) > 0:
+                out.append((kind, dest))
+        except Exception as e:
+            logger.warning(f"⚠️ فشل تنزيل وسيط تغريدة ({kind}): {e}")
+    return out
 
 
 # مرايا إنستغرام العامة (InstaFix) لجلب صور الكاروسيل بلا كوكيز — نفس المرايا
@@ -1661,6 +1697,15 @@ async def process_download_from_queue(task: DownloadTask):
                     message.from_user.username, lang
                 ):
                     return
+            # 🐦 تغريدة X بلا فيديو قابل للاستخراج: yt-dlp يفشل لتغريدات الصور
+            #    بـ"No video could be found in this tweet" → اجلب وسائط التغريدة
+            #    (صور، أو صور + فيديو) من المرآة العامة وأرسلها كألبوم.
+            elif _platform_of(url) == 'twitter':
+                if await download_and_send_tweet_media(
+                    app, message, url, status, user_id, user_name,
+                    message.from_user.username, lang
+                ):
+                    return
             # محتوى مقيّد بالعمر/حسّاس → رسالة واضحة بدل "رابط غير صحيح" المضلّلة
             if _last_info_error.get() == 'restricted':
                 await send_error_to_admin(user_id, user_name, "Restricted/sensitive content", url)
@@ -1681,6 +1726,18 @@ async def process_download_from_queue(task: DownloadTask):
             ban_text, ban_kb = await _apply_adult_ban(app, user_id, lang)
             await status.edit_text(ban_text, reply_markup=ban_kb)
             return
+
+        # 🐦 تغريدة X مختلطة (صور + فيديو) أو متعددة الفيديو في تغريدة واحدة:
+        #    yt-dlp يستخرج الفيديو فقط ويُسقط الصور → أرسل كل وسائط التغريدة
+        #    كألبوم واحد. تغريدة الفيديو الواحد تعود False فتُكمل مسار الجودة
+        #    المعتاد، وكذلك عند تعطّل المرآة (السلوك القديم بلا تغيير).
+        if _platform_of(url) == 'twitter':
+            tw_name = message.from_user.first_name or "User"
+            if await download_and_send_tweet_media(
+                app, message, url, status, user_id, tw_name,
+                message.from_user.username, lang, info
+            ):
+                return
 
         # 📃 كشف قوائم التشغيل: عرض زر لتحميل أول N مقاطع (للمشتركين/الأدمن)
         # كاروسيل الصور (بلا فيديو) يُستثنى هنا ليُعالَج كألبوم صور لاحقاً.
@@ -2151,8 +2208,11 @@ async def _try_send_images_from_cache(client, message, status_msg, ckey,
 
 
 async def download_and_send_images(client, message, url, status_msg,
-                                   user_id, user_name, user_username, lang, info=None):
-    """ينزّل صور منشور إنستغرام/تيك توك/بينتريست (كاروسيل/سلايدشو) ويرسلها كألبوم.
+                                   user_id, user_name, user_username, lang, info=None,
+                                   fallback_image_urls=None):
+    """ينزّل صور منشور إنستغرام/تيك توك/بينتريست/تويتر (كاروسيل/سلايدشو) ويرسلها
+    كألبوم. fallback_image_urls (اختياري): روابط صور مباشرة جاهزة تُستخدم حين
+    يفشل gallery-dl — يمرّرها مسار التغريدة من مرآة fx/vxtwitter العامة.
 
     يعيد True إذا عُثر على صور وأُرسلت، وFalse إن لم يكن منشوراً مصوّراً
     (فيرجع المتصل لمسار الفيديو المعتاد). لا يكسر أي سلوك للفيديو القائم.
@@ -2181,7 +2241,10 @@ async def download_and_send_images(client, message, url, status_msg,
         await status_msg.edit_text(t('downloading_images', lang))
         cookie_file = get_cookie_file_for_url(url)
         loop = asyncio.get_event_loop()
-        files = await loop.run_in_executor(
+        # تويتر/X بلا كوكيز: gallery-dl يفشل حتماً (X يتطلّب تسجيل دخول لواجهته)
+        # — نوفّر مهلة الفشل وننتقل مباشرة لروابط صور المرآة العامة
+        skip_gallery = _platform_of(url) == 'twitter' and not cookie_file
+        files = [] if skip_gallery else await loop.run_in_executor(
             None, lambda: _download_images_with_gallery_dl(url, dl_dir, cookie_file)
         )
 
@@ -2227,6 +2290,14 @@ async def download_and_send_images(client, message, url, status_msg,
                 if files:
                     logger.info(
                         f"✅ صور بينتريست عبر الواجهة العامة ({len(files)} صورة، بلا كوكيز)")
+
+        # 🎯 روابط صور مباشرة جاهزة من المتصل (تغريدات X عبر مرآة fx/vxtwitter)
+        if not files and fallback_image_urls:
+            files = await loop.run_in_executor(
+                None, lambda: _download_images_from_urls(fallback_image_urls, dl_dir))
+            if files:
+                logger.info(
+                    f"✅ صور عبر المرآة العامة ({len(files)} صورة، بلا كوكيز)")
 
         if not files:
             return False  # ليست صوراً → ارجع لمسار الفيديو
@@ -2323,6 +2394,274 @@ async def download_and_send_images(client, message, url, status_msg,
 
     except Exception as e:
         logger.error(f"❌ خطأ في تحميل الصور: {e}")
+        error_traceback = traceback.format_exc()
+        await send_error_to_admin(user_id, user_name, str(e), url, error_traceback)
+        try:
+            await status_msg.edit_text(t('download_failed', lang))
+        except Exception:
+            pass
+        return True  # عولج (بخطأ) — لا تكمل لمسار الفيديو
+    finally:
+        cleanup_download_dir(dl_dir)
+
+
+# مفتاح ثابت لجودة كاش ألبوم التغريدة المختلط (صور + فيديو في تغريدة واحدة)
+ALBUM_CACHE_QUALITY = 'album'
+
+
+async def _send_media_album(client, chat_id, entries, caption):
+    """يرسل قائمة وسائط مختلطة (صور + فيديو) كألبومات تلجرام (حد 10 للمجموعة)
+    مع الكابشن على أول وسيط فقط. كل عنصر (النوع، المصدر) والمصدر مسار ملف أو
+    file_id من الكاش. لفيديو من ملف نقرأ الأبعاد والمدة (ffprobe) كي يعرضه
+    تلجرام بنسبة صحيحة. يعيد قائمة الرسائل المُرسلة."""
+    from pyrogram.types import InputMediaPhoto, InputMediaVideo
+
+    def _video_kwargs(src):
+        if not (isinstance(src, str) and os.path.isfile(src)):
+            return {}  # file_id من الكاش — تلجرام يعرف بياناته أصلاً
+        _vc, _ac, width, height, duration = probe_video(src)
+        return {k: v for k, v in
+                (('width', width), ('height', height), ('duration', duration)) if v}
+
+    sent = []
+    chunks = [entries[i:i + 10] for i in range(0, len(entries), 10)]
+    for ci, chunk in enumerate(chunks):
+        if len(chunk) == 1 and len(chunks) == 1:
+            kind, src = chunk[0]
+            if kind == 'photo':
+                msg = await client.send_photo(
+                    chat_id=chat_id, photo=src, caption=caption)
+            else:
+                msg = await client.send_video(
+                    chat_id=chat_id, video=src, caption=caption,
+                    **_video_kwargs(src))
+            sent.append(msg)
+            continue
+        media = []
+        for fi, (kind, src) in enumerate(chunk):
+            cap = caption if (ci == 0 and fi == 0) else None
+            if kind == 'photo':
+                media.append(InputMediaPhoto(src, caption=cap))
+            else:
+                media.append(InputMediaVideo(src, caption=cap, **_video_kwargs(src)))
+        msgs = await client.send_media_group(chat_id=chat_id, media=media)
+        sent.extend(msgs if isinstance(msgs, list) else [msgs])
+    return sent
+
+
+def _album_cache_lines(messages):
+    """يحوّل رسائل ألبوم مُرسلة إلى أسطر كاش «النوع:file_id» (يتجاهل ما سواهما)."""
+    lines = []
+    for m in messages:
+        photo = getattr(m, 'photo', None)
+        video = getattr(m, 'video', None)
+        if photo and getattr(photo, 'file_id', None):
+            lines.append('photo:' + photo.file_id)
+        elif video and getattr(video, 'file_id', None):
+            lines.append('video:' + video.file_id)
+    return lines
+
+
+async def _try_send_album_from_cache(client, message, status_msg, ckey,
+                                     user_id, user_name, user_username, url, lang):
+    """يعيد إرسال ألبوم تغريدة مختلط من الكاش بمعرّفات الملفات (بلا أي تحميل)
+    كمسار كاش الصور. كل سطر معرّف بصيغة «النوع:file_id» لتمييز الصور عن
+    الفيديو عند إعادة البناء. يعيد True إن نجح، وFalse إن لا كاش."""
+    try:
+        cached = subdb.get_cached_media(ckey, ALBUM_CACHE_QUALITY)
+    except Exception as e:
+        logger.warning(f"⚠️ تعذّر قراءة كاش الألبوم: {e}")
+        return False
+    if not cached or cached.get('kind') != 'album':
+        return False
+
+    entries = []
+    for line in (cached.get('file_id') or '').split('\n'):
+        kind, _, fid = line.partition(':')
+        if fid and kind in ('photo', 'video'):
+            entries.append((kind, fid))
+    if not entries:
+        return False
+
+    title = cached.get('title') or 'Twitter/X'
+    bot_username = await _get_bot_username(client)
+    caption = t('album_caption', lang, title=title, count=len(entries),
+                user=user_name,
+                promo=(f"\n\n📥 @{bot_username}" if bot_username else ""))
+
+    try:
+        sent_messages = await _send_media_album(
+            client, message.chat.id, entries, caption)
+    except Exception as e:
+        # معرّفات قديمة لم تعد صالحة → احذف الكاش وأعد التحميل عادياً
+        logger.warning(f"⚠️ فشل إرسال ألبوم الكاش ({ckey})، سيُعاد التحميل: {e}")
+        try:
+            subdb.delete_cached_media(ckey, ALBUM_CACHE_QUALITY)
+        except Exception:
+            pass
+        return False
+
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+    try:
+        subdb.bump_cache_hit(ckey, ALBUM_CACHE_QUALITY)
+    except Exception:
+        pass
+    logger.info(f"⚡ كاش ألبوم: أُعيد إرسال {ckey} ({len(entries)} وسيطاً) بلا تحميل")
+
+    try:
+        await forward_images_to_log_channel(
+            client=client, message=message, sent_messages=sent_messages,
+            user_id=user_id, user_name=user_name, username=user_username,
+            url=url, video_info={'title': title}, title=title
+        )
+    except Exception as log_error:
+        logger.error(f"⚠️ خطأ في إرسال ألبوم الكاش للقناة: {log_error}")
+
+    await _send_daily_remaining_notice(message, user_id, lang)
+    try:
+        subdb.add_download_history(user_id, url, title, 'best', 'album',
+                                   'twitter', 0, from_cache=True)
+    except Exception:
+        pass
+    return True
+
+
+async def download_and_send_tweet_media(client, message, url, status_msg,
+                                        user_id, user_name, user_username,
+                                        lang, info=None):
+    """يعالج تغريدة X متعددة/مختلطة الوسائط عبر مرآة fx/vxtwitter العامة:
+    - صور فقط → ألبوم صور (مسار الصور القائم نفسه بكاشه وتطبيعه).
+    - صور + فيديو أو أكثر من فيديو في تغريدة واحدة → ألبوم مختلط واحد
+      بترتيب الوسائط الأصلي (yt-dlp يستخرج الفيديو فقط ويُسقط الصور).
+
+    يعيد True إذا عُولجت التغريدة (أُرسلت وسائطها أو عُرضت رسالة واضحة)،
+    وFalse ليُكمل المتصل المسار المعتاد دون أي تغيير في السلوك — تغريدة
+    الفيديو الواحد (أزرار الجودة/الصوت) أو مرآة معطّلة/تغريدة بلا وسائط."""
+    if _platform_of(url) != 'twitter':
+        return False
+    loop = asyncio.get_event_loop()
+    try:
+        items, sensitive = await loop.run_in_executor(
+            None, lambda: twitter_mirror_media(url, timeout=10))
+    except Exception as e:
+        logger.warning(f"⚠️ تعذّر جلب وسائط التغريدة من المرآة: {e}")
+        return False
+    if not items:
+        return False
+
+    # 🔞 التغريدات الحسّاسة (NSFW) تُرفض ما دام فلتر المحتوى مفعّلاً — نفس
+    # حماية مسار فيديو المرآة (رسالة «محتوى مقيّد» الواضحة بدل التحميل)
+    if sensitive and adult_filter_enabled():
+        logger.info("🔞 تغريدة حسّاسة (NSFW) — رُفض مسار الألبوم (فلتر المحتوى مفعّل)")
+        await send_error_to_admin(user_id, user_name, "Restricted/sensitive content", url)
+        await status_msg.edit_text(t('content_restricted', lang))
+        return True
+
+    photos = [it for it in items if it['type'] == 'photo']
+    videos = [it for it in items if it['type'] == 'video']
+
+    # صور فقط → مسار ألبوم الصور القائم (كاش الصور/gallery-dl/تطبيع تلجرام)
+    if not videos:
+        return await download_and_send_images(
+            client, message, url, status_msg, user_id, user_name,
+            user_username, lang, info,
+            fallback_image_urls=[it['url'] for it in photos])
+
+    # فيديو واحد بلا صور → مسار الفيديو المعتاد (أزرار الجودة/الصوت والكاش)
+    if len(videos) == 1 and not photos:
+        return False
+
+    # تغريدة مختلطة (صور + فيديو) أو متعددة الفيديو → ألبوم واحد
+    dl_dir = os.path.join('videos', 'alb_' + uuid.uuid4().hex)
+    ckey = cache_key_for_url(url)
+    try:
+        # ⚡ كاش الألبوم: نفس الرابط محمّل سابقاً → أعِد إرساله فوراً بلا تحميل
+        if await _try_send_album_from_cache(
+            client, message, status_msg, ckey,
+            user_id, user_name, user_username, url, lang
+        ):
+            return True
+
+        await status_msg.edit_text(t('downloading_album', lang))
+        files = await loop.run_in_executor(
+            None, lambda: _download_tweet_media_files(items, dl_dir))
+        if not files:
+            return False  # فشل التنزيل بالكامل → أكمل المسار المعتاد
+
+        # طبّع الصور لصيغ تلجرام المقبولة، واضمن مسار صوت في كل فيديو (GIF
+        # التغريدات mp4 بلا صوت فيُعرض كصورة متحركة بدل فيديو)
+        entries = []
+        for kind, path in files:
+            if kind == 'photo':
+                norm = _normalize_images_for_telegram([path])
+                if norm:
+                    entries.append(('photo', norm[0]))
+            else:
+                await loop.run_in_executor(
+                    None, lambda p=path: _ensure_video_has_audio(p))
+                entries.append(('video', path))
+        if not entries:
+            return False
+
+        title = _clean_media_title((info or {}).get('title'), url).replace('`', "'")[:200]
+        bot_username = await _get_bot_username(client)
+        caption = t('album_caption', lang, title=title, count=len(entries),
+                    user=user_name,
+                    promo=(f"\n\n📥 @{bot_username}" if bot_username else ""))
+
+        sent_messages = await _send_media_album(
+            client, message.chat.id, entries, caption)
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        n_photos = sum(1 for k, _ in entries if k == 'photo')
+        logger.info(f"✅ أُرسل ألبوم تغريدة للمستخدم {user_id}: "
+                    f"{n_photos} صورة + {len(entries) - n_photos} فيديو")
+
+        # تحويل الألبوم لقناة السجلات نسخاً بمعرّف الملف (بلا إعادة رفع)،
+        # ونفضّل نسخ القناة الدائمة للكاش إن اكتملت
+        log_messages = []
+        if sent_messages:
+            try:
+                log_messages = await forward_images_to_log_channel(
+                    client=client, message=message, sent_messages=sent_messages,
+                    user_id=user_id, user_name=user_name, username=user_username,
+                    url=url, video_info=(info or {'title': title}), title=title
+                ) or []
+            except Exception as log_error:
+                logger.error(f"⚠️ خطأ في إرسال الألبوم للقناة: {log_error}")
+
+        # 💾 حفظ معرّفات الوسائط (النوع:file_id لكل سطر) لإعادة الإرسال بلا تحميل
+        try:
+            src_msgs = log_messages if len(log_messages) == len(sent_messages) \
+                else sent_messages
+            lines = _album_cache_lines(src_msgs)
+            if lines:
+                subdb.save_cached_media(
+                    url_key=ckey, quality=ALBUM_CACHE_QUALITY, kind='album',
+                    file_id="\n".join(lines), title=title,
+                    file_size_mb=0, duration=0
+                )
+                logger.info(f"💾 حُفظ كاش الألبوم: {ckey} ({len(lines)} وسيطاً)")
+        except Exception as e:
+            logger.warning(f"⚠️ تعذّر حفظ كاش الألبوم: {e}")
+
+        try:
+            subdb.add_download_history(user_id, url, title, 'best', 'album',
+                                       'twitter', 0, from_cache=False)
+        except Exception:
+            pass
+
+        await _send_daily_remaining_notice(message, user_id, lang)
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ خطأ في تحميل ألبوم التغريدة: {e}")
         error_traceback = traceback.format_exc()
         await send_error_to_admin(user_id, user_name, str(e), url, error_traceback)
         try:
