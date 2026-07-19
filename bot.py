@@ -1727,16 +1727,27 @@ async def process_download_from_queue(task: DownloadTask):
             await status.edit_text(ban_text, reply_markup=ban_kb)
             return
 
-        # 🐦 تغريدة X مختلطة (صور + فيديو) أو متعددة الفيديو في تغريدة واحدة:
-        #    yt-dlp يستخرج الفيديو فقط ويُسقط الصور → أرسل كل وسائط التغريدة
-        #    كألبوم واحد. تغريدة الفيديو الواحد تعود False فتُكمل مسار الجودة
-        #    المعتاد، وكذلك عند تعطّل المرآة (السلوك القديم بلا تغيير).
+        # 🐦 تغريدة X: yt-dlp يعيد تغريدة الصور كبيانات بلا أي صيغة فيديو (بسبب
+        #    ignore_no_formats_error) فتظهر أزرار جودة زائفة — ويستخرج من
+        #    التغريدة المختلطة الفيديو فقط ويُسقط الصور. مسار التغريدة يميّز
+        #    النوع من المرآة: صور → ألبوم صور، صور + فيديو أو عدة فيديوهات →
+        #    ألبوم مختلط. تغريدة الفيديو الواحد تعود False فتُكمل كالمعتاد.
         if _platform_of(url) == 'twitter':
             tw_name = message.from_user.first_name or "User"
             if await download_and_send_tweet_media(
                 app, message, url, status, user_id, tw_name,
                 message.from_user.username, lang, info
             ):
+                return
+            # المرآة معطّلة والتغريدة بلا صيغة فيديو (منشور صور) → جرّب
+            # gallery-dl بالكوكيز بدل أزرار جودة زائفة، وإلا «لا وسائط»
+            if not _info_has_video(info):
+                if await download_and_send_images(
+                    app, message, url, status, user_id, tw_name,
+                    message.from_user.username, lang, info
+                ):
+                    return
+                await status.edit_text(t('no_media_found', lang))
                 return
 
         # 📃 كشف قوائم التشغيل: عرض زر لتحميل أول N مقاطع (للمشتركين/الأدمن)
@@ -5411,6 +5422,15 @@ async def handle_url(client, message):
                 ):
                     pending_downloads.pop(user_id, None)
                     return
+            # 🐦 تغريدة X بلا فيديو قابل للاستخراج (صور، أو صور + فيديو) →
+            #    وسائط التغريدة عبر المرآة العامة كألبوم
+            elif _platform_of(url) == 'twitter':
+                if await download_and_send_tweet_media(
+                    client, message, url, status, user_id, user_name,
+                    message.from_user.username, lang
+                ):
+                    pending_downloads.pop(user_id, None)
+                    return
             # محتوى مقيّد بالعمر/حسّاس → رسالة واضحة بدل "رابط غير صحيح" المضلّلة
             if _last_info_error.get() == 'restricted':
                 await send_error_to_admin(user_id, user_name, "Restricted/sensitive content", url)
@@ -5484,6 +5504,30 @@ async def handle_url(client, message):
         # لا فيديو ولا صور صالحة في الرابط
         await status.edit_text(t('no_media_found', lang))
         return
+
+    # 🐦 تغريدة X: yt-dlp يعيد تغريدة الصور كبيانات بلا أي صيغة فيديو (بسبب
+    #    ignore_no_formats_error) فتظهر معاينة فيديو زائفة بمدة 0:00 — ويستخرج
+    #    من التغريدة المختلطة الفيديو فقط ويُسقط الصور. مسار التغريدة يميّز
+    #    النوع من المرآة: صور → ألبوم صور، صور + فيديو أو عدة فيديوهات → ألبوم
+    #    مختلط. تغريدة الفيديو الواحد تعود False فتُكمل للمعاينة المعتادة.
+    if _platform_of(url) == 'twitter':
+        tw_name = message.from_user.first_name or "User"
+        if await download_and_send_tweet_media(
+            client, message, url, status, user_id, tw_name, username, lang, info
+        ):
+            pending_downloads.pop(user_id, None)
+            return
+        # المرآة معطّلة والتغريدة بلا صيغة فيديو (منشور صور) → جرّب gallery-dl
+        # بالكوكيز بدل عرض معاينة فيديو زائفة، وإلا فرسالة «لا وسائط» الصادقة
+        if not _info_has_video(info):
+            handled = await download_and_send_images(
+                client, message, url, status, user_id, tw_name, username, lang, info
+            )
+            pending_downloads.pop(user_id, None)
+            if handled:
+                return
+            await status.edit_text(t('no_media_found', lang))
+            return
 
     # الحد الأقصى للمدة = الأساس + مكافأة دعوات المستخدم (كل دعوة +REFERRAL_MINUTES دقيقة)
     max_duration_minutes = _user_max_duration_minutes(user_id)
