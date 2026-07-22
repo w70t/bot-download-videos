@@ -85,6 +85,7 @@ def init_db():
     _ensure_history_table()
     _ensure_referrals_table()
     _ensure_bonus_column()
+    _ensure_total_downloads_column()
     _ensure_moderation_table()
     _ensure_survey_table()
     _ensure_questions_tables()
@@ -241,6 +242,41 @@ def get_referral_minutes() -> int:
 def set_referral_minutes(minutes: int):
     """تحديد عدد الدقائق الممنوحة لحدّ المدة مقابل كل دعوة ناجحة."""
     set_setting('referral_minutes', str(minutes))
+
+# ── بوابة الدعوة الإجبارية (Mandatory invite gate) ──
+# عند تفعيلها: لكل مستخدم غير مشترك عدد تحميلات مجاني، وبعد استنفاده يجب أن
+# يدعو أصدقاءه عبر رابطه لفتح المزيد. لا يُفتح له إلا بانضمام صديق فعلي (يُتحقق
+# تلقائياً عبر جدول الدعوات) فلا يمكن الالتفاف على الشرط.
+
+def is_invite_gate_enabled() -> bool:
+    """هل بوابة الدعوة الإجبارية مفعّلة؟ (يديرها الأدمن؛ الافتراضي متوقفة)."""
+    return get_setting('invite_gate_enabled', '0') == '1'
+
+def set_invite_gate_enabled(enabled: bool):
+    """تفعيل/إيقاف بوابة الدعوة الإجبارية."""
+    set_setting('invite_gate_enabled', '1' if enabled else '0')
+
+def get_invite_gate_free() -> int:
+    """عدد التحميلات المجانية المسموحة قبل أن تُطلب أول دعوة (≥ 0)."""
+    try:
+        return max(0, int(get_setting('invite_gate_free', '1')))
+    except (TypeError, ValueError):
+        return 1
+
+def set_invite_gate_free(n: int):
+    """تحديد عدد التحميلات المجانية قبل أول دعوة مطلوبة."""
+    set_setting('invite_gate_free', str(max(0, int(n))))
+
+def get_invite_gate_per_invite() -> int:
+    """عدد التحميلات التي تُفتح مقابل كل دعوة ناجحة (≥ 1)."""
+    try:
+        return max(1, int(get_setting('invite_gate_per_invite', '1')))
+    except (TypeError, ValueError):
+        return 1
+
+def set_invite_gate_per_invite(n: int):
+    """تحديد عدد التحميلات المُتاحة مقابل كل دعوة ناجحة."""
+    set_setting('invite_gate_per_invite', str(max(1, int(n))))
 
 # ═══════════════════════════════════════════════════════════════
 # دوال الاشتراك الإجباري بالقنوات
@@ -847,6 +883,61 @@ def _ensure_bonus_column():
         cursor.execute(
             'ALTER TABLE users ADD COLUMN IF NOT EXISTS bonus_downloads INTEGER DEFAULT 0'
         )
+
+
+def _ensure_total_downloads_column():
+    """يضيف عمود إجمالي التحميلات (عدّاد تراكمي لبوابة الدعوة) إن لم يكن موجوداً."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute(
+            'ALTER TABLE users ADD COLUMN IF NOT EXISTS total_downloads INTEGER DEFAULT 0'
+        )
+
+
+def increment_total_downloads(user_id):
+    """يزيد العدّاد التراكمي لتحميلات المستخدم (يُستخدم في بوابة الدعوة)."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            INSERT INTO users (user_id, total_downloads)
+            VALUES (%s, 1)
+            ON CONFLICT (user_id) DO UPDATE SET
+                total_downloads = COALESCE(users.total_downloads, 0) + 1
+        ''', (user_id,))
+
+
+def get_total_downloads(user_id) -> int:
+    """إجمالي تحميلات المستخدم التراكمية."""
+    with db_cursor() as cursor:
+        cursor.execute('SELECT COALESCE(total_downloads, 0) FROM users WHERE user_id = %s',
+                       (user_id,))
+        row = cursor.fetchone()
+    return row[0] if row else 0
+
+
+def invite_gate_status(user_id) -> dict:
+    """حالة بوابة الدعوة لمستخدم غير مشترك.
+
+    allowed  = المجاني + (عدد دعواته الناجحة × التحميلات لكل دعوة)
+    consumed = إجمالي تحميلاته التراكمية
+    blocked  = استنفد رصيده (consumed ≥ allowed) → يجب أن يدعو ليكمل
+    needed   = كم دعوة ناجحة إضافية يحتاج لفتح تحميل واحد على الأقل
+    """
+    free = get_invite_gate_free()
+    per = get_invite_gate_per_invite()
+    invites = get_referral_count(user_id)
+    consumed = get_total_downloads(user_id)
+    allowed = free + invites * per
+    blocked = consumed >= allowed
+    needed = ((consumed - allowed) // per + 1) if blocked else 0
+    return {
+        'blocked': blocked,
+        'allowed': allowed,
+        'consumed': consumed,
+        'remaining': max(0, allowed - consumed),
+        'invites': invites,
+        'needed': needed,
+        'per': per,
+        'free': free,
+    }
 
 
 def record_referral(referred_user_id, referrer_user_id) -> bool:

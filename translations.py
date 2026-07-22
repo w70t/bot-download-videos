@@ -68,6 +68,8 @@ TRANSLATIONS = {
         # الاشتراك - Subscription
         'subscription_required': '⚠️ **هذا الفيديو أطول من حدّك الحالي**\n\n🎬 **الفيديو:** {title}\n⏱️ **المدة:** {duration} دقيقة\n🔒 **حدّك الحالي:** {max_duration} دقيقة',
         'unlock_by_invite': '🎁 **أو ارفع حدّك مجاناً بالدعوات!**\n\nكل صديق ينضم عبر رابطك يزيد مدة التحميل المسموحة **+{minutes} دقيقة** (دائماً).\n👇 اضغط زر «ادعُ أصدقاءك» بالأسفل للحصول على رابطك.',
+        'invite_gate_locked': '🔒 **لإكمال التحميل، ادعُ صديقاً!**\n\nاستهلكت رصيدك المجاني من التحميلات ({consumed}).\nلفتح المزيد، ادعُ **{needed}** صديق على الأقل عبر رابطك — وكل صديق ينضم يفتح لك **{per}** تحميل.\n✅ يُفتح لك تلقائياً بمجرد انضمام صديق حقيقي عبر رابطك.\n\n🔗 **رابطك:**\n`{link}`\n\n👥 أصدقاؤك حتى الآن: **{count}**',
+        'invite_gate_locked_nolink': '🔒 **لإكمال التحميل، ادعُ صديقاً!**\n\nاستهلكت رصيدك المجاني من التحميلات ({consumed}).\nلفتح المزيد، ادعُ **{needed}** صديق على الأقل — وكل صديق ينضم يفتح لك **{per}** تحميل.\n👇 اضغط زر «ادعُ أصدقاءك» بالأسفل للحصول على رابطك.',
         'subscription_benefits': '💎 **أو اشترك لتحميل بدون حدود:**\n• تحميل فيديوهات بدون حد للمدة\n• أولوية في التحميل\n• دعم المطور',
         'subscription_status': '💎 **اشتراكك نشط**\n\n📅 **ينتهي في:** {end_date}\n\n⏳ **الوقت المتبقي:**\n• {days} يوم\n• {hours} ساعة',
         'not_subscribed': '❌ **ليس لديك اشتراك نشط**\n\nاشترك الآن للحصول على مزايا غير محدودة!',
@@ -244,6 +246,8 @@ TRANSLATIONS = {
         # Subscription
         'subscription_required': '⚠️ **This video is longer than your current limit**\n\n🎬 **Video:** {title}\n⏱️ **Duration:** {duration} minutes\n🔒 **Your current limit:** {max_duration} minutes',
         'unlock_by_invite': '🎁 **Or raise your limit for free by inviting!**\n\nEach friend who joins via your link adds **+{minutes} minutes** to your allowed duration (permanently).\n👇 Tap the “Invite Friends” button below to get your link.',
+        'invite_gate_locked': '🔒 **Invite a friend to keep downloading!**\n\nYou have used your free downloads ({consumed}).\nTo unlock more, invite at least **{needed}** friend via your link — each friend who joins unlocks **{per}** download(s).\n✅ It unlocks automatically the moment a real friend joins through your link.\n\n🔗 **Your link:**\n`{link}`\n\n👥 Your friends so far: **{count}**',
+        'invite_gate_locked_nolink': '🔒 **Invite a friend to keep downloading!**\n\nYou have used your free downloads ({consumed}).\nTo unlock more, invite at least **{needed}** friend — each friend who joins unlocks **{per}** download(s).\n👇 Tap the “Invite Friends” button below to get your link.',
         'subscription_benefits': '💎 **Or subscribe for unlimited downloads:**\n• Unlimited video duration\n• Priority downloads\n• Support developer',
         'subscription_status': '💎 **Your Subscription is Active**\n\n📅 **Expires on:** {end_date}\n\n⏳ **Time Remaining:**\n• {days} days\n• {hours} hours',
         'not_subscribed': '❌ **No Active Subscription**\n\nSubscribe now to get unlimited features!',

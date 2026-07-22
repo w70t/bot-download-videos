@@ -1805,6 +1805,10 @@ async def process_download_from_queue(task: DownloadTask):
                     )
                     return
         
+        # 🔒 بوابة الدعوة الإجبارية: بعد استنفاد الرصيد المجاني يجب دعوة صديق للمتابعة
+        if await _invite_gate_blocked(status, user_id, lang):
+            return
+
         # 🖼️ منشور مصوّر بلا فيديو (كاروسيل إنستغرام / سلايدشو تيك توك) → ألبوم صور
         if _platform_of(url) in ('instagram', 'tiktok') and not _info_has_video(info):
             img_user_name = message.from_user.first_name or "User"
@@ -1969,6 +1973,7 @@ async def _send_daily_remaining_notice(message, user_id, lang):
     if subdb.is_user_subscribed(user_id):
         return
     subdb.increment_download_count(user_id)
+    subdb.increment_total_downloads(user_id)  # عدّاد بوابة الدعوة التراكمي
     base_limit = subdb.get_daily_limit()
     if base_limit != -1:
         effective_limit = base_limit + subdb.get_bonus_downloads(user_id)
@@ -3254,7 +3259,8 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         # زيادة عداد التحميلات اليومية للمستخدمين غير المشتركين
         if not subdb.is_user_subscribed(user_id):
             subdb.increment_download_count(user_id)
-            
+            subdb.increment_total_downloads(user_id)  # عدّاد بوابة الدعوة التراكمي
+
             # عرض رسالة التحميلات المتبقية (الحد = الأساس + دعواته)
             base_limit = subdb.get_daily_limit()
             if base_limit != -1:  # فقط إذا لم يكن غير محدود
@@ -3446,6 +3452,56 @@ async def _build_invite_text(client, user_id, lang):
 def _invite_button(lang):
     """زر الدعوة الذي يظهر عند انتهاء الحد اليومي."""
     return InlineKeyboardButton(t('btn_invite', lang), callback_data="show_invite")
+
+
+def _invite_gate_active_for(user_id) -> bool:
+    """هل تنطبق بوابة الدعوة الإجبارية على هذا المستخدم؟
+
+    تُطبّق فقط عندما تكون مفعّلة من الأدمن، وعلى المستخدمين العاديين فقط
+    (الأدمن والمشتركون وأعضاء قائمة الاستثناء معفَون منها)."""
+    if not subdb.is_invite_gate_enabled():
+        return False
+    if is_admin(user_id) or subdb.is_user_subscribed(user_id):
+        return False
+    if user_id in _exempt_ids():
+        return False
+    return True
+
+
+async def _build_invite_gate_text(user_id, lang, st):
+    """يبني نص شاشة بوابة الدعوة (يتضمّن رابط الدعوة وعدد الدعوات المطلوبة)."""
+    uname = await _get_bot_username(app)
+    if uname:
+        link = f"https://t.me/{uname}?start=ref_{user_id}"
+        return t('invite_gate_locked', lang, link=link,
+                 consumed=st['consumed'], needed=st['needed'],
+                 per=st['per'], count=st['invites'])
+    # تعذّر جلب اسم البوت → نص بديل يوجّه المستخدم لزر «ادعُ أصدقاءك»
+    return t('invite_gate_locked_nolink', lang,
+             consumed=st['consumed'], needed=st['needed'], per=st['per'])
+
+
+async def _invite_gate_blocked(status, user_id, lang) -> bool:
+    """بوابة الدعوة الإجبارية: تُفحص قبل بدء أي تحميل.
+
+    إذا استنفد المستخدم رصيده المجاني ولم يَدْعُ أصدقاءً كفاية، تعرض له شاشة
+    الدعوة وتُرجع True (امنع التحميل). الفتح تلقائي بمجرد انضمام صديق حقيقي عبر
+    رابطه (يُتحقق عبر جدول الدعوات) فلا يمكن الالتفاف على الشرط. خلاف ذلك تُرجع False."""
+    if not _invite_gate_active_for(user_id):
+        return False
+    st = subdb.invite_gate_status(user_id)
+    if not st['blocked']:
+        return False
+    text = await _build_invite_gate_text(user_id, lang, st)
+    keyboard = InlineKeyboardMarkup([
+        [_invite_button(lang)],
+        [InlineKeyboardButton(t('subscribe_now', lang), callback_data="show_plans")],
+    ])
+    try:
+        await status.edit_text(text, reply_markup=keyboard)
+    except Exception:
+        pass
+    return True
 
 
 def _user_max_duration_minutes(user_id) -> int:
@@ -5489,7 +5545,12 @@ async def handle_url(client, message):
                     ])
                 )
                 return
-    
+
+    # 🔒 بوابة الدعوة الإجبارية: بعد استنفاد الرصيد المجاني يجب دعوة صديق للمتابعة
+    if await _invite_gate_blocked(status, user_id, lang):
+        pending_downloads.pop(user_id, None)
+        return
+
     # 🖼️ منشور مصوّر بلا فيديو (كاروسيل إنستغرام/بينتريست / سلايدشو تيك توك) →
     #    أرسل الصور كألبوم عبر gallery-dl. المنشورات المختلطة (صور+فيديو) تبقى
     #    على مسار الفيديو المعتاد دون أي تغيير في سلوكه.
@@ -6201,6 +6262,9 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
         # — إعدادات الاشتراك —
         [InlineKeyboardButton("⏱️ المدة القصوى", callback_data="sub_set_duration"),
          InlineKeyboardButton("💰 الأسعار", callback_data="sub_set_price")],
+        [InlineKeyboardButton(
+            f"🎁 بوابة الدعوة: {'✅ مُفعّلة' if subdb.is_invite_gate_enabled() else '❌ متوقفة'}",
+            callback_data="sub_invite_gate")],
         [InlineKeyboardButton("📢 الاشتراك الإجباري", callback_data="sub_fsub"),
          InlineKeyboardButton("💳 الدفوعات", callback_data="sub_pending_payments")],
         # — المحتوى المحظور والأسئلة —
@@ -6247,6 +6311,137 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
         await message.edit_text(text, reply_markup=keyboard)
     else:
         await message.reply_text(text, reply_markup=keyboard)
+
+
+async def show_invite_gate_panel(client, callback_query, notice=None):
+    """لوحة التحكم ببوابة الدعوة الإجبارية (للأدمن)."""
+    enabled = subdb.is_invite_gate_enabled()
+    free = subdb.get_invite_gate_free()
+    per = subdb.get_invite_gate_per_invite()
+    toggle_label = "🔴 إيقاف البوابة" if enabled else "🟢 تفعيل البوابة"
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(toggle_label, callback_data="ig_toggle")],
+        [InlineKeyboardButton(f"🎬 التحميلات المجانية: {free}", callback_data="ig_free")],
+        [InlineKeyboardButton(f"👥 تحميلات لكل دعوة: {per}", callback_data="ig_per")],
+        [InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")],
+    ])
+
+    head = (notice + "\n\n") if notice else ""
+    text = (
+        f"{head}"
+        "🎁 **بوابة الدعوة الإجبارية**\n\n"
+        f"الحالة: {'✅ مُفعّلة' if enabled else '❌ متوقفة'}\n"
+        f"🎬 تحميلات مجانية قبل أول دعوة: **{free}**\n"
+        f"👥 تحميلات تُفتح لكل دعوة ناجحة: **{per}**\n\n"
+        "💡 **كيف تعمل:**\n"
+        f"• كل مستخدم عادي يحصل على **{free}** تحميل مجاناً.\n"
+        f"• بعدها يجب أن يدعو صديقاً عبر رابطه ليكمل — كل صديق ينضم يفتح له **{per}** تحميل.\n"
+        "• يُتحقق تلقائياً من انضمام الصديق فعلاً عبر رابطه (لا يمكن الالتفاف على الشرط).\n"
+        "• المشتركون والمشرف وقائمة الاستثناء معفَون من البوابة.\n\n"
+        "**أمثلة سريعة:**\n"
+        "• مجاني=1، لكل دعوة=1 → بعد كل تحميل يجب دعوة صديق.\n"
+        "• مجاني=3، لكل دعوة=3 → بعد كل 3 تحميلات يجب دعوة صديق.\n\n"
+        "اضبط الخيارات بالأزرار بالأسفل:"
+    )
+    try:
+        await callback_query.message.edit_text(text, reply_markup=keyboard)
+    except Exception:
+        pass
+
+
+def _ig_presets_kb(kind, presets):
+    """لوحة أزرار القيم الجاهزة + إدخال يدوي لخيارات بوابة الدعوة."""
+    rows = []
+    row = []
+    for v in presets:
+        row.append(InlineKeyboardButton(str(v), callback_data=f"ig_set{kind}_{v}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("✏️ إدخال يدوي", callback_data=f"ig_set{kind}_manual")])
+    rows.append([InlineKeyboardButton("« رجوع", callback_data="ig_back")])
+    return InlineKeyboardMarkup(rows)
+
+
+@app.on_callback_query(filters.regex(r'^ig_'))
+async def handle_invite_gate_actions(client, callback_query):
+    """معالج أزرار بوابة الدعوة الإجبارية."""
+    user_id = callback_query.from_user.id
+    if not is_admin(user_id):
+        await callback_query.answer("❌ للمشرفين فقط!", show_alert=True)
+        return
+
+    action = callback_query.data[len('ig_'):]
+
+    if action == 'toggle':
+        new_state = not subdb.is_invite_gate_enabled()
+        subdb.set_invite_gate_enabled(new_state)
+        await callback_query.answer(
+            "✅ تم تفعيل بوابة الدعوة" if new_state else "⏸️ تم إيقاف بوابة الدعوة",
+            show_alert=False
+        )
+        await show_invite_gate_panel(client, callback_query)
+        return
+
+    if action == 'back':
+        pending_downloads.pop(user_id, None)
+        await show_invite_gate_panel(client, callback_query)
+        await callback_query.answer()
+        return
+
+    if action == 'free':
+        await callback_query.message.edit_text(
+            "🎬 **التحميلات المجانية قبل أول دعوة**\n\n"
+            f"القيمة الحالية: {subdb.get_invite_gate_free()}\n\n"
+            "اختر عدد التحميلات التي يحصل عليها المستخدم مجاناً قبل أن تُطلب منه أول دعوة\n"
+            "(0 = يجب الدعوة من أول تحميل):",
+            reply_markup=_ig_presets_kb('free', [0, 1, 2, 3, 5, 10])
+        )
+        await callback_query.answer()
+        return
+
+    if action == 'per':
+        await callback_query.message.edit_text(
+            "👥 **تحميلات لكل دعوة ناجحة**\n\n"
+            f"القيمة الحالية: {subdb.get_invite_gate_per_invite()}\n\n"
+            "اختر عدد التحميلات التي تُفتح للمستخدم مقابل كل صديق ينضم عبر رابطه:",
+            reply_markup=_ig_presets_kb('per', [1, 2, 3, 5, 10])
+        )
+        await callback_query.answer()
+        return
+
+    if action.startswith('setfree_') or action.startswith('setper_'):
+        kind = 'free' if action.startswith('setfree_') else 'per'
+        value = action.split('_', 1)[1]
+        if value == 'manual':
+            pending_downloads[user_id] = {'waiting_for': f'invite_gate_{kind}'}
+            await callback_query.message.edit_text(
+                ("🎬 **التحميلات المجانية**\n\nأرسل رقماً صحيحاً (0 أو أكثر)."
+                 if kind == 'free' else
+                 "👥 **تحميلات لكل دعوة**\n\nأرسل رقماً صحيحاً (1 أو أكثر).")
+            )
+            await callback_query.answer()
+            return
+        try:
+            n = int(value)
+        except ValueError:
+            await callback_query.answer("❌ قيمة غير صالحة", show_alert=True)
+            return
+        if kind == 'free':
+            subdb.set_invite_gate_free(n)
+            await show_invite_gate_panel(
+                client, callback_query, notice=f"✅ التحميلات المجانية الآن: {subdb.get_invite_gate_free()}")
+        else:
+            subdb.set_invite_gate_per_invite(n)
+            await show_invite_gate_panel(
+                client, callback_query, notice=f"✅ تحميلات لكل دعوة الآن: {subdb.get_invite_gate_per_invite()}")
+        await callback_query.answer("✅ تم الحفظ")
+        return
+
+    await callback_query.answer()
 
 
 @app.on_callback_query(filters.regex(r'^sub_'))
@@ -6669,6 +6864,11 @@ async def handle_subscription_settings(client, callback_query):
         except Exception:
             await callback_query.answer("❌ تعذّر الحذف", show_alert=True)
         await show_forced_sub_panel(client, callback_query)
+        return
+
+    if action == 'invite_gate':
+        await show_invite_gate_panel(client, callback_query)
+        await callback_query.answer()
         return
 
     if action == 'set_duration':
@@ -7435,7 +7635,33 @@ async def handle_admin_input(client, message):
                 f"الحد الجديد: {limit} مرات في اليوم"
             )
             del pending_downloads[user_id]
-            
+
+        elif waiting_for in ('invite_gate_free', 'invite_gate_per'):
+            try:
+                n = int(message.text.strip())
+            except ValueError:
+                await message.reply_text("❌ أرسل رقماً صحيحاً.")
+                return
+            if waiting_for == 'invite_gate_free':
+                if n < 0:
+                    await message.reply_text("❌ لا يقبل قيمة سالبة (0 = الدعوة من أول تحميل).")
+                    return
+                subdb.set_invite_gate_free(n)
+                await message.reply_text(
+                    "✅ **تم تحديث بوابة الدعوة**\n\n"
+                    f"التحميلات المجانية قبل أول دعوة: {subdb.get_invite_gate_free()}"
+                )
+            else:
+                if n < 1:
+                    await message.reply_text("❌ يجب أن يكون العدد 1 أو أكثر.")
+                    return
+                subdb.set_invite_gate_per_invite(n)
+                await message.reply_text(
+                    "✅ **تم تحديث بوابة الدعوة**\n\n"
+                    f"تحميلات تُفتح لكل دعوة ناجحة: {subdb.get_invite_gate_per_invite()}"
+                )
+            del pending_downloads[user_id]
+
         elif waiting_for in ('price_monthly', 'price_yearly', 'subscription_price'):
             try:
                 price = float(message.text.strip())
