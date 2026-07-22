@@ -3469,10 +3469,18 @@ def _invite_gate_active_for(user_id) -> bool:
 
 
 async def _build_invite_gate_text(user_id, lang, st):
-    """يبني نص شاشة بوابة الدعوة (يتضمّن رابط الدعوة وعدد الدعوات المطلوبة)."""
+    """يبني نص شاشة بوابة الدعوة (يتضمّن رابط الدعوة) بحسب النمط الحالي."""
     uname = await _get_bot_username(app)
-    if uname:
-        link = f"https://t.me/{uname}?start=ref_{user_id}"
+    link = f"https://t.me/{uname}?start=ref_{user_id}" if uname else None
+
+    if st.get('mode') == 'period':
+        if link:
+            return t('invite_gate_period_locked', lang, link=link,
+                     days=st['period_days'], count=st['invites'])
+        return t('invite_gate_period_locked_nolink', lang, days=st['period_days'])
+
+    # النمط الافتراضي: حسب عدد التحميلات
+    if link:
         return t('invite_gate_locked', lang, link=link,
                  consumed=st['consumed'], needed=st['needed'],
                  per=st['per'], count=st['invites'])
@@ -6316,32 +6324,63 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
 async def show_invite_gate_panel(client, callback_query, notice=None):
     """لوحة التحكم ببوابة الدعوة الإجبارية (للأدمن)."""
     enabled = subdb.is_invite_gate_enabled()
+    mode = subdb.get_invite_gate_mode()
     free = subdb.get_invite_gate_free()
     per = subdb.get_invite_gate_per_invite()
+    period_days = subdb.get_invite_gate_period_days()
+    reset_pending = subdb.get_invite_gate_reset_at() > 0
+
     toggle_label = "🔴 إيقاف البوابة" if enabled else "🟢 تفعيل البوابة"
+    mode_label = ("🔀 النمط: 🔢 عدد التحميلات" if mode == 'count'
+                  else "🔀 النمط: ⏳ فترة زمنية")
 
-    keyboard = InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton(toggle_label, callback_data="ig_toggle")],
+        [InlineKeyboardButton(mode_label, callback_data="ig_mode")],
         [InlineKeyboardButton(f"🎬 التحميلات المجانية: {free}", callback_data="ig_free")],
-        [InlineKeyboardButton(f"👥 تحميلات لكل دعوة: {per}", callback_data="ig_per")],
-        [InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")],
-    ])
+    ]
+    if mode == 'count':
+        rows.append([InlineKeyboardButton(f"👥 تحميلات لكل دعوة: {per}", callback_data="ig_per")])
+    else:
+        rows.append([InlineKeyboardButton(f"⏳ تتكرر الدعوة كل: {period_days} يوم", callback_data="ig_period")])
+    # الطلب العام (اطلب دعوة من الجميع الآن)
+    if reset_pending:
+        rows.append([InlineKeyboardButton("✖️ إلغاء طلب الدعوة العام", callback_data="ig_resetclear")])
+    else:
+        rows.append([InlineKeyboardButton("🔔 اطلب دعوة من الجميع الآن", callback_data="ig_resetall")])
+    rows.append([InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")])
+    keyboard = InlineKeyboardMarkup(rows)
 
+    if mode == 'count':
+        how = (
+            f"• كل مستخدم عادي يحصل على **{free}** تحميل مجاناً.\n"
+            f"• بعدها يجب أن يدعو صديقاً عبر رابطه ليكمل — كل صديق ينضم يفتح له **{per}** تحميل.\n"
+            "**أمثلة:** مجاني=1 ولكل دعوة=1 → دعوة بعد كل تحميل. "
+            "مجاني=3 ولكل دعوة=3 → دعوة بعد كل 3 تحميلات."
+        )
+    else:
+        how = (
+            f"• العضو الجديد يحمّل **{free}** تحميل مجاناً كترحيب.\n"
+            f"• بعدها يجب أن يعمل **دعوة ناجحة جديدة كل {period_days} يوم** ليستمر بالتحميل.\n"
+            "• من انقطع فترة ثم عاد، ستكون آخر دعوة له قديمة فيُطلب منه دعوة جديدة.\n"
+            "**مثال:** كل 3 أيام يجب دعوة صديق جديد للاستمرار."
+        )
+
+    reset_line = "🔔 **طلب عام معلّق:** على كل عضو عمل دعوة جديدة الآن.\n" if reset_pending else ""
     head = (notice + "\n\n") if notice else ""
     text = (
         f"{head}"
         "🎁 **بوابة الدعوة الإجبارية**\n\n"
         f"الحالة: {'✅ مُفعّلة' if enabled else '❌ متوقفة'}\n"
-        f"🎬 تحميلات مجانية قبل أول دعوة: **{free}**\n"
-        f"👥 تحميلات تُفتح لكل دعوة ناجحة: **{per}**\n\n"
+        f"النمط: {'🔢 عدد التحميلات' if mode == 'count' else '⏳ فترة زمنية'}\n"
+        f"🎬 تحميلات مجانية: **{free}**\n"
+        + (f"👥 تحميلات لكل دعوة: **{per}**\n" if mode == 'count'
+           else f"⏳ تتكرر الدعوة كل: **{period_days}** يوم\n")
+        + f"{reset_line}\n"
         "💡 **كيف تعمل:**\n"
-        f"• كل مستخدم عادي يحصل على **{free}** تحميل مجاناً.\n"
-        f"• بعدها يجب أن يدعو صديقاً عبر رابطه ليكمل — كل صديق ينضم يفتح له **{per}** تحميل.\n"
+        f"{how}\n"
         "• يُتحقق تلقائياً من انضمام الصديق فعلاً عبر رابطه (لا يمكن الالتفاف على الشرط).\n"
         "• المشتركون والمشرف وقائمة الاستثناء معفَون من البوابة.\n\n"
-        "**أمثلة سريعة:**\n"
-        "• مجاني=1، لكل دعوة=1 → بعد كل تحميل يجب دعوة صديق.\n"
-        "• مجاني=3، لكل دعوة=3 → بعد كل 3 تحميلات يجب دعوة صديق.\n\n"
         "اضبط الخيارات بالأزرار بالأسفل:"
     )
     try:
@@ -6386,6 +6425,39 @@ async def handle_invite_gate_actions(client, callback_query):
         await show_invite_gate_panel(client, callback_query)
         return
 
+    if action == 'mode':
+        new_mode = 'period' if subdb.get_invite_gate_mode() == 'count' else 'count'
+        subdb.set_invite_gate_mode(new_mode)
+        await callback_query.answer(
+            "⏳ النمط الآن: فترة زمنية" if new_mode == 'period' else "🔢 النمط الآن: عدد التحميلات"
+        )
+        await show_invite_gate_panel(client, callback_query)
+        return
+
+    if action == 'resetall':
+        subdb.set_invite_gate_reset_now()
+        await callback_query.answer("🔔 تم — على كل عضو عمل دعوة جديدة الآن", show_alert=True)
+        await show_invite_gate_panel(
+            client, callback_query,
+            notice="🔔 تم إرسال طلب عام: على كل عضو عمل دعوة جديدة ليكمل التحميل.")
+        return
+
+    if action == 'resetclear':
+        subdb.clear_invite_gate_reset()
+        await callback_query.answer("✖️ تم إلغاء الطلب العام")
+        await show_invite_gate_panel(client, callback_query, notice="✖️ أُلغي الطلب العام للدعوة.")
+        return
+
+    if action == 'period':
+        await callback_query.message.edit_text(
+            "⏳ **تتكرر الدعوة كل كم يوم؟**\n\n"
+            f"القيمة الحالية: {subdb.get_invite_gate_period_days()} يوم\n\n"
+            "اختر الفترة التي يجب على العضو خلالها عمل دعوة ناجحة جديدة ليستمر بالتحميل:",
+            reply_markup=_ig_presets_kb('period', [1, 3, 7, 14, 30])
+        )
+        await callback_query.answer()
+        return
+
     if action == 'back':
         pending_downloads.pop(user_id, None)
         await show_invite_gate_panel(client, callback_query)
@@ -6413,16 +6485,22 @@ async def handle_invite_gate_actions(client, callback_query):
         await callback_query.answer()
         return
 
-    if action.startswith('setfree_') or action.startswith('setper_'):
-        kind = 'free' if action.startswith('setfree_') else 'per'
+    if action.startswith(('setfree_', 'setper_', 'setperiod_')):
+        if action.startswith('setfree_'):
+            kind = 'free'
+        elif action.startswith('setperiod_'):
+            kind = 'period'
+        else:
+            kind = 'per'
         value = action.split('_', 1)[1]
         if value == 'manual':
             pending_downloads[user_id] = {'waiting_for': f'invite_gate_{kind}'}
-            await callback_query.message.edit_text(
-                ("🎬 **التحميلات المجانية**\n\nأرسل رقماً صحيحاً (0 أو أكثر)."
-                 if kind == 'free' else
-                 "👥 **تحميلات لكل دعوة**\n\nأرسل رقماً صحيحاً (1 أو أكثر).")
-            )
+            prompts = {
+                'free': "🎬 **التحميلات المجانية**\n\nأرسل رقماً صحيحاً (0 أو أكثر).",
+                'per': "👥 **تحميلات لكل دعوة**\n\nأرسل رقماً صحيحاً (1 أو أكثر).",
+                'period': "⏳ **فترة تكرار الدعوة**\n\nأرسل عدد الأيام (1 أو أكثر).",
+            }
+            await callback_query.message.edit_text(prompts[kind])
             await callback_query.answer()
             return
         try:
@@ -6434,6 +6512,10 @@ async def handle_invite_gate_actions(client, callback_query):
             subdb.set_invite_gate_free(n)
             await show_invite_gate_panel(
                 client, callback_query, notice=f"✅ التحميلات المجانية الآن: {subdb.get_invite_gate_free()}")
+        elif kind == 'period':
+            subdb.set_invite_gate_period_days(n)
+            await show_invite_gate_panel(
+                client, callback_query, notice=f"✅ تتكرر الدعوة كل: {subdb.get_invite_gate_period_days()} يوم")
         else:
             subdb.set_invite_gate_per_invite(n)
             await show_invite_gate_panel(
@@ -7636,7 +7718,7 @@ async def handle_admin_input(client, message):
             )
             del pending_downloads[user_id]
 
-        elif waiting_for in ('invite_gate_free', 'invite_gate_per'):
+        elif waiting_for in ('invite_gate_free', 'invite_gate_per', 'invite_gate_period'):
             try:
                 n = int(message.text.strip())
             except ValueError:
@@ -7650,6 +7732,15 @@ async def handle_admin_input(client, message):
                 await message.reply_text(
                     "✅ **تم تحديث بوابة الدعوة**\n\n"
                     f"التحميلات المجانية قبل أول دعوة: {subdb.get_invite_gate_free()}"
+                )
+            elif waiting_for == 'invite_gate_period':
+                if n < 1:
+                    await message.reply_text("❌ يجب أن يكون عدد الأيام 1 أو أكثر.")
+                    return
+                subdb.set_invite_gate_period_days(n)
+                await message.reply_text(
+                    "✅ **تم تحديث بوابة الدعوة**\n\n"
+                    f"تتكرر الدعوة كل: {subdb.get_invite_gate_period_days()} يوم"
                 )
             else:
                 if n < 1:
