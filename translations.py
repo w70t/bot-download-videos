@@ -53,6 +53,8 @@ TRANSLATIONS = {
         # السجل والإحصائيات والدعوات - History / Stats / Referral
         'btn_my_downloads': '📥 تحميلاتي',
         'btn_invite': '🎁 ادعُ أصدقاءك',
+        'btn_share_invite': '📤 مشاركة الرابط',
+        'invite_share_text': '🎬 حمّل فيديوهاتك المفضّلة من يوتيوب وتيك توك وإنستغرام وفيسبوك وغيرها مجاناً عبر هذا البوت 👇',
         'history_title': '📥 **آخر تحميلاتك:**',
         'history_tap_hint': '👇 اضغط أي فيديو لإعادة إرساله فوراً',
         'history_empty': '📭 لا توجد تحميلات سابقة بعد.',
@@ -233,6 +235,8 @@ TRANSLATIONS = {
         # History / Stats / Referral
         'btn_my_downloads': '📥 My Downloads',
         'btn_invite': '🎁 Invite Friends',
+        'btn_share_invite': '📤 Share Link',
+        'invite_share_text': '🎬 Download your favorite videos from YouTube, TikTok, Instagram, Facebook and more — free — via this bot 👇',
         'history_title': '📥 **Your recent downloads:**',
         'history_tap_hint': '👇 Tap any video to resend it instantly',
         'history_empty': '📭 No downloads yet.',

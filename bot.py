@@ -3454,6 +3454,22 @@ def _invite_button(lang):
     return InlineKeyboardButton(t('btn_invite', lang), callback_data="show_invite")
 
 
+async def _invite_link_for(user_id):
+    """رابط دعوة المستخدم (أو None إذا تعذّر جلب اسم البوت)."""
+    uname = await _get_bot_username(app)
+    return f"https://t.me/{uname}?start=ref_{user_id}" if uname else None
+
+
+def _share_invite_button(link, lang):
+    """زر «مشاركة» يفتح نافذة تيليجرام لاختيار الأصدقاء/القروبات وإرسال الرابط
+    مباشرة (بدل نسخه يدوياً) عبر رابط t.me/share/url القياسي."""
+    from urllib.parse import quote
+    share_text = t('invite_share_text', lang)
+    url = (f"https://t.me/share/url?url={quote(link, safe='')}"
+           f"&text={quote(share_text, safe='')}")
+    return InlineKeyboardButton(t('btn_share_invite', lang), url=url)
+
+
 def _invite_gate_active_for(user_id) -> bool:
     """هل تنطبق بوابة الدعوة الإجبارية على هذا المستخدم؟
 
@@ -3501,12 +3517,14 @@ async def _invite_gate_blocked(status, user_id, lang) -> bool:
     if not st['blocked']:
         return False
     text = await _build_invite_gate_text(user_id, lang, st)
-    keyboard = InlineKeyboardMarkup([
-        [_invite_button(lang)],
-        [InlineKeyboardButton(t('subscribe_now', lang), callback_data="show_plans")],
-    ])
+    link = await _invite_link_for(user_id)
+    buttons = []
+    if link:
+        buttons.append([_share_invite_button(link, lang)])  # مشاركة مباشرة للأصدقاء/القروبات
+    buttons.append([_invite_button(lang)])
+    buttons.append([InlineKeyboardButton(t('subscribe_now', lang), callback_data="show_plans")])
     try:
-        await status.edit_text(text, reply_markup=keyboard)
+        await status.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
     except Exception:
         pass
     return True
@@ -3927,12 +3945,14 @@ async def handle_show_invite(client, callback_query):
     user_id = callback_query.from_user.id
     lang = subdb.get_user_language(user_id)
     text = await _build_invite_text(client, user_id, lang)
-    if text:
-        await callback_query.message.reply_text(text)
-    else:
+    if not text:
         await callback_query.message.reply_text(
             t('error_occurred', lang, error="bot username unavailable")
         )
+        return
+    link = await _invite_link_for(user_id)
+    kb = InlineKeyboardMarkup([[_share_invite_button(link, lang)]]) if link else None
+    await callback_query.message.reply_text(text, reply_markup=kb)
 
 
 @app.on_message(filters.command("history"))
@@ -4283,9 +4303,14 @@ async def handle_feature_buttons(client, message):
         )
     else:
         txt = await _build_invite_text(client, message.from_user.id, lang)
-        await message.reply_text(
-            txt or t('error_occurred', lang, error="bot username unavailable")
-        )
+        if not txt:
+            await message.reply_text(
+                t('error_occurred', lang, error="bot username unavailable")
+            )
+        else:
+            link = await _invite_link_for(message.from_user.id)
+            kb = InlineKeyboardMarkup([[_share_invite_button(link, lang)]]) if link else None
+            await message.reply_text(txt, reply_markup=kb)
 
 
 @app.on_message(filters.command("start"))
