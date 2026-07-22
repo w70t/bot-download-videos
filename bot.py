@@ -3520,8 +3520,12 @@ async def _invite_gate_blocked(status, user_id, lang) -> bool:
     link = await _invite_link_for(user_id)
     buttons = []
     if link:
-        buttons.append([_share_invite_button(link, lang)])  # مشاركة مباشرة للأصدقاء/القروبات
-    buttons.append([_invite_button(lang)])
+        # النص أصلاً يعرض الرابط؛ يكفي زر المشاركة المباشر (بلا زر «ادعُ أصدقاءك»
+        # المكرَّر الذي يعيد فتح نفس الرابط ونفس زر المشاركة)
+        buttons.append([_share_invite_button(link, lang)])
+    else:
+        # تعذّر بناء رابط المشاركة → نعرض زر الدعوة العادي كبديل
+        buttons.append([_invite_button(lang)])
     buttons.append([InlineKeyboardButton(t('subscribe_now', lang), callback_data="show_plans")])
     try:
         await status.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons))
