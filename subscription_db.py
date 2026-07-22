@@ -85,6 +85,7 @@ def init_db():
     _ensure_history_table()
     _ensure_referrals_table()
     _ensure_bonus_column()
+    _ensure_total_downloads_column()
     _ensure_moderation_table()
     _ensure_survey_table()
     _ensure_questions_tables()
@@ -241,6 +242,77 @@ def get_referral_minutes() -> int:
 def set_referral_minutes(minutes: int):
     """تحديد عدد الدقائق الممنوحة لحدّ المدة مقابل كل دعوة ناجحة."""
     set_setting('referral_minutes', str(minutes))
+
+# ── بوابة الدعوة الإجبارية (Mandatory invite gate) ──
+# عند تفعيلها: لكل مستخدم غير مشترك عدد تحميلات مجاني، وبعد استنفاده يجب أن
+# يدعو أصدقاءه عبر رابطه لفتح المزيد. لا يُفتح له إلا بانضمام صديق فعلي (يُتحقق
+# تلقائياً عبر جدول الدعوات) فلا يمكن الالتفاف على الشرط.
+
+def is_invite_gate_enabled() -> bool:
+    """هل بوابة الدعوة الإجبارية مفعّلة؟ (يديرها الأدمن؛ الافتراضي متوقفة)."""
+    return get_setting('invite_gate_enabled', '0') == '1'
+
+def set_invite_gate_enabled(enabled: bool):
+    """تفعيل/إيقاف بوابة الدعوة الإجبارية."""
+    set_setting('invite_gate_enabled', '1' if enabled else '0')
+
+def get_invite_gate_free() -> int:
+    """عدد التحميلات المجانية المسموحة قبل أن تُطلب أول دعوة (≥ 0)."""
+    try:
+        return max(0, int(get_setting('invite_gate_free', '1')))
+    except (TypeError, ValueError):
+        return 1
+
+def set_invite_gate_free(n: int):
+    """تحديد عدد التحميلات المجانية قبل أول دعوة مطلوبة."""
+    set_setting('invite_gate_free', str(max(0, int(n))))
+
+def get_invite_gate_per_invite() -> int:
+    """عدد التحميلات التي تُفتح مقابل كل دعوة ناجحة (≥ 1)."""
+    try:
+        return max(1, int(get_setting('invite_gate_per_invite', '1')))
+    except (TypeError, ValueError):
+        return 1
+
+def set_invite_gate_per_invite(n: int):
+    """تحديد عدد التحميلات المُتاحة مقابل كل دعوة ناجحة."""
+    set_setting('invite_gate_per_invite', str(max(1, int(n))))
+
+def get_invite_gate_mode() -> str:
+    """نمط بوابة الدعوة: 'count' (حسب عدد التحميلات) أو 'period' (حسب الفترة الزمنية)."""
+    m = get_setting('invite_gate_mode', 'count')
+    return m if m in ('count', 'period') else 'count'
+
+def set_invite_gate_mode(mode: str):
+    """تحديد نمط بوابة الدعوة ('count' أو 'period')."""
+    set_setting('invite_gate_mode', 'period' if mode == 'period' else 'count')
+
+def get_invite_gate_period_days() -> int:
+    """طول الفترة (بالأيام) في النمط الزمني: تُطلب دعوة جديدة كل هذه المدة (≥ 1)."""
+    try:
+        return max(1, int(get_setting('invite_gate_period_days', '3')))
+    except (TypeError, ValueError):
+        return 3
+
+def set_invite_gate_period_days(days: int):
+    """تحديد طول الفترة الزمنية (بالأيام) لطلب دعوة جديدة."""
+    set_setting('invite_gate_period_days', str(max(1, int(days))))
+
+def get_invite_gate_reset_at() -> float:
+    """لحظة «اطلب دعوة من الجميع الآن» (epoch seconds)؛ 0 = لا يوجد طلب عام حالي."""
+    try:
+        return float(get_setting('invite_gate_reset_at', '0') or '0')
+    except (TypeError, ValueError):
+        return 0.0
+
+def set_invite_gate_reset_now():
+    """يضبط لحظة إعادة تعيين عامة: على كل عضو عمل دعوة جديدة بعد الآن ليكمل."""
+    import time as _time
+    set_setting('invite_gate_reset_at', str(_time.time()))
+
+def clear_invite_gate_reset():
+    """يلغي الطلب العام للدعوة (يعود للسلوك المعتاد للنمط الحالي)."""
+    set_setting('invite_gate_reset_at', '0')
 
 # ═══════════════════════════════════════════════════════════════
 # دوال الاشتراك الإجباري بالقنوات
@@ -849,6 +921,109 @@ def _ensure_bonus_column():
         )
 
 
+def _ensure_total_downloads_column():
+    """يضيف عمود إجمالي التحميلات (عدّاد تراكمي لبوابة الدعوة) إن لم يكن موجوداً."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute(
+            'ALTER TABLE users ADD COLUMN IF NOT EXISTS total_downloads INTEGER DEFAULT 0'
+        )
+
+
+def increment_total_downloads(user_id):
+    """يزيد العدّاد التراكمي لتحميلات المستخدم (يُستخدم في بوابة الدعوة)."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            INSERT INTO users (user_id, total_downloads)
+            VALUES (%s, 1)
+            ON CONFLICT (user_id) DO UPDATE SET
+                total_downloads = COALESCE(users.total_downloads, 0) + 1
+        ''', (user_id,))
+
+
+def get_total_downloads(user_id) -> int:
+    """إجمالي تحميلات المستخدم التراكمية."""
+    with db_cursor() as cursor:
+        cursor.execute('SELECT COALESCE(total_downloads, 0) FROM users WHERE user_id = %s',
+                       (user_id,))
+        row = cursor.fetchone()
+    return row[0] if row else 0
+
+
+def invite_gate_status(user_id) -> dict:
+    """حالة بوابة الدعوة لمستخدم غير مشترك، بحسب النمط الحالي.
+
+    النمط 'count' (حسب عدد التحميلات):
+      allowed  = المجاني + (عدد دعواته الناجحة × التحميلات لكل دعوة)
+      blocked  = استنفد رصيده (consumed ≥ allowed) → يجب أن يدعو ليكمل
+
+    النمط 'period' (حسب الفترة الزمنية):
+      blocked  = لم يعمل أي دعوة ناجحة خلال آخر (period_days) يوم → يجب دعوة جديدة
+      (مع مهلة ترحيب للعضو الجديد قدر «المجاني» قبل أول دعوة مطلوبة)
+
+    الطلب العام (reset): إذا ضغط الأدمن «اطلب دعوة من الجميع الآن» يجب على كل
+    عضو سبق له التحميل أن يعمل دعوة جديدة بعد تلك اللحظة (يعمل في كِلا النمطين).
+    """
+    import time as _time
+    now = _time.time()
+    free = get_invite_gate_free()
+    consumed = get_total_downloads(user_id)
+    invites = get_referral_count(user_id)
+    reset_at = get_invite_gate_reset_at()
+
+    # طلب عام معلّق: يشمل فقط من سبق له التحميل (العضو الجديد يُترك لمسار العادة)
+    reset_pending = (
+        reset_at > 0 and consumed > 0
+        and count_referrals_since(user_id, reset_at) == 0
+    )
+
+    mode = get_invite_gate_mode()
+
+    if mode == 'period':
+        period_days = get_invite_gate_period_days()
+        # مهلة ترحيب للعضو الجديد قبل أول دعوة مطلوبة (ما لم يكن هناك طلب عام)
+        if consumed < free and not reset_pending:
+            blocked = False
+        else:
+            since = max(now - period_days * 86400, reset_at)
+            blocked = count_referrals_since(user_id, since) == 0
+        return {
+            'mode': 'period',
+            'blocked': blocked,
+            'needed': 1 if blocked else 0,
+            'consumed': consumed,
+            'invites': invites,
+            'per': 1,
+            'free': free,
+            'period_days': period_days,
+            'reset_pending': reset_pending,
+            'remaining': 0,
+        }
+
+    # النمط الافتراضي: حسب عدد التحميلات
+    per = get_invite_gate_per_invite()
+    allowed = free + invites * per
+    blocked_count = consumed >= allowed
+    blocked = blocked_count or reset_pending
+    if blocked_count:
+        needed = (consumed - allowed) // per + 1
+    elif reset_pending:
+        needed = 1
+    else:
+        needed = 0
+    return {
+        'mode': 'count',
+        'blocked': blocked,
+        'allowed': allowed,
+        'consumed': consumed,
+        'remaining': max(0, allowed - consumed),
+        'invites': invites,
+        'needed': needed,
+        'per': per,
+        'free': free,
+        'reset_pending': reset_pending,
+    }
+
+
 def record_referral(referred_user_id, referrer_user_id) -> bool:
     """يسجّل دعوة جديدة. يرجع True إذا كانت دعوة جديدة فعلاً (تُمنح المكافأة مرة)."""
     if int(referred_user_id) == int(referrer_user_id):
@@ -870,6 +1045,23 @@ def get_referral_count(referrer_user_id) -> int:
         cursor.execute(
             'SELECT COUNT(*) FROM referrals WHERE referrer_user_id = %s',
             (referrer_user_id,)
+        )
+        return cursor.fetchone()[0]
+
+
+def count_referrals_since(referrer_user_id, since_epoch) -> int:
+    """عدد دعوات هذا المستخدم الناجحة بعد لحظة زمنية معيّنة (epoch seconds).
+
+    يُستخدم في بوابة الدعوة الزمنية وفي الطلب العام: التحقّق أنّ المستخدم عمل
+    دعوة حقيقية جديدة بعد بداية الفترة/لحظة الطلب (يعتمد على created_at الفعلي)."""
+    try:
+        since_dt = datetime.fromtimestamp(float(since_epoch or 0))
+    except (TypeError, ValueError, OSError, OverflowError):
+        since_dt = datetime.fromtimestamp(0)
+    with db_cursor() as cursor:
+        cursor.execute(
+            'SELECT COUNT(*) FROM referrals WHERE referrer_user_id = %s AND created_at > %s',
+            (referrer_user_id, since_dt)
         )
         return cursor.fetchone()[0]
 
