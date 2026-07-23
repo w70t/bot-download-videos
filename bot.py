@@ -4145,7 +4145,7 @@ async def run_realusers_check(client, message):
             f"🟢 دخلوا اليوم (آخر 24 ساعة): **{joined}**\n"
             f"🔴 خرجوا/حظروا (حُذفوا الآن): **{removed}**\n"
             f"⚖️ صافي التغيّر: **{net_txt}**\n\n"
-            "━━━━━━━━━━━━━━━━━━\n"
+            "──────────────────\n"
             f"👥 قبل الفحص: **{total_before}**\n"
             f"✅ العدد الحقيقي الآن: **{alive}**"
         )
@@ -4845,7 +4845,7 @@ async def daily_cleanup_task():
                 f"🟢 دخلوا اليوم (آخر 24 ساعة): **{joined}**\n"
                 f"🔴 خرجوا/حظروا: **{removed}**\n"
                 f"⚖️ صافي التغيّر: **{net_txt}**\n\n"
-                "━━━━━━━━━━━━━━━━━━\n"
+                "──────────────────\n"
                 f"👥 قبل الفحص: **{total_before}**\n"
                 f"✅ العدد الحقيقي الآن: **{alive}**"
             )
@@ -5767,7 +5767,7 @@ async def show_subscription_screen(client, message, user_id, title, duration, ma
         t('subscription_required', lang, title=title, duration=duration_minutes, max_duration=max_minutes) +
         "\n\n" +
         t('unlock_by_invite', lang, minutes=subdb.get_referral_minutes()) +
-        "\n\n━━━━━━━━━━━━━━━━\n\n" +
+        "\n\n─────────────────────\n\n" +
         t('subscription_benefits', lang) +
         "\n\n" +
         t('choose_plan', lang)
@@ -7093,7 +7093,7 @@ async def handle_subscription_settings(client, callback_query):
             username_str = f"@{username}" if username else "لا يوجد"
             name = first_name or "مستخدم"
             
-            text += f"━━━━━━━━━━━━━━\n"
+            text += f"──────────────\n"
             text += f"🔖 **#{payment_id}**\n"
             text += f"👤 {name} ({username_str})\n"
             text += f"💰 ${amount} | 💳 {method}\n\n"
@@ -7122,7 +7122,7 @@ async def handle_subscription_settings(client, callback_query):
 
         # عرض بعض المشتركين مع الأيام المتبقية (الاسم قابل للضغط)
         if stats['subscribed'] > 0:
-            text += "━━━━━━━━━━━━━━━━\n"
+            text += "──────────────────\n"
             text += "<b>المشتركون الحاليون:</b>\n\n"
 
             count = 0
