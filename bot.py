@@ -810,6 +810,105 @@ async def _substack_video_fallback(url: str):
         return None
 
 
+# ═══════════════════════════════════════════════════════════════
+# 👻 سناب شات: النسخة النظيفة (بلا لوقو) عبر خدمة الوسائط الداخلية
+# سناب يقدّم نسختين من الـSnap نفسه:
+#   • نسخة صفحة الويب (وسم og:video وما يلتقطه yt-dlp بالمستخرج العام):
+#     علامة سناب مطبوعة داخل إطارات الفيديو نفسه — لا يمكن نزعها بعد التنزيل.
+#   • نسخة خدمة الوسائط الداخلية (التي يستهلكها التطبيق/خريطة سناب): الوسائط
+#     الخام، الفيديو في mediaUrl والتعليقات/الملصقات في overlayUrl ملفاً
+#     منفصلاً — فلا شيء مطبوع فوق الصورة.
+# الخدمة عامة: بلا كوكيز ولا تسجيل دخول. يُستخرج معرّف السناب (59 محرفاً من
+# أبجدية base64-url، وهو نفسه الظاهر في رابط السبوت لايت) ثم يُرسل
+# POST {"snapIds": ["<id>"]} فيعود عنصر الوسائط.
+# عند أي فشل (رد فارغ، تغيير من سناب، رابط ليس سناباً مفرداً، عنصر صورة لا
+# فيديو) يعود المسار تلقائياً لسلوك og:video السابق، فلا ينكسر أي تحميل يعمل
+# اليوم. للتشخيص السريع من تيليجرام: أمر الأدمن /snaptest.
+# متغيّرات البيئة (اختيارية):
+#   SNAPCHAT_CLEAN_MEDIA=0       → تعطيل المسار والاكتفاء بالسلوك السابق
+#   SNAPCHAT_MEDIA_SERVICE=<url> → تغيير عنوان الخدمة إن غيّره سناب
+# ═══════════════════════════════════════════════════════════════
+SNAPCHAT_MEDIA_SERVICE = os.getenv(
+    'SNAPCHAT_MEDIA_SERVICE', 'https://ms.sc-jpl.com/web/getStoryElements')
+SNAPCHAT_CLEAN_MEDIA = os.getenv(
+    'SNAPCHAT_CLEAN_MEDIA', '1').strip().lower() not in ('0', 'false', 'no', 'off')
+
+# معرّف السناب داخل الرابط: 59 محرفاً من أبجدية base64-url
+_SNAP_ID_PATTERN = r'[A-Za-z0-9_-]{59}'
+
+_SNAP_UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+            '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+
+
+def _snapchat_snap_id(url: str, timeout: int = 15):
+    """يستخرج معرّف السناب من الرابط، بعد توسيع روابط المشاركة المختصرة
+    (snapchat.com/t/... و t.snapchat.com) لأن المعرّف لا يظهر فيها.
+    يعيد None لغير روابط السناب المفردة (بروفايل/صفحة عامة)."""
+    import re
+    import urllib.request
+    low = (url or '').lower()
+    if 'snapchat.com/t/' in low or 't.snapchat.com' in low:
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': _SNAP_UA})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                url = resp.geturl() or url
+        except Exception as e:
+            logger.warning(f"⚠️ تعذّر توسيع رابط سناب المختصر: {e}")
+    m = re.search(_SNAP_ID_PATTERN, url or '')
+    return m.group(0) if m else None
+
+
+def _snapchat_clean_media(url: str, timeout: int = 20):
+    """يعيد رابط فيديو السناب الخام (بلا لوقو مطبوع) من خدمة الوسائط الداخلية،
+    أو None عند أي فشل — فيُكمل المستدعي بمسار نسخة الويب السابق.
+    طلب شبكي متزامن: يُنفَّذ داخل executor لا في حلقة الأحداث."""
+    import json
+    import urllib.request
+    if not SNAPCHAT_CLEAN_MEDIA or 'snapchat.com' not in (url or '').lower():
+        return None
+    snap_id = _snapchat_snap_id(url, timeout=min(timeout, 15))
+    if not snap_id:
+        return None
+    body = json.dumps({'snapIds': [snap_id]}).encode('utf-8')
+    req = urllib.request.Request(SNAPCHAT_MEDIA_SERVICE, data=body, headers={
+        'User-Agent': _SNAP_UA,
+        'Content-Type': 'application/json',
+        'Accept': '*/*',
+        'Accept-Language': 'en-US',
+        # الأصل/المرجع كما ترسلهما واجهة سناب على الويب
+        'Origin': 'https://map.snapchat.com',
+        'Referer': 'https://map.snapchat.com/',
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read(4_000_000).decode('utf-8', 'ignore'))
+    except Exception as e:
+        logger.warning(f"⚠️ تعذّر جلب وسائط سناب النظيفة ({snap_id[:12]}…): {e}")
+        return None
+    elements = (payload or {}).get('elements') or []
+    if not elements or not isinstance(elements[0], dict):
+        logger.info(f"ℹ️ خدمة وسائط سناب بلا عناصر لـ {snap_id[:12]}… — "
+                    f"نعود لنسخة الويب")
+        return None
+    snap_info = elements[0].get('snapInfo') or {}
+    info = snap_info.get('streamingMediaInfo') or {}
+    media = info.get('mediaUrl') or ''
+    # رابط نسبي (media.mp4) يُسبق ببادئة المسار، والمطلق يُستخدم كما هو
+    if media and not media.lower().startswith(('http://', 'https://')):
+        media = (info.get('prefixUrl') or '') + media
+    if not media.lower().startswith(('http://', 'https://')) or not is_safe_url(media):
+        logger.info("ℹ️ رد خدمة وسائط سناب بلا mediaUrl صالح — نعود لنسخة الويب")
+        return None
+    # عنصر صورة لا فيديو: يبقى لمساره السابق (البوت يعالج الصور بطريق آخر)
+    media_type = str(snap_info.get('snapMediaType') or '').upper()
+    if 'IMAGE' in media_type and not media.split('?', 1)[0].lower().endswith(
+            ('.mp4', '.mov', '.webm')):
+        logger.info("ℹ️ سناب: العنصر صورة لا فيديو — نعود للمسار السابق")
+        return None
+    logger.info(f"👻 سناب: نسخة نظيفة بلا لوقو ({media[:80]})")
+    return media
+
+
 async def get_video_info(url: str):
     """استخراج معلومات الفيديو"""
     _last_info_error.set(None)
@@ -4491,6 +4590,52 @@ async def cmd_uncache(client, message):
         await message.reply_text("ℹ️ هذا الرابط غير موجود في الكاش أصلاً.")
 
 
+@app.on_message(filters.command("snaptest"))
+async def cmd_snaptest(client, message):
+    """أمر أدمن: فحص مساري سناب شات على رابط واحد ومقارنة نتيجتيهما.
+
+    الاستخدام: /snaptest <رابط سناب>
+    يعرض معرّف السناب، ورابط النسخة النظيفة من خدمة الوسائط الداخلية (بلا لوقو
+    مطبوع)، ورابط نسخة الويب (og:video، باللوقو) — لتشخيص أي تغيير يجريه سناب
+    من تيليجرام مباشرة دون الدخول على الخادم وقراءة السجل."""
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    parts = (message.text or '').split(maxsplit=1)
+    url = extract_first_url(parts[1] if len(parts) > 1 else '')
+    if not url or 'snapchat.com' not in url.lower():
+        await message.reply_text("الاستخدام: `/snaptest <رابط سناب>`")
+        return
+    if not is_safe_url(url):
+        await message.reply_text("🚫 رابط غير صالح.")
+        return
+    status = await message.reply_text("🔍 جارٍ فحص مساري سناب…")
+    loop = asyncio.get_event_loop()
+    snap_id = await loop.run_in_executor(None, _snapchat_snap_id, url)
+    clean = await loop.run_in_executor(None, _snapchat_clean_media, url)
+    web = await loop.run_in_executor(None, resolve_snapchat_spotlight, url)
+
+    lines = ["👻 **فحص مساري سناب شات**", ""]
+    lines.append(f"**المعرّف:** `{snap_id}`" if snap_id
+                 else "**المعرّف:** ❌ لم يُستخرج (ليس رابط سناب مفرد؟)")
+    lines.append("")
+    if not SNAPCHAT_CLEAN_MEDIA:
+        lines.append("⏸️ **النظيف:** معطّل بـ `SNAPCHAT_CLEAN_MEDIA=0`")
+    elif clean:
+        lines.append(f"✅ **النظيف** (خدمة الوسائط، بلا لوقو):\n`{clean[:250]}`")
+    else:
+        lines.append("❌ **النظيف:** لم تُرجع الخدمة وسائط — التفصيل في "
+                     "`bot_standalone.log`")
+    lines.append("")
+    if web and web != url:
+        lines.append(f"🌐 **نسخة الويب** (باللوقو المطبوع):\n`{web[:250]}`")
+    else:
+        lines.append("🌐 **نسخة الويب:** لا og:video في الصفحة")
+    lines.append("")
+    lines.append("**النتيجة:** " + ("سيرسل البوت النسخة النظيفة." if clean
+                 else "سيعود البوت لنسخة الويب (فيها لوقو)."))
+    await status.edit_text("\n".join(lines), disable_web_page_preview=True)
+
+
 # معالج الأزرار السريعة
 @app.on_message(filters.text & filters.regex(r'^(🍪 Cookies|📊 التقرير اليومي|📊 Daily Report|🩺 فحص الصحّة|🩺 Health Check|💎 إعدادات الاشتراك|💎 Subscription Settings|📁 نسخ احتياطي|🔄 تحديث yt-dlp|🔄 Update yt-dlp)$'))
 async def handle_quick_buttons(client, message):
@@ -5431,13 +5576,20 @@ async def handle_url(client, message):
         await message.reply_text(t('invalid_url', lang))
         return
 
-    # 🎯 سناب سبوت لايت: استخرج الفيديو الخام (أنظف نسخة، غالباً بلا لوقو) قبل
-    #    التحميل. طلب شبكي متزامن فيُنفَّذ خارج حلقة الأحداث. عند الفشل يبقى الرابط.
+    # 🎯 سناب شات: جرّب أولاً النسخة النظيفة من خدمة الوسائط الداخلية (بلا لوقو
+    #    مطبوع)، وإن تعذّرت فالسلوك السابق: الفيديو الخام من صفحة الويب
+    #    (og:video). كلاهما طلب شبكي متزامن يُنفَّذ خارج حلقة الأحداث، وعند فشل
+    #    الاثنين يبقى الرابط كما هو ليتولّاه yt-dlp.
     if 'snapchat.com' in url.lower():
-        _resolved = await asyncio.get_event_loop().run_in_executor(
-            None, resolve_snapchat_spotlight, url)
-        if _resolved and _resolved != url:
-            url = _resolved
+        _loop = asyncio.get_event_loop()
+        _clean = await _loop.run_in_executor(None, _snapchat_clean_media, url)
+        if _clean:
+            url = _clean
+        else:
+            _resolved = await _loop.run_in_executor(
+                None, resolve_snapchat_spotlight, url)
+            if _resolved and _resolved != url:
+                url = _resolved
 
     # 🎵 روابط الأغاني (Shazam/Apple Music/Spotify) لا تُحمّل مباشرة →
     #    استخرج اسم الأغنية وابحث عنها في يوتيوب، ثم أكمل التحميل على رابط يوتيوب.
