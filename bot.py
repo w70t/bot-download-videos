@@ -909,6 +909,77 @@ def _snapchat_clean_media(url: str, timeout: int = 20):
     return media
 
 
+# ── فاحصان تشخيصيان لسناب (لأمر /snaptest فقط، لا يمسّان مسار التحميل) ──
+# الغرض: معرفة ما تحويه صفحة سناب فعلاً وما ترد به خدمة الوسائط، من تيليجرام
+# مباشرة، بدل تخمين البنية أو الدخول على الخادم لقراءة السجل.
+
+# علامات تدل على مكان الوسائط داخل الصفحة (نُبلغ عن الموجود منها فقط)
+_SNAP_PAGE_MARKERS = (
+    '__NEXT_DATA__', 'og:video', 'contentUrl', 'videoMetadata', 'snapUrls',
+    'mediaUrl', 'overlayUrl', 'streamingMediaInfo', 'sc-cdn.net', 'bolt-gcdn',
+)
+
+
+def _snapchat_service_probe(snap_id: str, timeout: int = 20):
+    """يستعلم خدمة الوسائط الداخلية ويعيد وصفاً نصياً لردّها (كود الحالة،
+    مفاتيح الرد، عدد العناصر) — للتشخيص لا للتحميل."""
+    import json
+    import urllib.request
+    body = json.dumps({'snapIds': [snap_id]}).encode('utf-8')
+    req = urllib.request.Request(SNAPCHAT_MEDIA_SERVICE, data=body, headers={
+        'User-Agent': _SNAP_UA,
+        'Content-Type': 'application/json',
+        'Accept': '*/*',
+        'Origin': 'https://map.snapchat.com',
+        'Referer': 'https://map.snapchat.com/',
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            code = resp.status
+            raw = resp.read(2_000_000).decode('utf-8', 'ignore')
+    except Exception as e:
+        code = getattr(e, 'code', None)
+        return f"كود {code or '—'} | {type(e).__name__}: {str(e)[:60]}"
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return f"كود {code} | رد ليس JSON ({len(raw)} حرفاً)"
+    keys = list(payload.keys())[:6] if isinstance(payload, dict) else []
+    count = len((payload or {}).get('elements') or []) if isinstance(payload, dict) else 0
+    return f"كود {code} | مفاتيح: {keys or '—'} | عناصر: {count}"
+
+
+def _snapchat_page_probe(url: str, timeout: int = 25):
+    """يجلب صفحة سناب ويصف محتواها: كود الحالة، الحجم، أي علامات الوسائط
+    موجودة، وأول روابط mp4 فيها — لتشخيص من أين تأتي النسخة المعلَّمة."""
+    import re
+    import urllib.request
+    req = urllib.request.Request(url, headers={
+        'User-Agent': _SNAP_UA,
+        'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            code, final = resp.status, resp.geturl()
+            html_text = resp.read(3_000_000).decode('utf-8', 'ignore')
+    except Exception as e:
+        return {'code': getattr(e, 'code', None), 'error': f"{type(e).__name__}: {str(e)[:60]}"}
+    found = [m for m in _SNAP_PAGE_MARKERS if m in html_text]
+    missing = [m for m in _SNAP_PAGE_MARKERS if m not in html_text]
+    urls, seen = [], set()
+    # يقبل الشكلين: الرابط الصريح والمهرّب داخل JSON (https:\/\/…)
+    for m in re.finditer(r'https?:[^"\'\s<>]+?\.mp4[^"\'\s<>]*', html_text):
+        u = m.group(0).replace('\\/', '/')
+        if u not in seen:
+            seen.add(u)
+            urls.append(u)
+        if len(urls) >= 3:
+            break
+    return {'code': code, 'final': final, 'size': len(html_text),
+            'found': found, 'missing': missing, 'mp4': urls}
+
+
 async def get_video_info(url: str):
     """استخراج معلومات الفيديو"""
     _last_info_error.set(None)
@@ -4608,32 +4679,50 @@ async def cmd_snaptest(client, message):
     if not is_safe_url(url):
         await message.reply_text("🚫 رابط غير صالح.")
         return
-    status = await message.reply_text("🔍 جارٍ فحص مساري سناب…")
+    status = await message.reply_text("🔍 جارٍ فحص مسارات سناب…")
     loop = asyncio.get_event_loop()
     snap_id = await loop.run_in_executor(None, _snapchat_snap_id, url)
     clean = await loop.run_in_executor(None, _snapchat_clean_media, url)
     web = await loop.run_in_executor(None, resolve_snapchat_spotlight, url)
+    service = (await loop.run_in_executor(None, _snapchat_service_probe, snap_id)
+               if snap_id else '— (بلا معرّف)')
+    page = await loop.run_in_executor(None, _snapchat_page_probe, url)
 
-    lines = ["👻 **فحص مساري سناب شات**", ""]
+    lines = ["👻 **فحص مسارات سناب شات**", ""]
     lines.append(f"**المعرّف:** `{snap_id}`" if snap_id
                  else "**المعرّف:** ❌ لم يُستخرج (ليس رابط سناب مفرد؟)")
-    lines.append("")
+
+    lines.append("\n**① خدمة الوسائط الداخلية**")
+    lines.append(f"`{service}`")
     if not SNAPCHAT_CLEAN_MEDIA:
-        lines.append("⏸️ **النظيف:** معطّل بـ `SNAPCHAT_CLEAN_MEDIA=0`")
+        lines.append("⏸️ معطّلة بـ `SNAPCHAT_CLEAN_MEDIA=0`")
     elif clean:
-        lines.append(f"✅ **النظيف** (خدمة الوسائط، بلا لوقو):\n`{clean[:250]}`")
+        lines.append(f"✅ وسائط نظيفة:\n`{clean[:200]}`")
     else:
-        lines.append("❌ **النظيف:** لم تُرجع الخدمة وسائط — التفصيل في "
-                     "`bot_standalone.log`")
-    lines.append("")
-    if web and web != url:
-        lines.append(f"🌐 **نسخة الويب** (باللوقو المطبوع):\n`{web[:250]}`")
+        lines.append("❌ بلا وسائط صالحة")
+
+    lines.append("\n**② صفحة سناب**")
+    if page.get('error'):
+        lines.append(f"❌ تعذّر الجلب — كود {page.get('code') or '—'}: "
+                     f"`{page['error']}`")
     else:
-        lines.append("🌐 **نسخة الويب:** لا og:video في الصفحة")
-    lines.append("")
-    lines.append("**النتيجة:** " + ("سيرسل البوت النسخة النظيفة." if clean
-                 else "سيعود البوت لنسخة الويب (فيها لوقو)."))
-    await status.edit_text("\n".join(lines), disable_web_page_preview=True)
+        lines.append(f"كود {page['code']} | الحجم: {page['size'] // 1024} ك.ب")
+        lines.append(f"✓ موجود: `{', '.join(page['found']) or '—'}`")
+        lines.append(f"✗ غائب: `{', '.join(page['missing']) or '—'}`")
+        if page['mp4']:
+            lines.append(f"روابط mp4 ({len(page['mp4'])}):")
+            for i, u in enumerate(page['mp4'], 1):
+                lines.append(f"{i}. `{u[:170]}`")
+        else:
+            lines.append("لا روابط mp4 في نص الصفحة")
+
+    lines.append("\n**③ المسار القديم (og:video)**")
+    lines.append(f"`{web[:200]}`" if web and web != url else "❌ لم يُرجع رابطاً")
+
+    lines.append("\n**النتيجة:** " + (
+        "سيرسل البوت النسخة النظيفة." if clean else
+        "سيتولّى yt-dlp الرابط كما هو (النسخة المعلَّمة)."))
+    await status.edit_text("\n".join(lines)[:4000], disable_web_page_preview=True)
 
 
 # معالج الأزرار السريعة
