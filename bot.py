@@ -909,6 +909,159 @@ def _snapchat_clean_media(url: str, timeout: int = 20):
     return media
 
 
+# ═══════════════════════════════════════════════════════════════
+# 👻 سناب شات: مرشّحو الوسائط من صفحة السناب نفسها (‎__NEXT_DATA__‎)
+# فحص ميداني على روابط حقيقية أظهر أن صفحة السبوت لايت تحوي بنية الوسائط
+# كاملة: snapUrls و mediaUrl و overlayUrl و contentUrl — أي أن الفيديو الخام
+# وطبقة التعليقات ملفان منفصلان هنا أيضاً، بلا حاجة لأي خدمة خارجية.
+# وأظهر كذلك سبب فشل المسار القديم: روابط وسائط سناب **لا تنتهي بـ .mp4**
+# (شكلها https://cf-st.sc-cdn.net/d/<id>?mo=…&uc=…)، والمحوّل القديم يبحث عن
+# ‎\.mp4‎ حصراً فلا يجد شيئاً، فيسلّم الرابط لـ yt-dlp الذي يأخذ النسخة
+# المعلَّمة باللوقو.
+# لذلك نقرأ JSON الصفحة ونجمع مرشّحي الوسائط مرتّبين بالأولوية:
+#   mediaUrl (الخام) ← contentUrl (نسخة الويب) ← og:video
+# مع تجاهل الامتداد تماماً في المطابقة.
+# ═══════════════════════════════════════════════════════════════
+
+# مفاتيح الوسائط داخل JSON الصفحة، مرتّبة: الأنظف أولاً. (overlayUrl و
+# mediaPreviewUrl للعرض في التشخيص فقط — لا يُنزَّلان كفيديو)
+_SNAP_MEDIA_KEYS = ('mediaUrl', 'contentUrl', 'videoUrl')
+_SNAP_INFO_KEYS = ('overlayUrl', 'mediaPreviewUrl', 'thumbnailUrl')
+
+
+def _snap_json_blobs(html_text: str):
+    """يعيد نصوص JSON المضمّنة في الصفحة (‎__NEXT_DATA__‎ أولاً ثم أي وسم
+    application/json آخر)، لتُحلَّل بحثاً عن روابط الوسائط."""
+    import re
+    blobs = []
+    m = re.search(r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
+                  html_text, re.S)
+    if m:
+        blobs.append(m.group(1))
+    for mm in re.finditer(
+            r'<script[^>]+type=["\']application/(?:ld\+)?json["\'][^>]*>(.*?)</script>',
+            html_text, re.S):
+        blobs.append(mm.group(1))
+    return blobs
+
+
+def _snap_collect_urls(node, wanted, out, path='', depth=0):
+    """يمشي في شجرة JSON ويجمع (المسار، المفتاح، الرابط) لكل مفتاح مطلوب.
+    قيمة المفتاح قد تكون نصاً مباشراً أو كائناً على شكل {"value": "..."}."""
+    if depth > 12 or len(out) > 40:
+        return
+    if isinstance(node, dict):
+        for k, v in node.items():
+            p = f"{path}.{k}" if path else k
+            if k in wanted:
+                s = v if isinstance(v, str) else (
+                    v.get('value') if isinstance(v, dict) else None)
+                if isinstance(s, str) and s.startswith(('http://', 'https://')):
+                    out.append((p, k, s))
+            _snap_collect_urls(v, wanted, out, p, depth + 1)
+    elif isinstance(node, list):
+        for i, it in enumerate(node[:30]):
+            _snap_collect_urls(it, wanted, out, f"{path}[{i}]", depth + 1)
+
+
+def _snapchat_page_candidates(url: str, timeout: int = 25):
+    """يجلب صفحة السناب ويعيد (مرشّحو الفيديو، عناصر إعلامية، خطأ الجلب).
+
+    مرشّحو الفيديو: [(المفتاح، المسار، الرابط)] مرتّبة بالأولوية — mediaUrl
+    (الوسائط الخام بلا لوقو) ثم contentUrl (نسخة الويب) ثم og:video.
+    العناصر الإعلامية: overlayUrl والمعاينات — للتشخيص لا للتحميل."""
+    import json
+    import re
+    import urllib.request
+    req = urllib.request.Request(url, headers={
+        'User-Agent': _SNAP_UA,
+        'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            html_text = resp.read(3_000_000).decode('utf-8', 'ignore')
+    except Exception as e:
+        return [], [], f"{type(e).__name__}: {str(e)[:80]}"
+
+    found, info = [], []
+    for blob in _snap_json_blobs(html_text):
+        try:
+            data = json.loads(blob.strip())
+        except Exception:
+            continue
+        _snap_collect_urls(data, _SNAP_MEDIA_KEYS, found)
+        _snap_collect_urls(data, _SNAP_INFO_KEYS, info)
+
+    # og:video من الوسوم: احتياطي حين لا يُقرأ JSON (بلا اشتراط امتداد)
+    m = re.search(r'property=["\']og:video(?::secure_url)?["\'][^>]*'
+                  r'content=["\']([^"\']+)["\']', html_text)
+    if m:
+        # الشكل نفسه: (المسار، المفتاح، الرابط) — المسار هنا وسم لا مسار JSON
+        found.append(('meta', 'og:video', m.group(1).replace('&amp;', '&')))
+
+    # ترتيب بالأولوية مع إزالة التكرار (نُبقي أول ظهور لكل رابط)
+    rank = {k: i for i, k in enumerate(_SNAP_MEDIA_KEYS)}
+    rank['og:video'] = 80  # بعد مفاتيح JSON، وقبل أي مفتاح غير معروف
+    ordered, seen = [], set()
+    for path, key, u in sorted(found, key=lambda t: rank.get(t[1], 90)):
+        if u not in seen and is_safe_url(u):
+            seen.add(u)
+            ordered.append((key, path, u))
+    return ordered, info, None
+
+
+def _snapchat_page_media(url: str, timeout: int = 25):
+    """أفضل رابط فيديو من صفحة السناب (mediaUrl الخام أولاً)، أو None."""
+    if 'snapchat.com' not in (url or '').lower():
+        return None
+    try:
+        candidates, _info, err = _snapchat_page_candidates(url, timeout)
+    except Exception as e:
+        logger.warning(f"⚠️ تعذّر تحليل صفحة سناب: {e}")
+        return None
+    if err:
+        logger.warning(f"⚠️ تعذّر جلب صفحة سناب: {err}")
+        return None
+    if not candidates:
+        logger.info("ℹ️ لا مرشّحي وسائط في صفحة سناب")
+        return None
+    key, path, media = candidates[0]
+    logger.info(f"👻 سناب: وسائط من الصفحة عبر {key} ({path}): {media[:80]}")
+    return media
+
+
+def _snap_safe(text) -> str:
+    """يعطّل الأقواس الزاويّة في نصوص التشخيص قبل إرسالها لتيليجرام: رسائل مثل
+    ‎<urlopen error …>‎ تُبتلع كوسم HTML فتصل فارغة وتضيع علينا سبب العطل."""
+    return str(text or '').replace('<', '‹').replace('>', '›')
+
+
+# حد أقصى لتنزيل مرشّح تشخيصي (تيليجرام يرفض ما فوق ذلك للبوتات أصلاً)
+_SNAP_DUAL_MAX_MB = 45
+
+
+def _snap_fetch_to_file(media_url: str, dest: str) -> int:
+    """ينزّل رابط وسائط إلى ملف ويعيد حجمه، مع سقف حجم يمنع تعليق الأمر
+    التشخيصي على ملف ضخم. يرفع استثناءً عند التجاوز أو فشل الشبكة."""
+    import urllib.request
+    req = urllib.request.Request(media_url, headers={'User-Agent': _SNAP_UA})
+    limit = _SNAP_DUAL_MAX_MB * 1024 * 1024
+    total = 0
+    with urllib.request.urlopen(req, timeout=90) as resp, open(dest, 'wb') as fh:
+        while True:
+            chunk = resp.read(262144)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                raise ValueError(f"أكبر من {_SNAP_DUAL_MAX_MB} م.ب")
+            fh.write(chunk)
+    if total == 0:
+        raise ValueError("ملف فارغ")
+    return total
+
+
 # ── فاحصان تشخيصيان لسناب (لأمر /snaptest فقط، لا يمسّان مسار التحميل) ──
 # الغرض: معرفة ما تحويه صفحة سناب فعلاً وما ترد به خدمة الوسائط، من تيليجرام
 # مباشرة، بدل تخمين البنية أو الدخول على الخادم لقراءة السجل.
@@ -4686,43 +4839,88 @@ async def cmd_snaptest(client, message):
     web = await loop.run_in_executor(None, resolve_snapchat_spotlight, url)
     service = (await loop.run_in_executor(None, _snapchat_service_probe, snap_id)
                if snap_id else '— (بلا معرّف)')
-    page = await loop.run_in_executor(None, _snapchat_page_probe, url)
+    cands, info, err = await loop.run_in_executor(
+        None, _snapchat_page_candidates, url)
 
     lines = ["👻 **فحص مسارات سناب شات**", ""]
     lines.append(f"**المعرّف:** `{snap_id}`" if snap_id
                  else "**المعرّف:** ❌ لم يُستخرج (ليس رابط سناب مفرد؟)")
 
     lines.append("\n**① خدمة الوسائط الداخلية**")
-    lines.append(f"`{service}`")
+    lines.append(f"`{_snap_safe(service)}`")
     if not SNAPCHAT_CLEAN_MEDIA:
         lines.append("⏸️ معطّلة بـ `SNAPCHAT_CLEAN_MEDIA=0`")
     elif clean:
-        lines.append(f"✅ وسائط نظيفة:\n`{clean[:200]}`")
+        lines.append(f"✅ وسائط:\n`{clean[:200]}`")
     else:
         lines.append("❌ بلا وسائط صالحة")
 
-    lines.append("\n**② صفحة سناب**")
-    if page.get('error'):
-        lines.append(f"❌ تعذّر الجلب — كود {page.get('code') or '—'}: "
-                     f"`{page['error']}`")
+    lines.append("\n**② مرشّحو وسائط الصفحة** (الأنظف أولاً)")
+    if err:
+        lines.append(f"❌ تعذّر الجلب: `{_snap_safe(err)}`")
+    elif not cands:
+        lines.append("❌ لا مرشّحين في JSON الصفحة")
     else:
-        lines.append(f"كود {page['code']} | الحجم: {page['size'] // 1024} ك.ب")
-        lines.append(f"✓ موجود: `{', '.join(page['found']) or '—'}`")
-        lines.append(f"✗ غائب: `{', '.join(page['missing']) or '—'}`")
-        if page['mp4']:
-            lines.append(f"روابط mp4 ({len(page['mp4'])}):")
-            for i, u in enumerate(page['mp4'], 1):
-                lines.append(f"{i}. `{u[:170]}`")
-        else:
-            lines.append("لا روابط mp4 في نص الصفحة")
+        for i, (key, path, u) in enumerate(cands[:4], 1):
+            lines.append(f"{i}. **{key}** — `{_snap_safe(path)[:60]}`\n`{u[:180]}`")
+    if info:
+        lines.append("طبقات/معاينات: " + ", ".join(
+            sorted({k for _p, k, _u in info})[:4]))
 
-    lines.append("\n**③ المسار القديم (og:video)**")
+    lines.append("\n**③ المسار القديم (og:video بامتداد mp4)**")
     lines.append(f"`{web[:200]}`" if web and web != url else "❌ لم يُرجع رابطاً")
 
+    picked = clean or (cands[0][2] if cands else None)
     lines.append("\n**النتيجة:** " + (
-        "سيرسل البوت النسخة النظيفة." if clean else
-        "سيتولّى yt-dlp الرابط كما هو (النسخة المعلَّمة)."))
+        f"سيحمّل البوت من **{cands[0][0] if (cands and not clean) else 'خدمة الوسائط'}**."
+        if picked else "سيتولّى yt-dlp الرابط كما هو (النسخة المعلَّمة)."))
+    if cands:
+        lines.append("للمقارنة البصرية: `/snapdual <الرابط>`")
     await status.edit_text("\n".join(lines)[:4000], disable_web_page_preview=True)
+
+
+@app.on_message(filters.command("snapdual"))
+async def cmd_snapdual(client, message):
+    """أمر أدمن: ينزّل كل مرشّحي وسائط السناب ويرسلها فيديوهات مستقلة معنونة
+    بمصدرها، لتُقارن باللوقو بصرياً في تيليجرام مباشرة.
+
+    الاستخدام: /snapdual <رابط سناب>"""
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    parts = (message.text or '').split(maxsplit=1)
+    url = extract_first_url(parts[1] if len(parts) > 1 else '')
+    if not url or 'snapchat.com' not in url.lower() or not is_safe_url(url):
+        await message.reply_text("الاستخدام: `/snapdual <رابط سناب>`")
+        return
+    status = await message.reply_text("⏬ جارٍ تنزيل مرشّحي الوسائط…")
+    loop = asyncio.get_event_loop()
+    cands, _info, err = await loop.run_in_executor(
+        None, _snapchat_page_candidates, url)
+    if err or not cands:
+        await status.edit_text(f"❌ لا مرشّحين: `{_snap_safe(err or 'JSON بلا وسائط')}`")
+        return
+    tmp = os.path.join('videos', f"snapdual_{uuid.uuid4().hex[:8]}")
+    os.makedirs(tmp, exist_ok=True)
+    sent = 0
+    try:
+        for i, (key, path, media) in enumerate(cands[:3], 1):
+            dest = os.path.join(tmp, f"{i}_{key}.mp4")
+            try:
+                size = await loop.run_in_executor(
+                    None, _snap_fetch_to_file, media, dest)
+            except Exception as e:
+                await message.reply_text(f"{i}. **{key}** ❌ فشل التنزيل: "
+                                         f"`{_snap_safe(str(e)[:80])}`")
+                continue
+            await message.reply_video(
+                dest, caption=f"{i}. **{key}** — `{_snap_safe(path)[:60]}`\n"
+                              f"{size / 1048576:.1f} م.ب")
+            sent += 1
+        await status.edit_text(
+            f"✅ أُرسل {sent} من {len(cands[:3])} — قارن أيّها بلا لوقو."
+            if sent else "❌ تعذّر تنزيل أي مرشّح.")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # معالج الأزرار السريعة
@@ -5672,6 +5870,10 @@ async def handle_url(client, message):
     if 'snapchat.com' in url.lower():
         _loop = asyncio.get_event_loop()
         _clean = await _loop.run_in_executor(None, _snapchat_clean_media, url)
+        if not _clean:
+            # وسائط الصفحة نفسها (mediaUrl الخام قبل contentUrl) — لا تشترط
+            # امتداد .mp4، فروابط سناب بلا امتداد
+            _clean = await _loop.run_in_executor(None, _snapchat_page_media, url)
         if _clean:
             url = _clean
         else:
