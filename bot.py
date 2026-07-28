@@ -55,7 +55,8 @@ from link_resolvers import (
     _is_music_link, resolve_music_link,
     resolve_instagram_media, instagram_mirror_lookup, resolve_tiktok_media,
     resolve_threads_media, threads_mirror_lookup,
-    resolve_facebook_share, is_facebook_story,
+    resolve_facebook_share, is_facebook_story, is_instagram_story,
+    _instagram_story_path,
     twitter_mirror_lookup, twitter_mirror_media,
     resolve_tiktok_images, tiktok_source_analysis,
     resolve_pinterest_media, resolve_pinterest_images,
@@ -1512,9 +1513,17 @@ def resolve_instagram_images(url, timeout=20):
     # الغلاف من المرآة تضلّل المستخدم (يستقبل "صورة" بدل فيديو). لذا نقتصر هنا على
     # منشورات /p/ وحدها (كاروسيل صور/صورة)، ونترك الريلز لمسار الفيديو ورسالة الفشل.
     m = re.search(r'/p/([A-Za-z0-9_-]+)', path, re.I)
-    if not m:
-        return []  # ريل/IGTV/ستوري/بروفايل — ليس منشور صور، لا مرآة صور له
-    shortcode = m.group(1)
+    if m:
+        shortcode = m.group(1)
+    else:
+        # 📖 ستوري صورة: معرّف عنصر الستوري في نفس فضاء معرّفات المنشورات، فرمزه
+        #    القصير يعمل على مسار /p/. آمن للستوري المصوّر فقط: ستوري الفيديو
+        #    تعيده المرآة بنوع video/mp4 فيرفضه _fetch_mirror_image_url ويبقى
+        #    على مسار الفيديو (لا غلاف يُرسَل بدل المقطع).
+        story_path = _instagram_story_path(url)
+        if not story_path:
+            return []  # ريل/IGTV/بروفايل — ليس منشور صور، لا مرآة صور له
+        shortcode = story_path.rsplit('/', 1)[-1]
     ua = 'Mozilla/5.0 (compatible; TelegramBot)'
 
     # (1) مرايا تدعم فهرسة الكاروسيل: اجمع كل عناصرها حتى أول فشل
@@ -2071,8 +2080,13 @@ async def process_download_from_queue(task: DownloadTask):
                 return
             # منشور إنستغرام خاص/محذوف (المرآة أُحيلت لجدار الدخول) → رسالة واضحة
             if _last_info_error.get() == 'ig_unavailable':
-                await send_error_to_admin(user_id, user_name, "Instagram post private/removed", url)
-                await status.edit_text(t('post_unavailable', lang))
+                _is_story = is_instagram_story(url)
+                await send_error_to_admin(
+                    user_id, user_name,
+                    "Instagram story expired/private" if _is_story
+                    else "Instagram post private/removed", url)
+                await status.edit_text(
+                    t('story_unavailable' if _is_story else 'post_unavailable', lang))
                 return
             await send_error_to_admin(user_id, user_name, "Failed to extract video info", url)
             await status.edit_text(t('invalid_url', lang))
@@ -6060,8 +6074,13 @@ async def handle_url(client, message):
                 return
             # منشور إنستغرام خاص/محذوف (المرآة أُحيلت لجدار الدخول) → رسالة واضحة
             if _last_info_error.get() == 'ig_unavailable':
-                await send_error_to_admin(user_id, user_name, "Instagram post private/removed", url)
-                await status.edit_text(t('post_unavailable', lang))
+                _is_story = is_instagram_story(url)
+                await send_error_to_admin(
+                    user_id, user_name,
+                    "Instagram story expired/private" if _is_story
+                    else "Instagram post private/removed", url)
+                await status.edit_text(
+                    t('story_unavailable' if _is_story else 'post_unavailable', lang))
                 return
             await send_error_to_admin(user_id, user_name, "Failed to extract video info", url)
             await status.edit_text(t('invalid_url', lang))

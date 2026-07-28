@@ -12,6 +12,7 @@ from link_resolvers import (
     snapchat_probe_renditions, set_snapchat_clean_rendition,
     get_snapchat_clean_rendition,
     resolve_instagram_media, instagram_mirror_lookup, _is_real_instagram_host,
+    _instagram_media_id_to_shortcode, _instagram_story_path, is_instagram_story,
     resolve_tiktok_media, resolve_tiktok_images,
     resolve_twitter_media, _extract_twitter_media, all_mirror_hosts,
     twitter_mirror_lookup, _twitter_payload_sensitive,
@@ -357,9 +358,11 @@ def test_instagram_resolver_ignores_non_instagram():
     assert resolve_instagram_media('') is None
 
 
-def test_instagram_resolver_ignores_story_and_profile():
-    # الستوري/البروفايل ليست منشور فيديو → None بلا طلب شبكي
+def test_instagram_resolver_ignores_profile():
+    # البروفايل ليس منشوراً → None بلا طلب شبكي
+    # (الستوري له مسار خاص: معرّفه يُحوَّل لرمز /p/ — انظر اختبارات الستوري)
     assert resolve_instagram_media('https://www.instagram.com/someuser/') is None
+    # معرّف قصير جداً ليس معرّف وسائط حقيقياً → لا تحويل
     assert resolve_instagram_media('https://www.instagram.com/stories/u/123/') is None
 
 
@@ -457,6 +460,115 @@ def test_instagram_lookup_mirror_outage_not_flagged():
             'https://www.instagram.com/reel/ABC123/')
     assert media is None
     assert unavailable is False
+
+
+# ── ستوري إنستغرام: معرّف رقمي → رمز قصير → مسار /p/ ────────────
+
+def test_instagram_media_id_to_shortcode_known_value():
+    # قيمة محقَّقة ميدانياً: معرّف ستوري حقيقي أعطى هذا الرمز، وعليه نزل mp4
+    assert _instagram_media_id_to_shortcode(3950648105099614764) == 'DbThYUpCFos'
+    assert _instagram_media_id_to_shortcode('3950648105099614764') == 'DbThYUpCFos'
+
+
+def test_instagram_media_id_to_shortcode_edges():
+    # حدود الأبجدية: ٦٣ آخر حرف، و٦٤ أول خانتين
+    assert _instagram_media_id_to_shortcode(1) == 'B'
+    assert _instagram_media_id_to_shortcode(63) == '_'
+    assert _instagram_media_id_to_shortcode(64) == 'BA'
+    # قيم غير صالحة → سلسلة فارغة (لا استثناء)
+    assert _instagram_media_id_to_shortcode(0) == ''
+    assert _instagram_media_id_to_shortcode(-5) == ''
+    assert _instagram_media_id_to_shortcode('abc') == ''
+    assert _instagram_media_id_to_shortcode(None) == ''
+
+
+def test_instagram_media_id_roundtrip():
+    # فكّ الترميز يعيد العدد نفسه — الأبجدية والترتيب صحيحان
+    alphabet = link_resolvers._IG_ALPHABET
+    for n in (1, 63, 64, 4095, 3950648105099614764, 3220119661673965667):
+        code = _instagram_media_id_to_shortcode(n)
+        back = 0
+        for ch in code:
+            back = back * 64 + alphabet.index(ch)
+        assert back == n
+
+
+def test_instagram_story_path_from_story_url():
+    # رابط ستوري (مع بارامترات المشاركة) → مسار منشور تفهمه المرآة
+    assert _instagram_story_path(
+        'https://www.instagram.com/stories/bakrnurechi/3950648105099614764'
+        '?utm_source=ig_story_item_share&igsh=MXNwamxiN3BocWR6dQ=='
+    ) == '/p/DbThYUpCFos'
+    # المسار وحده (كما يمرَّر داخلياً) يعمل أيضاً
+    assert _instagram_story_path(
+        '/stories/someone/3950648105099614764/') == '/p/DbThYUpCFos'
+
+
+def test_instagram_story_path_ignores_other_urls():
+    # ريل/منشور/بروفايل/غير إنستغرام → None (يبقى المسار الأصلي كما هو)
+    assert _instagram_story_path('https://www.instagram.com/reel/ABC123/') is None
+    assert _instagram_story_path('https://www.instagram.com/p/ABC123/') is None
+    assert _instagram_story_path('https://www.instagram.com/someuser/') is None
+    assert _instagram_story_path('https://youtube.com/watch?v=1') is None
+    assert _instagram_story_path('') is None
+    assert _instagram_story_path(None) is None
+    # أرقام قصيرة (ليست معرّف وسائط) → لا تحويل
+    assert _instagram_story_path('https://www.instagram.com/stories/u/123/') is None
+
+
+def test_instagram_story_path_highlights():
+    # «الأبرز» بلا story_media_id: رقم المسار هو رقم المجموعة لا الوسائط →
+    # لا نحوّله (رمز لا وجود له يعطي نتيجة مضلّلة)
+    assert _instagram_story_path(
+        'https://www.instagram.com/stories/highlights/17900000000000000/') is None
+    # ومعه: نأخذ معرّف الوسائط من الاستعلام (الجزء قبل «_» = معرّف المالك)
+    assert _instagram_story_path(
+        'https://www.instagram.com/stories/highlights/17900000000000000/'
+        '?story_media_id=3950648105099614764_1234567890&igsh=x'
+    ) == '/p/DbThYUpCFos'
+
+
+def test_instagram_lookup_story_requests_post_path(monkeypatch):
+    # الستوري: المرآة ترفض /stories/ فنطلب /p/<رمز> — نتحقق أن الطلب ذهب له
+    final = 'https://scontent.cdninstagram.com/o1/v/story.mp4?oe=1'
+    seen = []
+
+    def _fake_urlopen(req, *a, **k):
+        seen.append(req.full_url)
+        return _FakeResp('video/mp4', final)
+
+    with patch('urllib.request.urlopen', side_effect=_fake_urlopen), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        media, unavailable = instagram_mirror_lookup(
+            'https://www.instagram.com/stories/bakrnurechi/3950648105099614764'
+            '?igsh=MXNwamxiN3BocWR6dQ==')
+    assert media == final
+    assert unavailable is False
+    assert seen and seen[0].endswith('/p/DbThYUpCFos')
+
+
+def test_is_instagram_story():
+    # يميّز الستوري ليعرض البوت رسالة الانتهاء بدل «حساب خاص»
+    assert is_instagram_story(
+        'https://www.instagram.com/stories/bakrnurechi/3950648105099614764')
+    assert is_instagram_story(
+        'https://www.instagram.com/stories/highlights/17900000000000000/')
+    assert not is_instagram_story('https://www.instagram.com/reel/ABC123/')
+    assert not is_instagram_story('https://www.instagram.com/p/ABC123/')
+    # منصّة أخرى لها /stories/ (فيسبوك) لا تُحسب على إنستغرام
+    assert not is_instagram_story('https://www.facebook.com/stories/123/')
+    assert not is_instagram_story('')
+    assert not is_instagram_story(None)
+
+
+def test_instagram_lookup_expired_or_private_story_flagged():
+    # ستوري منتهٍ (٢٤ ساعة) أو حساب خاص: المرآة تحيل لصفحة إنستغرام → (None, True)
+    wall = 'https://www.instagram.com/accounts/login/'
+    with patch('urllib.request.urlopen', return_value=_FakeResp('text/html', wall)):
+        media, unavailable = instagram_mirror_lookup(
+            'https://www.instagram.com/stories/someone/3950648105099614764')
+    assert media is None
+    assert unavailable is True
 
 
 # ── فيسبوك: توسيع روابط المشاركة وكشف الستوري ───────────────────

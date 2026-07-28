@@ -403,8 +403,73 @@ _INSTAGRAM_PROXY_HOSTS = [
     ).split(',') if h.strip()
 ]
 
-# مسار منشور فيديو/ريلز في إنستغرام (نتجاهل الستوري/البروفايل)
+# مسار منشور فيديو/ريلز في إنستغرام (البروفايل لا مرآة له)
 _INSTAGRAM_MEDIA_RE = re.compile(r'/(?:reel|reels|p|tv)/[A-Za-z0-9_-]+', re.I)
+
+# ═══════════════════════════════════════════════════════════════
+# ستوري إنستغرام بلا كوكيز
+# yt-dlp يملك مستخرِج instagram:story لكنه يردّ «You need to log in»، وصفحة
+# الستوري لا تعطي الزوّار أي وسائط، والمرآة ترفض مسار /stories/ بـ403.
+# لكن معرّف عنصر الستوري في **نفس فضاء معرّفات المنشورات**: فترميزه بأبجدية
+# إنستغرام (base64 بترتيبها) يعطي رمزاً قصيراً تفهمه المرآة على مسار /p/.
+# محقَّق ميدانياً: ستوري بمعرّف 3950648105099614764 أعطى الرمز DbThYUpCFos،
+# ومنه نزل ملف mp4 حقيقي (720×1280، ١٢.٩ث) من scontent.cdninstagram.com
+# بنصوص الستوري ومنشناتها محروقة فيه — بلا كوكيز إطلاقاً.
+# قيدان طبيعيان: الحساب يجب أن يكون عاماً، والستوري يعيش ٢٤ ساعة.
+# ═══════════════════════════════════════════════════════════════
+_INSTAGRAM_STORY_RE = re.compile(r'/stories/(?!highlights/)[^/]+/(\d{8,25})', re.I)
+
+# روابط «الأبرز» (highlights) تحمل رقم المجموعة لا رقم العنصر في المسار، لكن
+# رابط المشاركة يضع معرّف العنصر في story_media_id=«<معرّف الوسائط>_<معرّف المالك>»
+_INSTAGRAM_HIGHLIGHT_RE = re.compile(r'/stories/highlights/', re.I)
+_INSTAGRAM_STORY_MEDIA_ID_RE = re.compile(r'[?&]story_media_id=(\d{8,25})', re.I)
+
+# أبجدية إنستغرام للرموز القصيرة (base64 بترتيب مختلف عن القياسي)
+_IG_ALPHABET = ('ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+                'abcdefghijklmnopqrstuvwxyz0123456789-_')
+
+
+def _instagram_media_id_to_shortcode(media_id) -> str:
+    """يحوّل معرّف وسائط إنستغرام الرقمي إلى رمزه القصير (كالذي في /p/<رمز>).
+    ترميز بالأساس ٦٤ بأبجدية إنستغرام؛ تحقّق ذهاباً وإياباً على قيم حدّية."""
+    try:
+        n = int(media_id)
+    except (TypeError, ValueError):
+        return ''
+    if n <= 0:
+        return ''
+    out = ''
+    while n > 0:
+        n, rem = divmod(n, 64)
+        out = _IG_ALPHABET[rem] + out
+    return out
+
+
+def _instagram_story_path(url: str):
+    """«/p/<رمز>» المكافئ لرابط ستوري إنستغرام، أو None لغير الستوري.
+
+    يقبل صيغتَي الستوري: العنصر المباشر «/stories/<حساب>/<معرّف>» ورابط
+    «الأبرز» الذي يحمل معرّف العنصر في story_media_id (لأن رقم المسار فيه هو
+    رقم المجموعة لا رقم الوسائط، فترميزه يعطي رمزاً لا وجود له)."""
+    u = url or ''
+    m = _INSTAGRAM_STORY_RE.search(u)
+    media_id = m.group(1) if m else None
+    if media_id is None and _INSTAGRAM_HIGHLIGHT_RE.search(u):
+        hm = _INSTAGRAM_STORY_MEDIA_ID_RE.search(u)
+        media_id = hm.group(1) if hm else None
+    if media_id is None:
+        return None
+    code = _instagram_media_id_to_shortcode(media_id)
+    return f"/p/{code}" if code else None
+
+
+def is_instagram_story(url: str) -> bool:
+    """هل الرابط ستوري إنستغرام (أو عنصر «أبرز»)؟ يُستعمل لرسالة فشل أدقّ:
+    الستوري يعيش ٢٤ ساعة، فالسبب الغالب للفشل انتهاؤه لا خصوصية الحساب."""
+    low = (url or '').lower()
+    if not any(h in low for h in ('instagram.com', 'instagr.am')):
+        return False
+    return '/stories/' in low
 
 # وكيل مستخدم بوت: المرايا تعيد توجيهاً مباشراً للفيديو للبوتات، وصفحة هبوط
 # للمتصفحات، لذا ننتحل بوت معاينة روابط للحصول على ملف mp4 مباشرة.
@@ -443,9 +508,16 @@ def instagram_mirror_lookup(url: str, timeout: int = 20):
     except Exception:
         return None, False
     m = _INSTAGRAM_MEDIA_RE.search(path)
-    if not m:
-        return None, False  # ستوري/بروفايل/رابط غير منشور — لا مرآة له
-    media_path = m.group(0)
+    if m:
+        media_path = m.group(0)
+    else:
+        # الستوري: المرآة ترفض مسار /stories/ لكن معرّف العنصر في نفس فضاء
+        # معرّفات المنشورات، فنحوّله لرمزه القصير ونطلبه على مسار /p/
+        # (الرابط كاملاً لا المسار وحده: رابط «الأبرز» يحمل المعرّف في الاستعلام)
+        media_path = _instagram_story_path(url)
+        if not media_path:
+            return None, False  # بروفايل/رابط غير منشور — لا مرآة له
+        logger.info(f"📖 ستوري إنستغرام → {media_path}")
     unavailable = False
     for proxy_host in _INSTAGRAM_PROXY_HOSTS:
         proxy_url = f"https://{proxy_host}{media_path}"
