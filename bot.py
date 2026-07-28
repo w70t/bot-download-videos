@@ -48,7 +48,8 @@ from cookies_manager import (
     COOKIES_PLATFORMS, get_cookie_file_for_url, validate_platform_cookies,
 )
 from link_resolvers import (
-    resolve_snapchat_spotlight, _is_music_link, resolve_music_link,
+    resolve_snapchat_spotlight, snapchat_clean_rendition,
+    _is_music_link, resolve_music_link,
     resolve_instagram_media, instagram_mirror_lookup, resolve_tiktok_media,
     twitter_mirror_lookup, twitter_mirror_media,
     resolve_tiktok_images, resolve_pinterest_media, resolve_pinterest_images,
@@ -5365,6 +5366,17 @@ async def cmd_snaptest(client, message):
     lines.append("\n**النتيجة:** " + (
         f"سيحمّل البوت من **{cands[0][0] if (cands and not clean) else 'خدمة الوسائط'}**."
         if picked else "سيتولّى yt-dlp الرابط كما هو (النسخة المعلَّمة)."))
+
+    # ④ خطّ الدفاع الأخير: تحويل رندر المشاركة 27 (اللوقو محروق) إلى 1034
+    final = await loop.run_in_executor(
+        None, snapchat_clean_rendition, picked or url)
+    lines.append(f"\n**④ الرندر النظيف (بلا لوقو)**")
+    if picked and final != picked:
+        lines.append(f"✅ نظيف:\n`{final[:200]}`")
+    elif picked:
+        lines.append("➖ لا رندر نظيف لهذا المقطع — سيُحمّل بنسخة اللوقو")
+    else:
+        lines.append("➖ لا رابط وسائط لتحويله")
     if cands:
         lines.append("للمقارنة البصرية: `/snapdual <الرابط>`")
     await status.edit_text("\n".join(lines)[:4000], disable_web_page_preview=True)
@@ -6643,8 +6655,7 @@ async def handle_url(client, message):
         _loop = asyncio.get_event_loop()
         _clean = await _loop.run_in_executor(None, _snapchat_clean_media, url)
         if not _clean:
-            # وسائط الصفحة نفسها (mediaUrl الخام قبل contentUrl) — لا تشترط
-            # امتداد .mp4، فروابط سناب بلا امتداد
+            # وسائط الصفحة نفسها — لا تشترط امتداد .mp4، فروابط سناب بلا امتداد
             _clean = await _loop.run_in_executor(None, _snapchat_page_media, url)
         if _clean:
             url = _clean
@@ -6653,6 +6664,12 @@ async def handle_url(client, message):
                 None, resolve_snapchat_spotlight, url)
             if _resolved and _resolved != url:
                 url = _resolved
+        # 👻 خطّ الدفاع الأخير: mediaUrl وcontentUrl في صفحة سناب يشيران معاً
+        #    لكائن الرندر 27 نفسه — وهو النسخة التي يحرق فيها سناب اللوقو واسم
+        #    الحساب داخل البكسل. فنحوّله للرندر 1034 (نفس المقطع بلا لوقو) بعد
+        #    التأكّد أنه منشور فعلاً. لا يمسّ الروابط الأخرى: أي رابط ليس رندر
+        #    مشاركة يعود كما هو، فلا ينكسر أي مسار يعمل اليوم.
+        url = await _loop.run_in_executor(None, snapchat_clean_rendition, url)
 
     # 🎵 روابط الأغاني (Shazam/Apple Music/Spotify) لا تُحمّل مباشرة →
     #    استخرج اسم الأغنية وابحث عنها في يوتيوب، ثم أكمل التحميل على رابط يوتيوب.

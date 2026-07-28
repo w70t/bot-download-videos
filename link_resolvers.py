@@ -21,11 +21,97 @@ from cookies_manager import get_cookie_file_for_url
 logger = logging.getLogger(__name__)
 
 
+# ═══════════════════════════════════════════════════════════════
+# سناب شات: النسخة بلا لوقو (رندر 1034 بدل 27)
+# وسائط سناب مخزّنة كائناتٍ ثابتة على Google Cloud Storage باسم
+# «<معرّف الوسائط>.<رقم الرندر>.<رمز السياق>». لكل مقطع سبوت لايت عدّة رندرات:
+#   27   → mp4، وهو الوحيد الذي تشير إليه الصفحة (og:video وcontentUrl)، وفيه
+#          سناب يحرق اللوقو واسم الحساب داخل الصورة نفسها — أعلى اليسار في
+#          النصف الأول من المقطع ثم أسفل اليمين في النصف الثاني (بروفايل
+#          التحويل «SpotlightSharing» المذكور صراحةً داخل بارامتر mo).
+#   1034 → mp4 لنفس المقطع بلا أي لوقو، ولا تذكره صفحة سبوت لايت إطلاقاً
+#          (ظهر في صفحات حسابات المنشئين، وبارامتر mo الخاص به بلا بروفايل
+#          مشاركة). متوفّر لأغلب المقاطع لا كلّها.
+#   256/1400 (jpeg) و1306/1430 (webp) → صور مصغّرة، وهي بلا لوقو أصلاً وهذا
+#          ما يثبت أن اللوقو من بروفايل التحويل لا من المقطع الأصلي.
+# فالحل: إعادة كتابة الرندر 27 إلى 1034 بعد التأكّد من وجوده فعلياً. النسخة
+# النظيفة أقل دقّةً قليلاً (480×852 مقابل 540×960) وهي المقايضة الوحيدة.
+# رقم الرندر قابل للتغيير بمتغيّر البيئة SNAPCHAT_CLEAN_RENDITION إن غيّره سناب.
+# ملاحظة: النسخة الخام (المسار بلا لاحقة رندر) مشفّرة بالكامل ومفتاحها لا
+# يظهر في الصفحة، فلا فائدة منها.
+# ═══════════════════════════════════════════════════════════════
+_SNAP_CLEAN_RENDITION = os.getenv('SNAPCHAT_CLEAN_RENDITION', '1034').strip() or '1034'
+
+# «/<معرّف الوسائط>.27.<رمز السياق>» في نهاية مسار رابط CDN سناب
+_SNAP_SHARING_RENDITION_RE = re.compile(
+    r'/([A-Za-z0-9_-]{10,32})\.27\.([A-Za-z0-9]{4,16})\Z')
+
+# صيغة كائن الرندر عامّةً: «/<معرّف>.<رقم الرندر>.<رمز السياق>»
+_SNAP_RENDITION_PATH_RE = re.compile(
+    r'/([A-Za-z0-9_-]{10,32})\.(\d{1,5})\.([A-Za-z0-9]{4,16})\Z')
+
+
+def _is_snap_video_url(u: str) -> bool:
+    """هل الرابط ملف فيديو على CDN سناب؟ يقبل ملف ‎.mp4‎ صريحاً، أو كائن رندر
+    فيديو بصيغة «<معرّف>.<رقم الرندر>.<رمز السياق>» — وهي صيغة سبوت لايت
+    الحالية التي لا امتداد فيها إطلاقاً. أرقام رندر المصغّرات (256/1306/1400/
+    1430 وغيرها) مستبعَدة كي لا نرسل صورة غلاف بدل الفيديو."""
+    try:
+        p = urlparse(u or '')
+    except Exception:
+        return False
+    host = (p.hostname or '').lower()
+    if not (host == 'sc-cdn.net' or host.endswith('.sc-cdn.net')):
+        return False
+    path = p.path or ''
+    if path.lower().endswith('.mp4'):
+        return True
+    m = _SNAP_RENDITION_PATH_RE.search(path)
+    return bool(m and m.group(2) in ('27', _SNAP_CLEAN_RENDITION))
+
+
+def snapchat_clean_rendition(media_url: str, timeout: int = 10) -> str:
+    """يحوّل رابط وسائط سناب من رندر المشاركة (27، اللوقو واسم الحساب محروقان
+    داخل الصورة) إلى الرندر النظيف (1034، نفس المقطع بلا لوقو).
+
+    يتحقّق بطلب HEAD أن النسخة النظيفة منشورة فعلاً قبل اعتمادها، فإن لم تكن
+    (بعض المقاطع لا رندر نظيف لها) يعيد الرابط الأصلي دون تغيير في السلوك.
+    يُسقط الاستعلام لأنه يصف الرندر القديم، والتخزين يتجاهله أصلاً."""
+    try:
+        parts = urlparse(media_url or '')
+    except Exception:
+        return media_url
+    m = _SNAP_SHARING_RENDITION_RE.search(parts.path or '')
+    if not m:
+        return media_url  # ليس رابط رندر مشاركة — لا شيء نعيد كتابته
+    clean = (f"{parts.scheme}://{parts.netloc}{parts.path[:m.start()]}"
+             f"/{m.group(1)}.{_SNAP_CLEAN_RENDITION}.{m.group(2)}")
+    if not is_safe_url(clean):
+        return media_url
+    import urllib.request
+    req = urllib.request.Request(clean, method='HEAD',
+                                 headers={'User-Agent': _BROWSER_UA})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            ctype = (resp.headers.get_content_type() or '').lower()
+            # التخزين يردّ 404 بجسم XML؛ الفيديو يأتي video/mp4 وأحياناً
+            # application/octet-stream، فنرفض أنواع النصّ/الترميز فقط
+            if resp.status == 200 and not ctype.endswith(('xml', 'html')):
+                logger.info(f"🎯 سناب بلا لوقو (رندر {_SNAP_CLEAN_RENDITION}): "
+                            f"{clean[:90]}")
+                return clean
+        logger.info(f"ℹ️ لا رندر نظيف لـ {m.group(1)} — نبقي نسخة المشاركة")
+    except Exception as e:
+        logger.info(f"ℹ️ تعذّر التحقّق من نسخة سناب بلا لوقو ({m.group(1)}): {e}")
+    return media_url
+
+
 def resolve_snapchat_spotlight(url: str, timeout: int = 20) -> str:
-    """يجلب صفحة سناب سبوت لايت ويستخرج رابط الفيديو الخام المباشر (أنظف نسخة
-    متاحة، غالباً بلا لوقو لأن اللوقو طبقة واجهة لا جزء من الملف) من وسم
-    og:video أو من رابط CDN داخل الصفحة، فيُحمّل مباشرة بدل مسار سناب الضعيف
-    في yt-dlp. يعمل للسبوت لايت العام فقط؛ عند أي فشل يعيد الرابط الأصلي.
+    """يجلب صفحة سناب سبوت لايت ويستخرج رابط الفيديو المباشر من وسم og:video أو
+    من رابط CDN داخل الصفحة، فيُحمّل مباشرة بدل مسار سناب الضعيف في yt-dlp، ثم
+    يحوّله إلى الرندر النظيف بلا لوقو (انظر snapchat_clean_rendition — الصفحة
+    لا تعطي إلا رندر المشاركة الذي يحرق اللوقو داخل الصورة).
+    يعمل للسبوت لايت العام فقط؛ عند أي فشل يعيد الرابط الأصلي.
     يقبل روابط المشاركة snapchat.com/t/... (يتبع التوجيه للصفحة الحقيقية)."""
     low = (url or '').lower()
     if 'snapchat.com' not in low:
@@ -50,26 +136,29 @@ def resolve_snapchat_spotlight(url: str, timeout: int = 20) -> str:
         with opener.open(url, timeout=timeout) as resp:
             html_text = resp.read(1500000).decode('utf-8', 'ignore')
 
-        # 1) og:video — الأنسب لأن معاينات الروابط تعتمد عليه فيبقى مستقراً
-        for pat in (
-            r'property=["\']og:video(?::secure_url)?["\'][^>]*content=["\']([^"\']+\.mp4[^"\']*)["\']',
-            r'content=["\']([^"\']+\.mp4[^"\']*)["\'][^>]*property=["\']og:video',
-        ):
-            m = re.search(pat, html_text)
-            if m:
-                cand = m.group(1).replace('&amp;', '&')
-                if is_safe_url(cand):
-                    logger.info(f"🎯 سناب سبوت لايت (og:video): {cand[:90]}")
-                    return cand
+        from html import unescape
 
-        # 2) أي رابط فيديو خام من CDN سناب داخل JSON المضمّن (قد تكون الشرطات
-        #    مهرّبة \/ لذا نطابق حتى علامة الاقتباس ثم نفكّ التهريب)
-        m = re.search(r'"(https:[^"]*sc-cdn\.net[^"]*\.mp4[^"]*)"', html_text)
-        if m:
-            cand = m.group(1).replace('\\/', '/').replace('&amp;', '&')
-            if is_safe_url(cand):
+        # 1) og:video — الأنسب لأن معاينات الروابط تعتمد عليه فيبقى مستقراً.
+        #    نلتقط كل قيم content ثم نصفّيها بـ _is_snap_video_url لأن وسوم
+        #    og:video:type/width/height تشارك النمط نفسه بقيم ليست روابط.
+        for pat in (
+            r'property=["\']og:video(?::secure_url)?["\'][^>]*?content=["\']([^"\']+)["\']',
+            r'content=["\']([^"\']+)["\'][^>]*?property=["\']og:video',
+        ):
+            for m in re.finditer(pat, html_text):
+                cand = unescape(m.group(1))
+                if _is_snap_video_url(cand) and is_safe_url(cand):
+                    logger.info(f"🎯 سناب سبوت لايت (og:video): {cand[:90]}")
+                    return snapchat_clean_rendition(cand)
+
+        # 2) رابط الفيديو من JSON المضمّن في الصفحة (contentUrl/mediaUrl)؛ قد
+        #    تكون الشرطات مهرّبة \/ والمحارف بصيغة & فنفكّها قبل الفحص
+        for m in re.finditer(r'"(https:[^"\s]*sc-cdn\.net[^"\s]*)"', html_text):
+            cand = unescape(m.group(1).replace('\\/', '/')
+                            .replace('\\u0026', '&').replace('\\u003d', '='))
+            if _is_snap_video_url(cand) and is_safe_url(cand):
                 logger.info(f"🎯 سناب سبوت لايت (cdn): {cand[:90]}")
-                return cand
+                return snapchat_clean_rendition(cand)
     except Exception as e:
         logger.warning(f"⚠️ تعذّر استخراج سناب سبوت لايت ({url[:60]}): {e}")
     return url
