@@ -2070,29 +2070,47 @@ async def forward_images_to_log_channel(client, message, sent_messages, user_id,
         return []
 
 
-async def process_download_from_queue(task: DownloadTask):
+async def process_download_from_queue(task: DownloadTask, skip_ig_highlight=False):
     """
     Process a download task from the queue.
-    
+
     Args:
         task: DownloadTask containing download information
+        skip_ig_highlight: يتخطّى سؤال «الأبرز» — يمرّره زرّ «هذا المقطع فقط»
+            وحده، وإلا لأعاد السؤال على نفسه بلا نهاية.
     """
     user_id = task.user_id
     url = task.url
     message = task.message
-    
+
     # Get user language
     lang = subdb.get_user_language(user_id)
-    
+
     try:
+        # 📚 «أبرز» إنستغرام: الرابط القادم من الطابور يستحقّ السؤال نفسه الذي
+        #    يراه الرابط المُرسَل مباشرةً، وإلا اختفت الأزرار لمجرّد أن العضو
+        #    كان لديه تحميل جارٍ لحظة الإرسال
+        if not skip_ig_highlight and await _ig_highlight_prompt(
+                message, url, user_id, lang):
+            return
+
         # Send processing notification
         status = await message.reply_text(t('queue_processing_current', lang))
-        
+
         # Get video info
         info = await get_video_info(url)
         
         if not info:
             user_name = message.from_user.first_name or "User"
+            # 📖 ستوري إنستغرام حكمت عليه المرآة بأنه غير متاح (منتهٍ/خاص):
+            #    لا معنى لمحاولة مسار الصور بعده — كان يعرض «جاري تحميل الصور…»
+            #    ثم يفشل. الرسالة الصحيحة أولاً وفوراً.
+            if (_last_info_error.get() == 'ig_unavailable'
+                    and is_instagram_story(url)):
+                await send_error_to_admin(
+                    user_id, user_name, "Instagram story expired/private", url)
+                await status.edit_text(t('story_unavailable', lang))
+                return
             # 🖼️ قد يفشل yt-dlp تماماً في استخراج سلايدشو تيك توك / كاروسيل
             #    إنستغرام/بينتريست (منشور صور بلا فيديو، خاصة الروابط المختصرة)
             #    فيرجع None. جرّب مسار الصور عبر gallery-dl قبل اعتبار الرابط فاشلاً.
@@ -2125,6 +2143,14 @@ async def process_download_from_queue(task: DownloadTask):
                     else "Instagram post private/removed", url)
                 await status.edit_text(
                     t('story_unavailable' if _is_story else 'post_unavailable', lang))
+                return
+            # 📖 رابط ستوري/«أبرز» فشل بلا حكم صريح (عطل مرآة، أو انتهاء لم
+            #    ترفع له المرآة علماً): «رابط غير صحيح» مضلّلة — الرابط سليم
+            #    والمحتوى هو المتعذّر
+            if is_instagram_story(url) or instagram_highlight_id(url):
+                await send_error_to_admin(
+                    user_id, user_name, "Instagram story/highlight unavailable", url)
+                await status.edit_text(t('story_unavailable', lang))
                 return
             await send_error_to_admin(user_id, user_name, "Failed to extract video info", url)
             await status.edit_text(t('invalid_url', lang))
@@ -3443,10 +3469,12 @@ async def handle_ig_highlight_choice(client, callback_query):
             pend.get('total') or len(pend['items']))
         return
 
-    # المقطع الواحد: المسار المعتاد كاملاً (كاش، أزرار الجودة/الصوت، الحدود)
+    # المقطع الواحد: المسار المعتاد كاملاً (كاش، أزرار الجودة/الصوت، الحدود).
+    # skip_ig_highlight ضروري: بدونه يعرض المسار السؤال نفسه من جديد بلا نهاية.
     await _safe_delete(callback_query.message)
     await process_download_from_queue(
-        DownloadTask(url=url, message=message, user_id=user_id))
+        DownloadTask(url=url, message=message, user_id=user_id),
+        skip_ig_highlight=True)
 
 
 class PreviewStatus:
@@ -6339,6 +6367,15 @@ async def handle_url(client, message):
         if not info:
             # Send alert to admin
             user_name = message.from_user.first_name or "User"
+            # 📖 ستوري إنستغرام حكمت عليه المرآة بأنه غير متاح (منتهٍ/خاص):
+            #    لا معنى لمحاولة مسار الصور بعده — كان يعرض «جاري تحميل الصور…»
+            #    ثم يفشل. الرسالة الصحيحة أولاً وفوراً.
+            if (_last_info_error.get() == 'ig_unavailable'
+                    and is_instagram_story(url)):
+                await send_error_to_admin(
+                    user_id, user_name, "Instagram story expired/private", url)
+                await status.edit_text(t('story_unavailable', lang))
+                return
             # 🖼️ قد يفشل yt-dlp تماماً في استخراج سلايدشو تيك توك / كاروسيل
             #    إنستغرام/بينتريست (منشور صور بلا فيديو، خاصة الروابط المختصرة)
             #    فيرجع None. جرّب مسار الصور عبر gallery-dl قبل اعتبار الرابط فاشلاً.
@@ -6372,6 +6409,14 @@ async def handle_url(client, message):
                     else "Instagram post private/removed", url)
                 await status.edit_text(
                     t('story_unavailable' if _is_story else 'post_unavailable', lang))
+                return
+            # 📖 رابط ستوري/«أبرز» فشل بلا حكم صريح (عطل مرآة، أو انتهاء لم
+            #    ترفع له المرآة علماً): «رابط غير صحيح» مضلّلة — الرابط سليم
+            #    والمحتوى هو المتعذّر
+            if is_instagram_story(url) or instagram_highlight_id(url):
+                await send_error_to_admin(
+                    user_id, user_name, "Instagram story/highlight unavailable", url)
+                await status.edit_text(t('story_unavailable', lang))
                 return
             await send_error_to_admin(user_id, user_name, "Failed to extract video info", url)
             await status.edit_text(t('invalid_url', lang))

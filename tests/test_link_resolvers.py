@@ -464,6 +464,43 @@ def test_instagram_lookup_mirror_outage_not_flagged():
     assert unavailable is False
 
 
+def test_instagram_lookup_retries_transient_failure():
+    # 504 عابر ثم نجاح: محاولة واحدة كانت تُظهر «رابط غير صحيح» لستوري سليم
+    final = 'https://scontent.cdninstagram.com/o1/v/ok.mp4'
+    seq = [OSError('504 Gateway Timeout'), _FakeResp('video/mp4', final)]
+
+    def _flaky(*a, **k):
+        item = seq.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    with patch('urllib.request.urlopen', side_effect=_flaky), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        media, unavailable = instagram_mirror_lookup(
+            'https://www.instagram.com/stories/u/3950648105099614764')
+    assert media == final
+    assert unavailable is False
+    assert not seq          # استُهلكت المحاولتان
+
+
+def test_instagram_lookup_does_not_retry_clear_answer():
+    # ردّ واضح (إحالة لجدار الدخول) جواب نهائي: طلب واحد لا طلبان
+    wall = 'https://www.instagram.com/reel/DbV1WksiHiR/'
+    calls = []
+
+    def _count(*a, **k):
+        calls.append(1)
+        return _FakeResp('text/html', wall)
+
+    with patch('urllib.request.urlopen', side_effect=_count):
+        media, unavailable = instagram_mirror_lookup(
+            'https://www.instagram.com/stories/m33zmz/3951298895782901905')
+    assert media is None
+    assert unavailable is True
+    assert len(calls) == 1
+
+
 # ── ستوري إنستغرام: معرّف رقمي → رمز قصير → مسار /p/ ────────────
 
 def test_instagram_media_id_to_shortcode_known_value():

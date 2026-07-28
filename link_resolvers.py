@@ -481,9 +481,15 @@ def _instagram_story_path(url: str):
 # تعرف رقم مجموعته.
 # ═══════════════════════════════════════════════════════════════
 _IG_APP_ID = os.getenv('INSTAGRAM_APP_ID', '936619743392459')
-_IG_REELS_MEDIA_URL = os.getenv(
-    'INSTAGRAM_REELS_MEDIA_API',
-    'https://i.instagram.com/api/v1/feed/reels_media/')
+# مضيفان للنقطة نفسها: أحدهما قد يُحجب على شبكة دون أخرى (كلاهما محقَّق يعطي
+# النتيجة ذاتها بالبايت)، فنجرّبهما بالترتيب بدل أن يسقط الأبرز كلّه بحجب واحد
+_IG_REELS_MEDIA_URLS = [
+    u.strip() for u in os.getenv(
+        'INSTAGRAM_REELS_MEDIA_API',
+        'https://i.instagram.com/api/v1/feed/reels_media/,'
+        'https://www.instagram.com/api/v1/feed/reels_media/'
+    ).split(',') if u.strip()
+]
 
 _INSTAGRAM_HIGHLIGHT_PATH_RE = re.compile(r'/stories/highlights/(\d{8,25})', re.I)
 _INSTAGRAM_SHARE_PATH_RE = re.compile(r'/s/([A-Za-z0-9_\-=]{8,})', re.I)
@@ -558,18 +564,23 @@ def instagram_highlight_items(highlight_id: str, limit: int = 0, timeout: int = 
     import urllib.request
     if not highlight_id or not str(highlight_id).isdigit():
         return '', '', []
-    api = f"{_IG_REELS_MEDIA_URL}?reel_ids=highlight%3A{highlight_id}"
-    try:
-        req = urllib.request.Request(api, headers={
-            'User-Agent': _BROWSER_UA,
-            'X-IG-App-ID': _IG_APP_ID,
-            'Accept': '*/*',
-            'Referer': 'https://www.instagram.com/',
-        })
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode('utf-8', 'replace'))
-    except Exception as e:
-        logger.warning(f"⚠️ تعذّر جلب «الأبرز» {highlight_id}: {e}")
+    data = None
+    for base in _IG_REELS_MEDIA_URLS:
+        api = f"{base}?reel_ids=highlight%3A{highlight_id}"
+        try:
+            req = urllib.request.Request(api, headers={
+                'User-Agent': _BROWSER_UA,
+                'X-IG-App-ID': _IG_APP_ID,
+                'Accept': '*/*',
+                'Referer': 'https://www.instagram.com/',
+            })
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode('utf-8', 'replace'))
+            break
+        except Exception as e:
+            logger.warning(f"⚠️ تعذّر جلب «الأبرز» {highlight_id} من "
+                           f"{urlparse(base).hostname}: {e}")
+    if data is None:
         return '', '', []
     reels = (data or {}).get('reels') or {}
     reel = reels.get(f"highlight:{highlight_id}")
@@ -657,15 +668,24 @@ def instagram_mirror_lookup(url: str, timeout: int = 20):
     unavailable = False
     for proxy_host in _INSTAGRAM_PROXY_HOSTS:
         proxy_url = f"https://{proxy_host}{media_path}"
-        try:
-            req = urllib.request.Request(proxy_url, headers={
-                'User-Agent': _BOT_UA,
-                'Accept': '*/*',
-            })
-            # urlopen يتبع التوجيهات؛ geturl() = الرابط النهائي (mp4 على CDN)
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                ctype = (resp.headers.get_content_type() or '').lower()
-                final = resp.geturl()
+        # المرآة تردّ 504 عابراً تحت الضغط (شوهد ميدانياً: محاولة تفشل والتالية
+        # تنجح على الرابط نفسه)، فمحاولة واحدة كانت تُظهر «رابط غير صحيح»
+        # لستوري سليم. نعيد المحاولة على أعطال الشبكة وحدها — أما الردّ
+        # الواضح (وسيط/إحالة لجدار الدخول) فجواب نهائي لا يُعاد.
+        for attempt in (1, 2):
+            try:
+                req = urllib.request.Request(proxy_url, headers={
+                    'User-Agent': _BOT_UA,
+                    'Accept': '*/*',
+                })
+                # urlopen يتبع التوجيهات؛ geturl() = الرابط النهائي (mp4 على CDN)
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    ctype = (resp.headers.get_content_type() or '').lower()
+                    final = resp.geturl()
+            except Exception as e:
+                logger.warning(f"⚠️ تعذّر حل إنستغرام عبر {proxy_host} "
+                               f"({media_path}) محاولة {attempt}: {e}")
+                continue
             if ctype.startswith('video/') and is_safe_url(final):
                 logger.info(f"🎯 إنستغرام عبر {proxy_host}: {final[:90]}")
                 return final, False
@@ -674,11 +694,11 @@ def instagram_mirror_lookup(url: str, timeout: int = 20):
                 # خاص/محذوف. (الصور تبقى لمسار الصور: منشور مصوّر عام سليم)
                 unavailable = True
                 logger.info(f"🔒 {proxy_host} أحال لصفحة إنستغرام (منشور خاص/"
-                            f"محذوف؟) لـ {media_path}")
-                continue
-            logger.info(f"ℹ️ {proxy_host} لم يُرجع فيديو (نوع={ctype}) لـ {media_path}")
-        except Exception as e:
-            logger.warning(f"⚠️ تعذّر حل إنستغرام عبر {proxy_host} ({media_path}): {e}")
+                            f"محذوف/منتهٍ؟) لـ {media_path}")
+            else:
+                logger.info(f"ℹ️ {proxy_host} لم يُرجع فيديو (نوع={ctype}) "
+                            f"لـ {media_path}")
+            break  # ردّ واضح من المرآة — لا نكرّر الطلب عليها
     return None, unavailable
 
 
