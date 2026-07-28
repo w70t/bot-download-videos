@@ -487,6 +487,83 @@ def resolve_instagram_media(url: str, timeout: int = 20):
 
 
 # ═══════════════════════════════════════════════════════════════
+# ثريدز: مرآة عامة (بدون كوكيز)
+# yt-dlp لا يملك مستخرِجاً لثريدز إطلاقاً فيردّ "Unsupported URL"، وصفحة
+# المنشور واجهة جافاسكربت لا وسائط فيها للزوّار: لا og:video ولا JSON مضمّن،
+# وفحص 261 حزمة جافاسكربت (162 استعلام GraphQL) لم يُظهر استعلام وسائط المنشور
+# — أي أن ثريدز لا يسلّم الفيديو لغير المسجّلين أصلاً، ووسوم المعاينة تعطي
+# صورة الغلاف فقط حتى لوكلاء فيسبوك/تويتر الرسميين.
+# مرايا vxthreads العامة تجلب المنشور وتعيد وسم og:video فيه رابط mp4 مباشر
+# على cdninstagram — فنقرأه ونحمّله عادياً. تُجرَّب المضيفات بالترتيب؛ غيّرها
+# بمتغيّر البيئة THREADS_PROXY_HOSTS إن تعطّلت مرآة (بعضها يتوقّف فعلاً: عند
+# الكتابة كانت vxthreads.net وfixthreads.net تردّان 503 وvxthreads.com تعمل).
+# ═══════════════════════════════════════════════════════════════
+_THREADS_PROXY_HOSTS = [
+    h.strip() for h in os.getenv(
+        'THREADS_PROXY_HOSTS', 'vxthreads.com,vxthreads.net,fixthreads.net'
+    ).split(',') if h.strip()
+]
+
+# مسار منشور ثريدز: /@user/post/<code> أو /@user/video/<code>
+_THREADS_POST_RE = re.compile(
+    r'/(@[A-Za-z0-9_.]{1,40})/(?:post|video)/([A-Za-z0-9_-]{5,24})')
+
+
+def _threads_post_path(url: str, timeout: int = 15):
+    """«/@user/post/<code>» من رابط ثريدز، بعد توسيع الروابط المختصرة
+    (threads.net/t/<code>) لأن المعرّف لا يظهر فيها. None لغير المنشورات."""
+    import urllib.request
+    low = (url or '').lower()
+    if not any(m in low for m in PLATFORM_URL_MARKERS['threads']):
+        return None
+    if '/t/' in low:
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': _BROWSER_UA})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                url = r.geturl() or url
+        except Exception as e:
+            logger.warning(f"⚠️ تعذّر توسيع رابط ثريدز المختصر: {e}")
+    m = _THREADS_POST_RE.search(url or '')
+    return f"/{m.group(1)}/post/{m.group(2)}" if m else None
+
+
+def resolve_threads_media(url: str, timeout: int = 20):
+    """يحوّل رابط منشور ثريدز إلى رابط الفيديو المباشر (mp4) عبر مرآة عامة بلا
+    كوكيز، لأن yt-dlp لا يدعم ثريدز أصلاً.
+
+    يعيد رابط mp4 عند النجاح، أو None لغير روابط المنشورات أو لمنشور بلا فيديو
+    (صور/نصّ) أو عند أي فشل — فيبقى المسار الأصلي دون تغيير في السلوك."""
+    import re as _re
+    import urllib.request
+    from html import unescape
+    path = _threads_post_path(url, timeout=min(timeout, 15))
+    if not path:
+        return None
+    for host in _THREADS_PROXY_HOSTS:
+        proxy_url = f"https://{host}{path}"
+        try:
+            req = urllib.request.Request(proxy_url, headers={
+                'User-Agent': _BOT_UA,   # المرايا تعطي وسوم المعاينة للبوتات
+                'Accept': 'text/html,*/*',
+            })
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                page = resp.read(2_000_000).decode('utf-8', 'ignore')
+        except Exception as e:
+            logger.warning(f"⚠️ تعذّر حل ثريدز عبر {host} ({path}): {e}")
+            continue
+        for pat in (r'property=["\']og:video(?::secure_url)?["\'][^>]*?content=["\']([^"\']+)["\']',
+                    r'content=["\']([^"\']+)["\'][^>]*?property=["\']og:video'):
+            m = _re.search(pat, page)
+            if m:
+                media = unescape(m.group(1))
+                if media.lower().startswith(('http://', 'https://')) and is_safe_url(media):
+                    logger.info(f"🎯 ثريدز عبر {host}: {media[:90]}")
+                    return media
+        logger.info(f"ℹ️ {host} لم يُرجع فيديو ثريدز لـ {path} (منشور صور/نصّ؟)")
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════
 # مرآة تيك توك العامة (بديل عند حجب IP الخادم)
 # تيك توك يحجب عناوين مراكز البيانات فيعيد "Your IP address is blocked"،
 # فيفشل yt-dlp حتى مع كوكيز صالحة (الحجب على مستوى الـ IP قبل الكوكيز). مرآة
@@ -1104,6 +1181,8 @@ def all_mirror_hosts():
     hosts = []
     for h in _INSTAGRAM_PROXY_HOSTS:
         hosts.append(('instagram', h))
+    for h in _THREADS_PROXY_HOSTS:
+        hosts.append(('threads', h))
     for h in _TIKTOK_API_HOSTS:
         hosts.append(('tiktok', h))
     for h in _TWITTER_API_HOSTS:

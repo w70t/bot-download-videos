@@ -54,6 +54,7 @@ from link_resolvers import (
     set_snapchat_clean_rendition, get_snapchat_clean_rendition,
     _is_music_link, resolve_music_link,
     resolve_instagram_media, instagram_mirror_lookup, resolve_tiktok_media,
+    resolve_threads_media,
     twitter_mirror_lookup, twitter_mirror_media,
     resolve_tiktok_images, resolve_pinterest_media, resolve_pinterest_images,
     is_substack_note, resolve_substack_note, all_mirror_hosts,
@@ -688,6 +689,28 @@ async def _instagram_video_fallback(url: str):
         return None
 
 
+async def _threads_video_fallback(url: str):
+    """ثريدز: yt-dlp لا يدعمه إطلاقاً («Unsupported URL»)، وصفحة المنشور لا
+    تعطي الزوّار أي وسائط. نحلّ الرابط لملف mp4 مباشر عبر مرآة عامة (بلا كوكيز)
+    ثم نستخرج معلوماته. يعيد dict أو None لمنشور بلا فيديو أو عند أي فشل."""
+    if _platform_of(url) != 'threads':
+        return None
+    loop = asyncio.get_event_loop()
+    direct = await loop.run_in_executor(None, resolve_threads_media, url)
+    if not direct:
+        return None
+    try:
+        info = await loop.run_in_executor(
+            None, lambda: _extract_direct_media(direct, 'Threads Video')
+        )
+        if info:
+            logger.info("✅ ثريدز عبر المرآة العامة (بلا كوكيز)")
+        return info
+    except Exception as e:
+        logger.warning(f"⚠️ فشل استخراج ثريدز البديل: {e}")
+        return None
+
+
 async def resolve_tiktok_direct(url: str):
     """يحل رابط تيك توك إلى رابط الفيديو المباشر عبر مرآة عامة (بلا كوكيز).
     يعيد رابط mp4 المباشر أو None. طلب شبكي متزامن يُنفَّذ خارج حلقة الأحداث."""
@@ -1230,6 +1253,10 @@ async def get_video_info(url: str):
         tk = await _tiktok_video_fallback(url)
         if tk:
             return tk
+        # 🎯 ثريدز: لا مستخرِج له في yt-dlp أصلاً → مرآة عامة تعيد mp4 مباشراً
+        th = await _threads_video_fallback(url)
+        if th:
+            return th
         # 🎯 خطة بديلة لتويتر/X: حجب/تقييد يفشل yt-dlp → جرّب مرآة عامة (mp4 مباشر)
         tw = await _twitter_video_fallback(url)
         if tw:

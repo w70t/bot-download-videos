@@ -27,7 +27,7 @@ def test_all_mirror_hosts_lists_configured_mirrors():
     # قائمة أزواج (منصة، مضيف) تشمل المرايا الافتراضية
     assert all(isinstance(p, tuple) and len(p) == 2 for p in hosts)
     platforms = {p for p, _ in hosts}
-    assert {'instagram', 'tiktok', 'twitter', 'pinterest'} <= platforms
+    assert {'instagram', 'tiktok', 'twitter', 'pinterest', 'threads'} <= platforms
     host_names = {h for _, h in hosts}
     assert 'tikwm.com' in host_names
     assert 'api.vxtwitter.com' in host_names
@@ -457,6 +457,82 @@ def test_instagram_lookup_mirror_outage_not_flagged():
             'https://www.instagram.com/reel/ABC123/')
     assert media is None
     assert unavailable is False
+
+
+# ── resolve_threads_media (ثريدز عبر مرآة عامة) ─────────────────
+
+class _FakeHtml:
+    """محاكاة استجابة urlopen تُرجع صفحة HTML عبر read()."""
+    def __init__(self, body):
+        self._b = body.encode('utf-8')
+
+    def read(self, *a):
+        return self._b
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+_THREADS_MP4 = 'https://scontent-iad3-2.cdninstagram.com/o1/v/t2/f2/m86/AQP36.mp4'
+
+
+def test_threads_resolver_ignores_non_posts():
+    # بلا أي طلب شبكي: غير ثريدز، أو بروفايل بلا منشور
+    assert link_resolvers.resolve_threads_media('https://youtube.com/watch?v=1') is None
+    assert link_resolvers.resolve_threads_media('https://www.threads.com/@zuck') is None
+    assert link_resolvers.resolve_threads_media('') is None
+
+
+def test_threads_resolver_reads_og_video():
+    """yt-dlp لا يدعم ثريدز، والمرآة تعطي og:video برابط mp4 مباشر."""
+    page = (f'<meta property="og:image" content="https://x/cover.jpg"/>'
+            f'<meta property="og:video" content="{_THREADS_MP4}"/>')
+    for url in ('https://www.threads.com/@user/post/DauKPbYnR6q',
+                'https://www.threads.net/@user/video/DauKPbYnR6q',
+                'https://www.threads.com/@user/post/DauKPbYnR6q/video-slug'):
+        with patch('urllib.request.urlopen', return_value=_FakeHtml(page)), \
+                patch.object(link_resolvers, 'is_safe_url', return_value=True):
+            assert link_resolvers.resolve_threads_media(url) == _THREADS_MP4
+
+
+def test_threads_resolver_none_for_photo_post():
+    # منشور صور/نصّ: المرآة تعطي og:image بلا og:video → None فيبقى المسار الأصلي
+    page = '<meta property="og:image" content="https://x/pic.jpg"/>'
+    with patch('urllib.request.urlopen', return_value=_FakeHtml(page)), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        assert link_resolvers.resolve_threads_media(
+            'https://www.threads.com/@user/post/DauKPbYnR6q') is None
+
+
+def test_threads_resolver_tries_next_mirror_on_failure():
+    """أول مرآة معطّلة (503 وقت الكتابة) → نجرّب التالية بدل الاستسلام."""
+    page = f'<meta property="og:video" content="{_THREADS_MP4}"/>'
+    calls = []
+
+    def fake(req, *a, **k):
+        url = req if isinstance(req, str) else req.full_url
+        calls.append(url)
+        if len(calls) == 1:
+            raise OSError('503')
+        return _FakeHtml(page)
+
+    with patch.object(link_resolvers, '_THREADS_PROXY_HOSTS',
+                      ['down.example', 'up.example']), \
+            patch('urllib.request.urlopen', side_effect=fake), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        out = link_resolvers.resolve_threads_media(
+            'https://www.threads.com/@user/post/DauKPbYnR6q')
+    assert out == _THREADS_MP4
+    assert len(calls) == 2 and 'up.example' in calls[1]
+
+
+def test_threads_resolver_handles_all_mirrors_down():
+    with patch('urllib.request.urlopen', side_effect=OSError('503')):
+        assert link_resolvers.resolve_threads_media(
+            'https://www.threads.com/@user/post/DauKPbYnR6q') is None
 
 
 # ── resolve_tiktok_media ────────────────────────────────────────
