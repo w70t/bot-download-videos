@@ -528,11 +528,15 @@ def test_facebook_share_survives_network_failure():
 
 class _FakeHtml:
     """محاكاة استجابة urlopen تُرجع صفحة HTML عبر read()."""
-    def __init__(self, body):
+    def __init__(self, body, final='https://example.invalid/'):
         self._b = body.encode('utf-8')
+        self._final = final
 
     def read(self, *a):
         return self._b
+
+    def geturl(self):
+        return self._final
 
     def __enter__(self):
         return self
@@ -678,15 +682,77 @@ def test_threads_resolver_handles_all_mirrors_down():
             'https://www.threads.com/@user/post/DauKPbYnR6q') is None
 
 
+# ── tiktok_source_analysis (تحليل مصدر المقطع) ──────────────────
+
+def test_tiktok_analysis_ignores_non_tiktok():
+    # بلا أي طلب شبكي
+    assert link_resolvers.tiktok_source_analysis('https://youtube.com/watch?v=1') == {}
+    assert link_resolvers.tiktok_source_analysis('') == {}
+
+
+def test_tiktok_id_carries_upload_timestamp():
+    """أول ٣٢ بت من معرّف المقطع طابع يونكس — تحقّق ميداني: طابق create_time
+    بفارق ثوانٍ (المعرّف يُخصَّص عند بدء الرفع لا نهايته)."""
+    ts = link_resolvers._tt_ts(7666463874119404833 >> 32)
+    assert ts is not None
+    assert ts.strftime('%Y-%m-%d') == '2026-07-25'
+
+
+def test_tt_ts_rejects_out_of_range():
+    # قيم مشوّهة/خارج النطاق المعقول لا تُنتج تواريخ خاطئة
+    for bad in (None, '', 'abc', 0, -1, 99999999999999):
+        assert link_resolvers._tt_ts(bad) is None
+
+
+def test_tiktok_analysis_collects_public_fields():
+    """المصادر الثلاثة تُدمج، وغياب أحدها لا يُفشل البقية."""
+    import json as _json
+    user = {'createTime': 1776316829, 'language': 'de',
+            'avatarLarger': 'https://p16.tiktokcdn.com/tos-useast2a-avt-0068-euttp/x~tplv.jpeg'}
+    page = ('<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">'
+            + _json.dumps({'__DEFAULT_SCOPE__': {'webapp.user-detail':
+                                                 {'userInfo': {'user': user}}}})
+            + '</script>')
+
+    def fake(req, *a, **k):
+        url = req if isinstance(req, str) else req.full_url
+        if 'tikwm' in url:
+            return _FakeJsonResp({'data': {'region': 'DE', 'create_time': 1785032122}})
+        return _FakeHtml(page)
+
+    with patch('urllib.request.urlopen', side_effect=fake):
+        out = link_resolvers.tiktok_source_analysis(
+            'https://www.tiktok.com/@mohamed.janoudi7/video/7666463874119404833')
+    assert out['video_id'] == '7666463874119404833'
+    assert out['username'] == 'mohamed.janoudi7'
+    assert out['video_region'] == 'DE'
+    assert out['language'] == 'de'
+    assert out['storage_region'] == 'EU'      # euttp → منطقة الاتحاد الأوروبي
+    assert out['account_created'].strftime('%Y-%m-%d') == '2026-04-16'
+
+
+def test_tiktok_analysis_survives_all_sources_failing():
+    # فشل الشبكة كاملاً → نبقي ما استُخرج من الرابط نفسه بلا استثناء
+    with patch('urllib.request.urlopen', side_effect=OSError('boom')):
+        out = link_resolvers.tiktok_source_analysis(
+            'https://www.tiktok.com/@u/video/7666463874119404833')
+    assert out['video_id'] == '7666463874119404833'
+    assert 'video_region' not in out
+
+
 # ── resolve_tiktok_media ────────────────────────────────────────
 
 class _FakeJsonResp:
     """محاكاة استجابة urlopen تُرجع جسم JSON عبر read()."""
-    def __init__(self, payload):
+    def __init__(self, payload, final='https://example.invalid/'):
         self._body = json.dumps(payload).encode('utf-8')
+        self._final = final
 
     def read(self, *a):
         return self._body
+
+    def geturl(self):
+        return self._final
 
     def __enter__(self):
         return self

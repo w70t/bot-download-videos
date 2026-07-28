@@ -57,7 +57,8 @@ from link_resolvers import (
     resolve_threads_media, threads_mirror_lookup,
     resolve_facebook_share, is_facebook_story,
     twitter_mirror_lookup, twitter_mirror_media,
-    resolve_tiktok_images, resolve_pinterest_media, resolve_pinterest_images,
+    resolve_tiktok_images, tiktok_source_analysis,
+    resolve_pinterest_media, resolve_pinterest_images,
     is_substack_note, resolve_substack_note, all_mirror_hosts,
 )
 from content_filter import (
@@ -875,6 +876,11 @@ async def _substack_video_fallback(url: str):
 #   SNAPCHAT_CLEAN_MEDIA=0       → تعطيل المسار والاكتفاء بالسلوك السابق
 #   SNAPCHAT_MEDIA_SERVICE=<url> → تغيير عنوان الخدمة إن غيّره سناب
 # ═══════════════════════════════════════════════════════════════
+# 🔎 تحليل مصدر مقاطع تيك توك (بلد النشر + عمر الحساب) في وصف الرفع.
+# اضبط 0 لتعطيله (يوفّر طلبين شبكيين لكل مقطع تيك توك).
+TIKTOK_SOURCE_ANALYSIS = os.getenv(
+    'TIKTOK_SOURCE_ANALYSIS', '1').strip().lower() not in ('0', 'false', 'no', 'off')
+
 SNAPCHAT_MEDIA_SERVICE = os.getenv(
     'SNAPCHAT_MEDIA_SERVICE', 'https://ms.sc-jpl.com/web/getStoryElements')
 
@@ -2307,8 +2313,62 @@ def _clean_media_title(raw_title, url):
     return f"{label} Video" if label else 'فيديو'
 
 
+# أسماء الدول الشائعة بالعربية + علمها (رمز ISO-3166 alpha-2 من تيك توك).
+# ما لا يرد هنا يُعرض برمزه كما هو — أفضل من إخفائه.
+_COUNTRY_AR = {
+    'SA': ('السعودية', '🇸🇦'), 'AE': ('الإمارات', '🇦🇪'), 'EG': ('مصر', '🇪🇬'),
+    'SY': ('سوريا', '🇸🇾'), 'IQ': ('العراق', '🇮🇶'), 'JO': ('الأردن', '🇯🇴'),
+    'KW': ('الكويت', '🇰🇼'), 'QA': ('قطر', '🇶🇦'), 'BH': ('البحرين', '🇧🇭'),
+    'OM': ('عُمان', '🇴🇲'), 'YE': ('اليمن', '🇾🇪'), 'LB': ('لبنان', '🇱🇧'),
+    'PS': ('فلسطين', '🇵🇸'), 'MA': ('المغرب', '🇲🇦'), 'DZ': ('الجزائر', '🇩🇿'),
+    'TN': ('تونس', '🇹🇳'), 'LY': ('ليبيا', '🇱🇾'), 'SD': ('السودان', '🇸🇩'),
+    'DE': ('ألمانيا', '🇩🇪'), 'TR': ('تركيا', '🇹🇷'), 'US': ('أمريكا', '🇺🇸'),
+    'GB': ('بريطانيا', '🇬🇧'), 'FR': ('فرنسا', '🇫🇷'), 'NL': ('هولندا', '🇳🇱'),
+    'SE': ('السويد', '🇸🇪'), 'CA': ('كندا', '🇨🇦'), 'AU': ('أستراليا', '🇦🇺'),
+    'IN': ('الهند', '🇮🇳'), 'PK': ('باكستان', '🇵🇰'), 'ID': ('إندونيسيا', '🇮🇩'),
+    'MY': ('ماليزيا', '🇲🇾'), 'ES': ('إسبانيا', '🇪🇸'), 'IT': ('إيطاليا', '🇮🇹'),
+}
+
+
+def _country_label(code):
+    """«ألمانيا 🇩🇪» من رمز الدولة، أو الرمز كما هو إن كان غير معروف."""
+    code = str(code or '').strip().upper()
+    if not code:
+        return None
+    name, flag = _COUNTRY_AR.get(code, (code, '🌍'))
+    return f"{name} {flag}"
+
+
+def _build_source_lines(info):
+    """أسطر تحليل المصدر لوصف الرفع (تيك توك)، أو [] إن لا بيانات.
+
+    البيانات كلها علنية: منطقة نشر المقطع، وبلد تسجيل الحساب، وتاريخ إنشائه."""
+    a = (info or {}).get('_source_analysis') or {}
+    if not a:
+        return []
+    lines = []
+    where = _country_label(a.get('video_region'))
+    if where:
+        lines.append(f"🌍 نُشر من: {where}")
+    created = a.get('account_created')
+    if created:
+        try:
+            from datetime import datetime, timezone
+            days = (datetime.now(timezone.utc) - created).days
+            lines.append(f"📅 الحساب أُنشئ: {created:%Y-%m-%d} (قبل {days} يوماً)")
+        except Exception:
+            lines.append(f"📅 الحساب أُنشئ: {created:%Y-%m-%d}")
+    # منطقة تخزين الحساب: دليل بلد التسجيل، وهي قرار بنية تحتية لا اختيار
+    # مستخدم — فتبقى دالّة حتى لو غيّر نبذته أو سافر
+    store = {'EU': 'الاتحاد الأوروبي 🇪🇺', 'SG': 'سنغافورة 🇸🇬',
+             'US': 'أمريكا 🇺🇸'}.get(a.get('storage_region'))
+    if store:
+        lines.append(f"🗄️ تخزين الحساب: {store}")
+    return lines
+
+
 def _build_media_caption(title, file_size_mb, duration, user_name,
-                         bot_username=None, stats=None):
+                         bot_username=None, stats=None, source_lines=None):
     """وصف الوسائط الموحّد: العنوان قابل للنسخ (monospace) + الحجم والمدة +
     يوزر البوت (يبقى مع الفيديو عند إعادة إرساله).
 
@@ -2317,12 +2377,14 @@ def _build_media_caption(title, file_size_mb, duration, user_name,
     safe_title = (title or 'فيديو').replace('`', "'")[:300]
     dur_line = f"⏱️ {int(duration)//60}:{int(duration)%60:02d}\n" if duration else ""
     stats_line = f"{str(stats).strip()}\n" if stats else ""
+    src_line = ''.join(f"{ln}\n" for ln in (source_lines or []))
     promo = f"\n\n📥 @{bot_username}" if bot_username else ""
     return (
         f"🎬 `{safe_title}`\n\n"
         f"📊 {file_size_mb:.1f} MB\n"
         f"{dur_line}"
         f"{stats_line}"
+        f"{src_line}"
         f"👤 {user_name}"
         f"{promo}"
     )
@@ -3474,6 +3536,15 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         duration = info.get('duration', 0)
         # العنوان: اسم نظيف موحّد بين المنصات (يستبدل معرّفات CDN القبيحة مثل
         # إنستغرام عبر المرآة)، مع إزالة ` حتى لا يكسر تنسيق النسخ وحد آمن للوصف
+        # 🔎 تحليل مصدر مقطع تيك توك (بيانات عامة) لعرضه مع الفيديو. طلب شبكي
+        #    متزامن يُنفَّذ خارج حلقة الأحداث، وأي فشل فيه لا يمسّ التحميل.
+        if TIKTOK_SOURCE_ANALYSIS and _platform_of(url) == 'tiktok':
+            try:
+                info['_source_analysis'] = await loop.run_in_executor(
+                    None, tiktok_source_analysis, url)
+            except Exception as _e:
+                logger.info(f"ℹ️ تعذّر تحليل مصدر تيك توك: {_e}")
+
         # بيانات ثريدز من المرآة: yt-dlp لا يعرف عنوان/مدّة/أبعاد ملف mp4 بعيد،
         # فنكمل الناقص فقط ونستبدل العنوان بنصّ المنشور بدل معرّف الملف
         if _threads_meta:
@@ -3509,7 +3580,8 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         caption = _build_media_caption(
             title, file_size_mb, duration, user_name,
             bot_username=await _get_bot_username(client),
-            stats=_threads_meta.get('stats')
+            stats=_threads_meta.get('stats'),
+            source_lines=_build_source_lines(info)
         )
         
         if is_audio:

@@ -810,6 +810,115 @@ def resolve_tiktok_media(url: str, timeout: int = 20):
     return None
 
 
+# ── تحليل مصدر مقطع تيك توك (بيانات عامة) ──────────────────────
+# ثلاثة مصادر مستقلّة، كلها علنية يراها أي زائر:
+#   ١) معرّف المقطع نفسه: أول ٣٢ بت طابع يونكس لوقت الرفع (تحقّق ميداني: طابق
+#      حقل create_time بفارق ثوانٍ — المعرّف يُخصَّص عند بدء الرفع لا نهايته)
+#   ٢) المرآة: منطقة نشر المقطع (region)
+#   ٣) صفحة الحساب: createTime الصريح، ولغة الواجهة، ومنطقة تخزين الصورة
+#      الرمزية — وهذه الأخيرة أقوى دليل على بلد التسجيل لأنها قرار بنية تحتية
+#      (امتثال حماية البيانات) لا اختيار مستخدم ولا نصّ يكتبه في نبذته.
+_TT_STORAGE_REGIONS = (('euttp', 'EU'), ('alisg', 'SG'),
+                       ('maliva', 'US'), ('useast', 'US'))
+
+_TT_VIDEO_ID_RE = re.compile(r'/video/(\d{10,25})')
+_TT_USERNAME_RE = re.compile(r'/@([A-Za-z0-9_.]{1,40})')
+
+
+def _tt_ts(value):
+    """طابع يونكس → datetime، أو None عند قيمة غير صالحة."""
+    from datetime import datetime, timezone
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return None
+    # نطاق معقول: 2016 حتى 2100 (يستبعد القيم المشوّهة)
+    if not (1451606400 < v < 4102444800):
+        return None
+    return datetime.fromtimestamp(v, tz=timezone.utc)
+
+
+def tiktok_source_analysis(url: str, timeout: int = 20) -> dict:
+    """يحلّل مصدر مقطع تيك توك من بياناته العامة.
+
+    يعيد dict بما أمكن جمعه (كل مفتاح اختياري، فغياب مصدر لا يُفشل البقية):
+      video_id · published (datetime) · video_region (بلد نشر المقطع)
+      username · account_created (datetime) · language · storage_region
+
+    كل ما يُقرأ علنيّ يراه أي زائر — لا شيء خاص ولا موقع جغرافي دقيق."""
+    import json
+    import urllib.request
+    import urllib.parse
+    out = {}
+    low = (url or '').lower()
+    if 'tiktok.' not in low:
+        return out
+
+    def fetch(u, ua, cap=3_000_000):
+        req = urllib.request.Request(u, headers={'User-Agent': ua, 'Accept': '*/*'})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read(cap).decode('utf-8', 'ignore'), (r.geturl() or u)
+
+    # ١) وسّع المختصر ثم استخرج المعرّف واسم الحساب
+    full = url
+    if any(s in low for s in ('vm.tiktok.', 'vt.tiktok.', '/t/')):
+        try:
+            _body, full = fetch(url, _BROWSER_UA, 2000)
+        except Exception as e:
+            logger.info(f"ℹ️ تعذّر توسيع رابط تيك توك للتحليل: {e}")
+    m = _TT_VIDEO_ID_RE.search(full or '')
+    if m:
+        out['video_id'] = m.group(1)
+        ts = _tt_ts(int(m.group(1)) >> 32)   # الطابع الزمني داخل المعرّف
+        if ts:
+            out['published'] = ts
+    mu = _TT_USERNAME_RE.search(full or '')
+    if mu:
+        out['username'] = mu.group(1)
+
+    # ٢) منطقة نشر المقطع من المرآة (وتاريخ أدقّ إن توفّر)
+    if out.get('video_id'):
+        for host in _TIKTOK_API_HOSTS:
+            try:
+                api = (f"https://{host}/api/?url="
+                       + urllib.parse.quote((full or '').split('?')[0], safe=''))
+                data = (json.loads(fetch(api, _BOT_UA, 2_000_000)[0]).get('data') or {})
+            except Exception:
+                continue
+            if data.get('region'):
+                out['video_region'] = str(data['region']).upper()
+            ts = _tt_ts(data.get('create_time'))
+            if ts:
+                out['published'] = ts
+            break
+
+    # ٣) بيانات الحساب من صفحته العامة
+    if out.get('username'):
+        try:
+            page, _f = fetch(f"https://www.tiktok.com/@{out['username']}", _BROWSER_UA)
+            j = re.search(r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>',
+                          page, re.S)
+            user = (json.loads(j.group(1))['__DEFAULT_SCOPE__']
+                    ['webapp.user-detail']['userInfo']['user']) if j else {}
+            ts = _tt_ts(user.get('createTime'))
+            if ts:
+                out['account_created'] = ts
+            if user.get('language'):
+                out['language'] = str(user['language'])
+            avatar = user.get('avatarLarger') or ''
+            for seg, region in _TT_STORAGE_REGIONS:
+                if seg in avatar:
+                    out['storage_region'] = region
+                    break
+        except Exception as e:
+            logger.info(f"ℹ️ تعذّر تحليل حساب تيك توك @{out.get('username')}: {e}")
+    if out:
+        logger.info(f"🔎 تحليل تيك توك: منطقة={out.get('video_region','—')} "
+                    f"حساب=@{out.get('username','—')} "
+                    f"أُنشئ={str(out.get('account_created','—'))[:10]}")
+    return out
+
+
 def resolve_tiktok_images(url: str, timeout: int = 20):
     """يعيد قائمة روابط صور منشور تيك توك المصوّر (سلايدشو) عبر مرآة عامة بلا
     كوكيز، حين يفشل gallery-dl (حجب IP الخادم). قائمة روابط مباشرة مرتّبة، أو
