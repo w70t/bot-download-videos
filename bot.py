@@ -1512,18 +1512,19 @@ def resolve_instagram_images(url, timeout=20):
     # الريلز/IGTV (reel|reels|tv) فيديو دائماً — لو أخفق مسار الفيديو فإعادة صورة
     # الغلاف من المرآة تضلّل المستخدم (يستقبل "صورة" بدل فيديو). لذا نقتصر هنا على
     # منشورات /p/ وحدها (كاروسيل صور/صورة)، ونترك الريلز لمسار الفيديو ورسالة الفشل.
-    m = re.search(r'/p/([A-Za-z0-9_-]+)', path, re.I)
-    if m:
-        shortcode = m.group(1)
-    else:
-        # 📖 ستوري صورة: معرّف عنصر الستوري في نفس فضاء معرّفات المنشورات، فرمزه
-        #    القصير يعمل على مسار /p/. آمن للستوري المصوّر فقط: ستوري الفيديو
-        #    تعيده المرآة بنوع video/mp4 فيرفضه _fetch_mirror_image_url ويبقى
-        #    على مسار الفيديو (لا غلاف يُرسَل بدل المقطع).
-        story_path = _instagram_story_path(url)
-        if not story_path:
-            return []  # ريل/IGTV/بروفايل — ليس منشور صور، لا مرآة صور له
-        shortcode = story_path.rsplit('/', 1)[-1]
+    # 📖 ستوري صورة: معرّف عنصر الستوري في نفس فضاء معرّفات المنشورات، فرمزه
+    #    القصير يعمل على مسار /p/. آمن للستوري المصوّر فقط: ستوري الفيديو تعيده
+    #    المرآة بنوع video/mp4 فيرفضه _fetch_mirror_image_url ويبقى على مسار
+    #    الفيديو (لا غلاف يُرسَل بدل المقطع).
+    #    نبدأ بـstory_media_id: معرّف صريح موثوق، والجزء المرمّز في رابط «/s/»
+    #    قد يحوي ما يشبه «/p/» فيخدع تعبير المسار.
+    story_path = _instagram_story_path(url) if 'story_media_id=' in low else None
+    if not story_path:
+        m = re.search(r'/p/([A-Za-z0-9_-]+)', path, re.I)
+        story_path = f"/p/{m.group(1)}" if m else _instagram_story_path(url)
+    if not story_path:
+        return []  # ريل/IGTV/بروفايل — ليس منشور صور، لا مرآة صور له
+    shortcode = story_path.rsplit('/', 1)[-1]
     ua = 'Mozilla/5.0 (compatible; TelegramBot)'
 
     # (1) مرايا تدعم فهرسة الكاروسيل: اجمع كل عناصرها حتى أول فشل

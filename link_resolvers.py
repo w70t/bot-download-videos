@@ -419,9 +419,12 @@ _INSTAGRAM_MEDIA_RE = re.compile(r'/(?:reel|reels|p|tv)/[A-Za-z0-9_-]+', re.I)
 # ═══════════════════════════════════════════════════════════════
 _INSTAGRAM_STORY_RE = re.compile(r'/stories/(?!highlights/)[^/]+/(\d{8,25})', re.I)
 
-# روابط «الأبرز» (highlights) تحمل رقم المجموعة لا رقم العنصر في المسار، لكن
-# رابط المشاركة يضع معرّف العنصر في story_media_id=«<معرّف الوسائط>_<معرّف المالك>»
-_INSTAGRAM_HIGHLIGHT_RE = re.compile(r'/stories/highlights/', re.I)
+# روابط «الأبرز» (highlights) بصيغتيها — الطويلة «/stories/highlights/<رقم>/»
+# والمختصرة «/s/<مرمّز>» (يفكّ إلى «highlight:<رقم>») — تحمل رقم **المجموعة** لا
+# رقم العنصر في المسار، فترميزه يعطي رمزاً لا وجود له. لكن رابط المشاركة يضع
+# معرّف العنصر الحقيقي في story_media_id=«<معرّف الوسائط>_<معرّف المالك>».
+# محقَّق ميدانياً: /s/aGlnaGxpZ2h0OjE4MDgwMTA1ODI4MDU0MTIy?story_media_id=
+# 3740582527900321836 → الرمز DPpN_2ciAgs → mp4 حقيقي 720×1280 و٢٠.٦ث.
 _INSTAGRAM_STORY_MEDIA_ID_RE = re.compile(r'[?&]story_media_id=(\d{8,25})', re.I)
 
 # أبجدية إنستغرام للرموز القصيرة (base64 بترتيب مختلف عن القياسي)
@@ -448,13 +451,16 @@ def _instagram_media_id_to_shortcode(media_id) -> str:
 def _instagram_story_path(url: str):
     """«/p/<رمز>» المكافئ لرابط ستوري إنستغرام، أو None لغير الستوري.
 
-    يقبل صيغتَي الستوري: العنصر المباشر «/stories/<حساب>/<معرّف>» ورابط
-    «الأبرز» الذي يحمل معرّف العنصر في story_media_id (لأن رقم المسار فيه هو
-    رقم المجموعة لا رقم الوسائط، فترميزه يعطي رمزاً لا وجود له)."""
+    يقبل كل صيغ الستوري: العنصر المباشر «/stories/<حساب>/<معرّف>»، وروابط
+    «الأبرز» الطويلة «/stories/highlights/<رقم>/» والمختصرة «/s/<مرمّز>» —
+    وفي الأخيرتين يُؤخذ المعرّف من story_media_id في الاستعلام لأن رقم المسار
+    هو رقم المجموعة لا رقم الوسائط."""
     u = url or ''
     m = _INSTAGRAM_STORY_RE.search(u)
     media_id = m.group(1) if m else None
-    if media_id is None and _INSTAGRAM_HIGHLIGHT_RE.search(u):
+    if media_id is None:
+        # أي صيغة تحمل story_media_id: هو بالتعريف معرّف عنصر الستوري نفسه،
+        # فلا حاجة للتعرّف على شكل المسار (يغطّي /s/ و/stories/highlights/ وما يجدّه إنستغرام)
         hm = _INSTAGRAM_STORY_MEDIA_ID_RE.search(u)
         media_id = hm.group(1) if hm else None
     if media_id is None:
@@ -469,7 +475,7 @@ def is_instagram_story(url: str) -> bool:
     low = (url or '').lower()
     if not any(h in low for h in ('instagram.com', 'instagr.am')):
         return False
-    return '/stories/' in low
+    return '/stories/' in low or 'story_media_id=' in low
 
 # وكيل مستخدم بوت: المرايا تعيد توجيهاً مباشراً للفيديو للبوتات، وصفحة هبوط
 # للمتصفحات، لذا ننتحل بوت معاينة روابط للحصول على ملف mp4 مباشرة.
@@ -507,17 +513,24 @@ def instagram_mirror_lookup(url: str, timeout: int = 20):
         path = urlparse(url).path
     except Exception:
         return None, False
-    m = _INSTAGRAM_MEDIA_RE.search(path)
-    if m:
-        media_path = m.group(0)
+    # الستوري: المرآة ترفض مسار /stories/ لكن معرّف العنصر في نفس فضاء معرّفات
+    # المنشورات، فنحوّله لرمزه القصير ونطلبه على مسار /p/. نبدأ بـstory_media_id
+    # لأنه معرّف صريح موثوق، ولأن الجزء المرمّز في رابط «/s/» قد يحوي ما يشبه
+    # مسار منشور فيخدع تعبير المسار.
+    media_path = (_instagram_story_path(url)
+                  if 'story_media_id=' in low else None)
+    if media_path:
+        logger.info(f"📖 «أبرز»/ستوري إنستغرام (story_media_id) → {media_path}")
     else:
-        # الستوري: المرآة ترفض مسار /stories/ لكن معرّف العنصر في نفس فضاء
-        # معرّفات المنشورات، فنحوّله لرمزه القصير ونطلبه على مسار /p/
-        # (الرابط كاملاً لا المسار وحده: رابط «الأبرز» يحمل المعرّف في الاستعلام)
-        media_path = _instagram_story_path(url)
-        if not media_path:
-            return None, False  # بروفايل/رابط غير منشور — لا مرآة له
-        logger.info(f"📖 ستوري إنستغرام → {media_path}")
+        m = _INSTAGRAM_MEDIA_RE.search(path)
+        if m:
+            media_path = m.group(0)
+        else:
+            # الرابط كاملاً لا المسار وحده (بعض الصيغ تضع المعرّف في الاستعلام)
+            media_path = _instagram_story_path(url)
+            if not media_path:
+                return None, False  # بروفايل/رابط غير منشور — لا مرآة له
+            logger.info(f"📖 ستوري إنستغرام → {media_path}")
     unavailable = False
     for proxy_host in _INSTAGRAM_PROXY_HOSTS:
         proxy_url = f"https://{proxy_host}{media_path}"

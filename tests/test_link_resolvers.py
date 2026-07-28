@@ -528,6 +528,38 @@ def test_instagram_story_path_highlights():
     ) == '/p/DbThYUpCFos'
 
 
+def test_instagram_story_path_short_share_link():
+    # صيغة المشاركة المختصرة «/s/<مرمّز>» — المرمّز يفكّ إلى «highlight:<رقم>»
+    # (رقم المجموعة) فالمعوَّل عليه story_media_id. محقَّق ميدانياً: هذا الرابط
+    # أعطى /p/DPpN_2ciAgs ومنه نزل mp4 حقيقي 720×1280 و٢٠.٦ث
+    assert _instagram_story_path(
+        'https://www.instagram.com/s/aGlnaGxpZ2h0OjE4MDgwMTA1ODI4MDU0MTIy'
+        '?story_media_id=3740582527900321836&igsh=eHBxbjdvcWRxbXAw'
+    ) == '/p/DPpN_2ciAgs'
+    # بلا story_media_id لا يمكن استخراج معرّف الوسائط من الرابط
+    assert _instagram_story_path(
+        'https://www.instagram.com/s/aGlnaGxpZ2h0OjE4MDgwMTA1ODI4MDU0MTIy') is None
+
+
+def test_instagram_lookup_short_share_link_requests_post_path():
+    # /s/ المرمّز قد يحوي ما يشبه مسار منشور — لا بد أن يفوز story_media_id
+    final = 'https://scontent.cdninstagram.com/o1/v/hl.mp4'
+    seen = []
+
+    def _fake_urlopen(req, *a, **k):
+        seen.append(req.full_url)
+        return _FakeResp('video/mp4', final)
+
+    with patch('urllib.request.urlopen', side_effect=_fake_urlopen), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        media, unavailable = instagram_mirror_lookup(
+            'https://www.instagram.com/s/YWJjL3AvZGVmZ2g'
+            '?story_media_id=3740582527900321836&igsh=x')
+    assert media == final
+    assert unavailable is False
+    assert seen and seen[0].endswith('/p/DPpN_2ciAgs')
+
+
 def test_instagram_lookup_story_requests_post_path(monkeypatch):
     # الستوري: المرآة ترفض /stories/ فنطلب /p/<رمز> — نتحقق أن الطلب ذهب له
     final = 'https://scontent.cdninstagram.com/o1/v/story.mp4?oe=1'
@@ -553,6 +585,10 @@ def test_is_instagram_story():
         'https://www.instagram.com/stories/bakrnurechi/3950648105099614764')
     assert is_instagram_story(
         'https://www.instagram.com/stories/highlights/17900000000000000/')
+    # صيغة المشاركة المختصرة تُعرَف بـstory_media_id لا بالمسار
+    assert is_instagram_story(
+        'https://www.instagram.com/s/aGlnaGxpZ2h0OjE4MDgw'
+        '?story_media_id=3740582527900321836')
     assert not is_instagram_story('https://www.instagram.com/reel/ABC123/')
     assert not is_instagram_story('https://www.instagram.com/p/ABC123/')
     # منصّة أخرى لها /stories/ (فيسبوك) لا تُحسب على إنستغرام
