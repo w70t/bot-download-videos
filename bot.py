@@ -1317,6 +1317,126 @@ def _snap_remux(src: str, dest_dir: str):
     return None, ' | '.join(log)
 
 
+# ── مسح تحويلات الـCDN والبحث عن مادة مفاتيح ──
+# الملف بلا لاحقة مشفّر (عشوائية 8.00/8، بلا توقيع، ffmpeg يرفضه)، فاللاحقة
+# ‎.<رقم>.<رمز>‎ أمرُ تحويل على الخادم: فكّ تشفير + ضغط + طبع اللوقو. الرقم 27
+# ليس وحده بالضرورة — فإن كان للتطبيق تحويل بلا لوقو فهو خلف رقم آخر. نمسح
+# الأرقام بطلبات HEAD رخيصة ونقارن الأحجام والأنواع.
+
+# أسماء حقول يُحتمل أن تحمل مادة مفاتيح في JSON الصفحة
+_SNAP_KEY_NAMES = ('key', 'iv', 'encryption', 'encryptionkey', 'mediakey',
+                   'aeskey', 'cbckey', 'contentkey', 'decryptionkey')
+
+
+def _snap_transform_base(media_url: str):
+    """يفصل الرابط إلى (ما قبل اللاحقة، اللاحقة، الاستعلام). اللاحقة بصيغة
+    ‎.<رقم>.<رمز>‎. يعيد None إن لم توجد لاحقة."""
+    import re
+    from urllib.parse import urlparse
+    parts = urlparse(media_url)
+    m = re.search(r'^(.*)\.(\d+)\.([A-Z0-9]{5,})$', parts.path)
+    if not m:
+        return None
+    base = f"{parts.scheme}://{parts.netloc}{m.group(1)}"
+    return base, int(m.group(2)), m.group(3), (f"?{parts.query}" if parts.query else '')
+
+
+def _snap_head(url: str, timeout: int = 20):
+    """طلب HEAD رخيص يعيد (الكود، الحجم، النوع). يتراجع لطلب جزئي إن رُفض."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, method='HEAD',
+                                     headers={'User-Agent': _SNAP_UA})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return (r.status, int(r.headers.get('Content-Length') or 0),
+                    r.headers.get('Content-Type', '—'))
+    except Exception as e:
+        code = getattr(e, 'code', None)
+        if code not in (403, 405, 501):
+            return code, 0, f"{type(e).__name__}"
+    try:  # بعض الخوادم ترفض HEAD وتقبل الطلب الجزئي
+        req = urllib.request.Request(url, headers={
+            'User-Agent': _SNAP_UA, 'Range': 'bytes=0-1'})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            rng = r.headers.get('Content-Range', '')
+            total = int(rng.rsplit('/', 1)[-1]) if '/' in rng else 0
+            return r.status, total, r.headers.get('Content-Type', '—')
+    except Exception as e:
+        return getattr(e, 'code', None), 0, f"{type(e).__name__}"
+
+
+def _snap_sweep_transforms(media_url: str, numbers=range(1, 49)):
+    """يجرّب أرقام التحويل ويعيد [(الرقم، الرابط، الكود، الحجم، النوع)]
+    للناجحة فقط (كود 200)."""
+    split = _snap_transform_base(media_url)
+    if not split:
+        return []
+    base, _cur, token, query = split
+    out = []
+    for n in numbers:
+        u = f"{base}.{n}.{token}{query}"
+        code, size, ctype = _snap_head(u)
+        # 206 لأن الخوادم التي ترفض HEAD تُجاب بطلب جزئي (محتوى جزئي)
+        if code in (200, 206) and size > 0:
+            out.append((n, u, code, size, ctype))
+    return out
+
+
+def _snap_key_material(url: str, timeout: int = 25):
+    """يبحث في JSON الصفحة عن مادة مفاتيح: حقول بأسماء تشفيرية، أو نصوص
+    base64 تفكّ إلى 16/24/32 بايتاً بالضبط (أطوال مفاتيح AES وIV)."""
+    import base64
+    import json
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': _SNAP_UA})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            html_text = resp.read(3_000_000).decode('utf-8', 'ignore')
+    except Exception as e:
+        return [], f"{type(e).__name__}: {str(e)[:60]}"
+
+    hits = []
+
+    def looks_like_key(s):
+        if not isinstance(s, str) or not (20 <= len(s) <= 64):
+            return None
+        try:
+            raw = base64.b64decode(s + '=' * (-len(s) % 4), validate=True)
+        except Exception:
+            try:
+                raw = base64.urlsafe_b64decode(s + '=' * (-len(s) % 4))
+            except Exception:
+                return None
+        return len(raw) if len(raw) in (16, 24, 32) else None
+
+    def walk(node, path='', depth=0):
+        if depth > 12 or len(hits) > 25:
+            return
+        if isinstance(node, dict):
+            for k, v in node.items():
+                p = f"{path}.{k}" if path else k
+                if k.lower() in _SNAP_KEY_NAMES and isinstance(v, (str, dict)):
+                    # اسم الحقل مطابق: نضيف طول القيمة إن كان طول مفتاح معتاداً
+                    n = looks_like_key(v) if isinstance(v, str) else None
+                    hits.append((p, k, str(v)[:60],
+                                 f'اسم الحقل، {n} بايت' if n else 'اسم الحقل'))
+                elif isinstance(v, str):
+                    n = looks_like_key(v)
+                    if n:
+                        hits.append((p, k, v[:44], f'{n} بايت'))
+                walk(v, p, depth + 1)
+        elif isinstance(node, list):
+            for i, it in enumerate(node[:30]):
+                walk(it, f"{path}[{i}]", depth + 1)
+
+    for blob in _snap_json_blobs(html_text):
+        try:
+            walk(json.loads(blob.strip()))
+        except Exception:
+            continue
+    return hits, None
+
+
 def _snap_probe_variant(media_url: str, timeout: int = 45):
     """يجلب صيغة واحدة ويعيد (الكود، الحجم، نوع المحتوى) بلا حفظ."""
     import urllib.request
@@ -5176,6 +5296,96 @@ async def cmd_snaptest(client, message):
     if cands:
         lines.append("للمقارنة البصرية: `/snapdual <الرابط>`")
     await status.edit_text("\n".join(lines)[:4000], disable_web_page_preview=True)
+
+
+@app.on_message(filters.command("snaphunt"))
+async def cmd_snaphunt(client, message):
+    """أمر أدمن: يمسح أرقام تحويل الـCDN بحثاً عن تجهيز بلا لوقو، ويبحث في
+    JSON الصفحة عن مادة مفاتيح تفكّ الملف المشفّر.
+
+    الاستخدام: /snaphunt <رابط سناب>
+    يعرض كل رقم تحويل يستجيب مع حجمه ونوعه مجمَّعاً بالحجم، ثم يرسل عيّنة من
+    كل حجم مختلف عن تجهيز المشاركة المعروف لتُقارن اللوقو بصرياً."""
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    parts = (message.text or '').split(maxsplit=1)
+    url = extract_first_url(parts[1] if len(parts) > 1 else '')
+    if not url or 'snapchat.com' not in url.lower() or not is_safe_url(url):
+        await message.reply_text("الاستخدام: `/snaphunt <رابط سناب>`")
+        return
+    status = await message.reply_text("🕵️ جارٍ مسح تحويلات الـCDN…")
+    loop = asyncio.get_event_loop()
+    cands, _info, err = await loop.run_in_executor(
+        None, _snapchat_page_candidates, url)
+    if err or not cands:
+        await status.edit_text(f"❌ لا وسائط: `{_snap_safe(err or 'بلا مرشّحين')}`")
+        return
+
+    media = cands[0][2]
+    split = _snap_transform_base(media)
+    if not split:
+        await status.edit_text("❌ لا لاحقة تحويل في هذا الرابط.")
+        return
+    _base, current, token, _q = split
+
+    hits = await loop.run_in_executor(None, _snap_sweep_transforms, media)
+    # تجميع بالحجم: الأرقام المتساوية الحجم تعني التجهيز نفسه
+    groups = {}
+    for n, u, _c, size, ctype in hits:
+        groups.setdefault((size, ctype), []).append((n, u))
+
+    lines = [f"🕵️ **مسح تحويلات الـCDN** (الحالي: `.{current}.{token}`)", ""]
+    if not hits:
+        lines.append("❌ لا رقم تحويل استجاب — الرمز نفسه قد يقيّد الأرقام.")
+    else:
+        lines.append(f"استجاب {len(hits)} رقماً في {len(groups)} تجهيزاً مختلفاً:")
+        base_size = next((s for (s, _t), v in groups.items()
+                          if any(n == current for n, _u in v)), None)
+        for (size, ctype), members in sorted(groups.items()):
+            nums = ', '.join(str(n) for n, _u in members[:10])
+            mark = ' ⬅ التجهيز الحالي' if size == base_size else ''
+            lines.append(f"• `{nums}` → {size / 1048576:.2f} م.ب | "
+                         f"`{_snap_safe(ctype)[:24]}`{mark}")
+
+    keys, kerr = await loop.run_in_executor(None, _snap_key_material, url)
+    lines.append("\n**مادة مفاتيح في الصفحة:**")
+    if kerr:
+        lines.append(f"❌ `{_snap_safe(kerr)}`")
+    elif not keys:
+        lines.append("لا شيء — لا مفاتيح ولا نصوص بأطوال AES معتادة")
+    else:
+        for path, _k, val, why in keys[:6]:
+            lines.append(f"• `{_snap_safe(path)[:50]}` ({why}): `{_snap_safe(val)}`")
+    await status.edit_text("\n".join(lines)[:4000], disable_web_page_preview=True)
+
+    # أرسل عيّنة من كل تجهيز يختلف عن تجهيز المشاركة الحالي
+    base_size = next((s for (s, _t), v in groups.items()
+                      if any(n == current for n, _u in v)), None)
+    novel = [(size, members[0]) for (size, _t), members in groups.items()
+             if base_size is None or abs(size - base_size) > 2048]
+    if not novel:
+        return
+    tmp = os.path.join('videos', f"snaphunt_{uuid.uuid4().hex[:8]}")
+    os.makedirs(tmp, exist_ok=True)
+    try:
+        for i, (size, (n, u)) in enumerate(sorted(novel)[:3], 1):
+            dest = os.path.join(tmp, f"t{n}.mp4")
+            try:
+                got = await loop.run_in_executor(None, _snap_fetch_to_file, u, dest)
+                head = open(dest, 'rb').read(64)
+                kind = _snap_identify(head) or 'مجهول'
+                if kind == 'مجهول':
+                    await message.reply_text(
+                        f"تحويل `{n}`: {got / 1048576:.1f} م.ب — نوعه مجهول "
+                        f"(`{head[:16].hex(' ')}`) — غالباً مشفّر")
+                    continue
+                await message.reply_video(
+                    dest, caption=f"تحويل `{n}` — {got / 1048576:.1f} م.ب "
+                                  f"({kind})\nهل فيه لوقو؟")
+            except Exception as e:
+                await message.reply_text(f"تحويل `{n}`: ❌ `{_snap_safe(str(e)[:60])}`")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 @app.on_message(filters.command("snapraw"))
