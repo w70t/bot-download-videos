@@ -2585,8 +2585,10 @@ async def _try_send_images_from_cache(client, message, status_msg, ckey,
 
     title = cached.get('title') or 'صور'
     bot_username = await _get_bot_username(client)
+    # source فارغ هنا: التحليل لقطة وقت التحميل ولا يُحفظ في الكاش، فلا نعرض
+    # بيانات قديمة عند إعادة الإرسال. (تركه غير ممرَّر يجعل t تُرجع القالب خاماً)
     caption = t('images_caption', lang, title=title, count=len(file_ids),
-                user=user_name,
+                user=user_name, source='',
                 promo=(f"\n\n📥 @{bot_username}" if bot_username else ""))
 
     try:
@@ -2749,8 +2751,20 @@ async def download_and_send_images(client, message, url, status_msg,
 
         title = ((info or {}).get('title') or 'صور').replace('`', "'")[:200]
         bot_username = await _get_bot_username(client)
+        # 🔎 تحليل مصدر ألبوم تيك توك: مسار الصور منفصل عن مسار الفيديو، فلولا
+        #    هذا لظهرت الألبومات بلا تحليل. (منشور الصور مساره /photo/ لا
+        #    /video/، وقد رُوعي ذلك في نمط استخراج المعرّف)
+        _src = []
+        if TIKTOK_SOURCE_ANALYSIS and _platform_of(url) == 'tiktok':
+            try:
+                _a = await asyncio.get_event_loop().run_in_executor(
+                    None, tiktok_source_analysis, url)
+                _src = _build_source_lines({'_source_analysis': _a})
+            except Exception as _e:
+                logger.info(f"ℹ️ تعذّر تحليل مصدر ألبوم تيك توك: {_e}")
         caption = t('images_caption', lang,
                     title=title, count=len(files), user=user_name,
+                    source=(''.join(f"\n{ln}" for ln in _src)),
                     promo=(f"\n\n📥 @{bot_username}" if bot_username else ""))
 
         sent_messages = []

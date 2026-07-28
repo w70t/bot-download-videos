@@ -731,6 +731,17 @@ def test_tiktok_analysis_collects_public_fields():
     assert out['account_created'].strftime('%Y-%m-%d') == '2026-04-16'
 
 
+def test_tiktok_analysis_handles_photo_slideshow_urls():
+    """ألبومات الصور مسارها /photo/ لا /video/ — ولولا قبولها لضاع التحليل
+    على كل منشورات الصور (المعرّف يحمل الطابع الزمني في الحالتين)."""
+    with patch('urllib.request.urlopen', side_effect=OSError('offline')):
+        out = link_resolvers.tiktok_source_analysis(
+            'https://www.tiktok.com/@elazehra07/photo/7667349854049406226')
+    assert out['video_id'] == '7667349854049406226'
+    assert out['username'] == 'elazehra07'
+    assert out['published'].strftime('%Y-%m-%d') == '2026-07-27'
+
+
 def test_tiktok_analysis_survives_all_sources_failing():
     # فشل الشبكة كاملاً → نبقي ما استُخرج من الرابط نفسه بلا استثناء
     with patch('urllib.request.urlopen', side_effect=OSError('boom')):

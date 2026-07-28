@@ -821,7 +821,9 @@ def resolve_tiktok_media(url: str, timeout: int = 20):
 _TT_STORAGE_REGIONS = (('euttp', 'EU'), ('alisg', 'SG'),
                        ('maliva', 'US'), ('useast', 'US'))
 
-_TT_VIDEO_ID_RE = re.compile(r'/video/(\d{10,25})')
+# منشورات الصور (السلايدشو) مسارها /photo/ لا /video/ — والمعرّف يحمل الطابع
+# الزمني في الحالتين، فنقبل الاثنين وإلا ضاع التحليل على كل ألبومات الصور
+_TT_VIDEO_ID_RE = re.compile(r'/(?:video|photo)/(\d{10,25})')
 _TT_USERNAME_RE = re.compile(r'/@([A-Za-z0-9_.]{1,40})')
 
 
