@@ -516,6 +516,33 @@ def test_threads_lookup_returns_duration_and_size():
     assert meta == {'width': 1080, 'height': 1920, 'duration': 45}
 
 
+def test_threads_lookup_splits_text_from_engagement_stats():
+    """og:description = نصّ المنشور ثم سطر التفاعلات. نفصلهما: النصّ عنواناً
+    مفهوماً بدل «Threads Video»، والتفاعلات سطراً في وصف الرفع."""
+    page = ('<meta property="og:title" content="زينب علاء (@en0la_19)"/>'
+            '<meta property="og:description" content="المقاومه ح تلطم\n\n'
+            '❤️ 425  💬 113  🔁 1  📤 33"/>'
+            '<meta property="og:video" content="https://x.cdninstagram.com/v.mp4"/>')
+    with patch('urllib.request.urlopen', return_value=_FakeHtml(page)), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        _out, meta = link_resolvers.threads_mirror_lookup(
+            'https://www.threads.com/@en0la_19/post/DbT2rAFEYfA')
+    assert meta['title'] == 'المقاومه ح تلطم'
+    assert meta['stats'] == '❤️ 425  💬 113  🔁 1  📤 33'
+    assert meta['uploader'] == '@en0la_19'
+
+
+def test_threads_lookup_without_stats_line():
+    # منشور بلا تفاعلات معروضة → عنوان فقط، وبلا مفتاح stats
+    page = ('<meta property="og:description" content="نصّ فقط"/>'
+            '<meta property="og:video" content="https://x.cdninstagram.com/v.mp4"/>')
+    with patch('urllib.request.urlopen', return_value=_FakeHtml(page)), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        _out, meta = link_resolvers.threads_mirror_lookup(
+            'https://www.threads.com/@u/post/DbT2rAFEYfA')
+    assert meta['title'] == 'نصّ فقط' and 'stats' not in meta
+
+
 def test_threads_duration_missing_is_not_fatal():
     # رابط بلا efg → لا مدّة، لكن الفيديو يبقى صالحاً
     media = 'https://scontent.cdninstagram.com/o1/v/x.mp4'

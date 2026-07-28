@@ -547,6 +547,42 @@ def _threads_duration(media_url: str):
         return None
 
 
+# سطر التفاعلات في وصف المرآة: «❤️ 425  💬 113  🔁 1  📤 33»
+_THREADS_STATS_RE = re.compile(r'^[\s‏‎]*(?:[❤️💬🔁📤]️?\s*[\d.,KkMm]+\s*){2,}$')
+
+# اسم الحساب داخل og:title: «الاسم المعروض (@user)»
+_THREADS_HANDLE_RE = re.compile(r'\(@([A-Za-z0-9_.]{1,40})\)\s*$')
+
+
+def _threads_description_meta(page: str) -> dict:
+    """يستخرج نصّ المنشور وسطر التفاعلات واسم الحساب من وسوم المرآة.
+
+    og:description = نصّ المنشور ثم سطر التفاعلات (❤️/💬/🔁/📤). نفصلهما كي
+    يصير نصّ المنشور عنواناً مفهوماً بدل «Threads Video»، ويظهر سطر التفاعلات
+    في وصف الرفع. أي جزء غائب يُترك ببساطة."""
+    import re as _re
+    from html import unescape
+    out = {}
+    m = _re.search(r'property=["\']og:description["\'][^>]*?content=["\']([^"\']*)["\']',
+                   page, _re.S)
+    if m:
+        desc = unescape(m.group(1)).replace('\r', '')
+        lines = [ln.strip() for ln in desc.split('\n') if ln.strip()]
+        body = [ln for ln in lines if not _THREADS_STATS_RE.match(ln)]
+        stats = [ln for ln in lines if _THREADS_STATS_RE.match(ln)]
+        if stats:
+            out['stats'] = stats[-1]
+        if body:
+            # أول سطر مفيد عنواناً (الوصف كاملاً قد يكون طويلاً جداً)
+            out['title'] = ' '.join(body)[:200]
+    m = _re.search(r'property=["\']og:title["\'][^>]*?content=["\']([^"\']*)["\']', page)
+    if m:
+        h = _THREADS_HANDLE_RE.search(unescape(m.group(1)).strip())
+        if h:
+            out['uploader'] = '@' + h.group(1)
+    return out
+
+
 def threads_mirror_lookup(url: str, timeout: int = 20):
     """يستعلم مرايا ثريدز ويعيد (رابط الفيديو المباشر أو None، بيانات المقطع).
 
@@ -586,6 +622,7 @@ def threads_mirror_lookup(url: str, timeout: int = 20):
                     dur = _threads_duration(media)
                     if dur:
                         meta['duration'] = dur
+                    meta.update(_threads_description_meta(page))
                     logger.info(f"🎯 ثريدز عبر {host}: {media[:90]}"
                                 + (f" ({dur}ث)" if dur else ""))
                     return media, meta

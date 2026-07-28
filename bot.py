@@ -717,6 +717,15 @@ async def _threads_video_fallback(url: str):
         return None
 
 
+async def resolve_threads_direct(url: str):
+    """يحل رابط ثريدز إلى (رابط mp4 مباشر أو None، بيانات المقطع) عبر مرآة عامة.
+    طلب شبكي متزامن يُنفَّذ خارج حلقة الأحداث."""
+    if _platform_of(url) != 'threads':
+        return None, {}
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, threads_mirror_lookup, url)
+
+
 async def resolve_tiktok_direct(url: str):
     """يحل رابط تيك توك إلى رابط الفيديو المباشر عبر مرآة عامة (بلا كوكيز).
     يعيد رابط mp4 المباشر أو None. طلب شبكي متزامن يُنفَّذ خارج حلقة الأحداث."""
@@ -2294,16 +2303,22 @@ def _clean_media_title(raw_title, url):
     return f"{label} Video" if label else 'فيديو'
 
 
-def _build_media_caption(title, file_size_mb, duration, user_name, bot_username=None):
+def _build_media_caption(title, file_size_mb, duration, user_name,
+                         bot_username=None, stats=None):
     """وصف الوسائط الموحّد: العنوان قابل للنسخ (monospace) + الحجم والمدة +
-    يوزر البوت (يبقى مع الفيديو عند إعادة إرساله)."""
+    يوزر البوت (يبقى مع الفيديو عند إعادة إرساله).
+
+    stats: سطر تفاعلات المنشور (مثل «❤️ 425  💬 113») للمنصات التي تتيحه —
+    لقطة وقت التحميل، فلا يُحفظ في الكاش كي لا يُعاد إرسال أرقام قديمة."""
     safe_title = (title or 'فيديو').replace('`', "'")[:300]
     dur_line = f"⏱️ {int(duration)//60}:{int(duration)%60:02d}\n" if duration else ""
+    stats_line = f"{str(stats).strip()}\n" if stats else ""
     promo = f"\n\n📥 @{bot_username}" if bot_username else ""
     return (
         f"🎬 `{safe_title}`\n\n"
         f"📊 {file_size_mb:.1f} MB\n"
         f"{dur_line}"
+        f"{stats_line}"
         f"👤 {user_name}"
         f"{promo}"
     )
@@ -3279,6 +3294,9 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         is_instagram_url = _platform_of(url) == 'instagram'
         is_tiktok_url = _platform_of(url) == 'tiktok'
         is_pinterest_url = _platform_of(url) == 'pinterest'
+        is_threads_url = _platform_of(url) == 'threads'
+        # بيانات ثريدز من المرآة (عنوان/تفاعلات/مدّة) تُملأ عند التحميل منها
+        _threads_meta = {}
 
         def download(use_cookies=True, fmt=None, url_override=None, yt_clients=None):
             o = dict(ydl_opts)
@@ -3376,6 +3394,14 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                 logger.info("✅ تحميل تيك توك عبر المرآة العامة (بديل yt-dlp، بلا كوكيز)")
                 info, file_path = await loop.run_in_executor(
                     None, lambda: download(url_override=_direct))
+            # 🎯 ثريدز: yt-dlp لا يدعمه إطلاقاً («Unsupported URL») → حل الرابط
+            #    لملف mp4 مباشر عبر مرآة عامة وحمّله منها. بدون هذا الفرع تنجح
+            #    المعاينة (لأن get_video_info له بديله) ثم يفشل التحميل.
+            elif is_threads_url and (_th := await resolve_threads_direct(url))[0]:
+                _direct, _threads_meta = _th
+                logger.info("✅ تحميل ثريدز عبر المرآة العامة (بلا كوكيز)")
+                info, file_path = await loop.run_in_executor(
+                    None, lambda: download(url_override=_direct))
             # 🎯 بينتريست: فشل yt-dlp (تغييرات الموقع/حجب) → حل الرابط لملف فيديو
             #    مباشر عبر واجهة بينتريست العامة (بلا كوكيز) وحمّله منها
             elif is_pinterest_url and (_direct := await resolve_pinterest_direct(url)):
@@ -3444,6 +3470,16 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         duration = info.get('duration', 0)
         # العنوان: اسم نظيف موحّد بين المنصات (يستبدل معرّفات CDN القبيحة مثل
         # إنستغرام عبر المرآة)، مع إزالة ` حتى لا يكسر تنسيق النسخ وحد آمن للوصف
+        # بيانات ثريدز من المرآة: yt-dlp لا يعرف عنوان/مدّة/أبعاد ملف mp4 بعيد،
+        # فنكمل الناقص فقط ونستبدل العنوان بنصّ المنشور بدل معرّف الملف
+        if _threads_meta:
+            for _k in ('duration', 'width', 'height'):
+                if _threads_meta.get(_k) and not info.get(_k):
+                    info[_k] = _threads_meta[_k]
+            if _threads_meta.get('title'):
+                info['title'] = _threads_meta['title']
+            if _threads_meta.get('uploader') and not info.get('uploader'):
+                info['uploader'] = _threads_meta['uploader']
         title = _clean_media_title(info.get('title'), url).replace('`', "'")[:300]
         
         logger.info(f"📊 حجم الملف النهائي: {file_size_mb:.2f} MB")
@@ -3468,7 +3504,8 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         # الوصف الموحّد: العنوان قابل للنسخ + يوزر البوت (يبقى مع الفيديو)
         caption = _build_media_caption(
             title, file_size_mb, duration, user_name,
-            bot_username=await _get_bot_username(client)
+            bot_username=await _get_bot_username(client),
+            stats=_threads_meta.get('stats')
         )
         
         if is_audio:
