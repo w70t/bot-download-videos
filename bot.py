@@ -928,6 +928,13 @@ def _snapchat_clean_media(url: str, timeout: int = 20):
 _SNAP_MEDIA_KEYS = ('mediaUrl', 'contentUrl', 'videoUrl')
 _SNAP_INFO_KEYS = ('overlayUrl', 'mediaPreviewUrl', 'thumbnailUrl')
 
+# أسماء مقروءة لمصادر المرشّحين في رسائل التشخيص
+_SNAP_SRC_LABELS = {
+    'preload': 'وسم preload — المقطع المطلوب',
+    'byId': 'مطابقة معرّف السناب',
+    'mediaUrl': 'mediaUrl (قد يكون من قائمة التغذية)',
+}
+
 
 def _snap_json_blobs(html_text: str):
     """يعيد نصوص JSON المضمّنة في الصفحة (‎__NEXT_DATA__‎ أولاً ثم أي وسم
@@ -964,6 +971,50 @@ def _snap_collect_urls(node, wanted, out, path='', depth=0):
             _snap_collect_urls(it, wanted, out, f"{path}[{i}]", depth + 1)
 
 
+def _snap_preload_video(html_text: str):
+    """رابط الفيديو من وسم preload في ترويسة الصفحة — يخصّ **المقطع المطلوب
+    نفسه**، بخلاف قائمة spotlightFeed التي تضمّ مقاطع أخرى. (نفس ما يعتمد عليه
+    مشروع cobalt المفتوح لسبوت لايت.)"""
+    import re
+    m = re.search(r'<link[^>]+rel=["\']preload["\'][^>]+href=["\']([^"\']+)["\']'
+                  r'[^>]+as=["\']video["\']', html_text)
+    if not m:
+        m = re.search(r'<link[^>]+as=["\']video["\'][^>]+href=["\']([^"\']+)["\']',
+                      html_text)
+    if not m:
+        return None
+    u = m.group(1).replace('&amp;', '&')
+    return u if u.startswith(('http://', 'https://')) else None
+
+
+def _snap_id_owner_media(data, snap_id: str):
+    """يبحث في JSON عن العنصر الذي يحمل معرّف السناب المطلوب ويعيد mediaUrl
+    الخاص به. يمنع إرسال مقطع آخر من قائمة التغذية بدل المطلوب."""
+    if not snap_id:
+        return None
+    stack = [data]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            blob = None
+            for key in ('snapId', 'id', 'storyId'):
+                v = node.get(key)
+                s = v if isinstance(v, str) else (
+                    v.get('value') if isinstance(v, dict) else None)
+                if isinstance(s, str) and snap_id in s:
+                    blob = node
+                    break
+            if blob is not None:
+                got = []
+                _snap_collect_urls(blob, _SNAP_MEDIA_KEYS, got)
+                if got:
+                    return got[0][2]
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node[:60])
+    return None
+
+
 def _snapchat_page_candidates(url: str, timeout: int = 25):
     """يجلب صفحة السناب ويعيد (مرشّحو الفيديو، عناصر إعلامية، خطأ الجلب).
 
@@ -985,11 +1036,26 @@ def _snapchat_page_candidates(url: str, timeout: int = 25):
         return [], [], f"{type(e).__name__}: {str(e)[:80]}"
 
     found, info = [], []
+
+    # ⚠️ الأولوية القصوى للمقطع **المطلوب** لا لأول مقطع في الصفحة: قائمة
+    # spotlightFeed تضمّ مقاطع أخرى، فأخذ أولها قد يرسل فيديو شخص آخر.
+    preload = _snap_preload_video(html_text)
+    if preload:
+        found.append(('link[rel=preload]', 'preload', preload))
+
+    snap_id = None
+    m_id = re.search(_SNAP_ID_PATTERN, url or '')
+    if m_id:
+        snap_id = m_id.group(0)
+
     for blob in _snap_json_blobs(html_text):
         try:
             data = json.loads(blob.strip())
         except Exception:
             continue
+        owned = _snap_id_owner_media(data, snap_id)
+        if owned:
+            found.append(('json[snapId مطابق]', 'byId', owned))
         _snap_collect_urls(data, _SNAP_MEDIA_KEYS, found)
         _snap_collect_urls(data, _SNAP_INFO_KEYS, info)
 
@@ -1000,8 +1066,11 @@ def _snapchat_page_candidates(url: str, timeout: int = 25):
         # الشكل نفسه: (المسار، المفتاح، الرابط) — المسار هنا وسم لا مسار JSON
         found.append(('meta', 'og:video', m.group(1).replace('&amp;', '&')))
 
-    # ترتيب بالأولوية مع إزالة التكرار (نُبقي أول ظهور لكل رابط)
-    rank = {k: i for i, k in enumerate(_SNAP_MEDIA_KEYS)}
+    # ترتيب بالأولوية مع إزالة التكرار (نُبقي أول ظهور لكل رابط).
+    # المطلوب أولاً (preload ثم مطابقة المعرّف)، ثم مفاتيح JSON العامة.
+    rank = {k: i + 10 for i, k in enumerate(_SNAP_MEDIA_KEYS)}
+    rank['preload'] = 0
+    rank['byId'] = 1
     rank['og:video'] = 80  # بعد مفاتيح JSON، وقبل أي مفتاح غير معروف
     ordered, seen = [], set()
     for path, key, u in sorted(found, key=lambda t: rank.get(t[1], 90)):
@@ -1029,6 +1098,145 @@ def _snapchat_page_media(url: str, timeout: int = 25):
     key, path, media = candidates[0]
     logger.info(f"👻 سناب: وسائط من الصفحة عبر {key} ({path}): {media[:80]}")
     return media
+
+
+# ── تجربة معامل التجهيز mo (استطلاع: هل اللوقو مرتبط بوصف حالة الاستخدام؟) ──
+# رابط وسائط سناب يحمل معامِلاً mo يفكّ إلى رسالة protobuf فيها نصّ صريح
+# "SpotlightSharing" — أي وصف لحالة الاستخدام التي يُجهَّز الملف من أجلها،
+# وهي الحالة التي يُطبع فيها اللوقو. إن لم يكن الوصف موقَّعاً تشفيرياً فقد
+# يعطي تعديله نسخة بلا لوقو. هذه دوال استطلاع لأمر /snapvariants فقط.
+
+_SNAP_USE_CASE_FIELD = 11  # رقم حقل النص داخل رسالة mo
+
+
+def _pb_varint(buf: bytes, i: int):
+    """يقرأ عدداً متغيّر الطول من موضع i ويعيد (القيمة، الموضع التالي)."""
+    val = shift = 0
+    while i < len(buf):
+        byte = buf[i]
+        i += 1
+        val |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return val, i
+        shift += 7
+    raise ValueError('varint مقطوع')
+
+
+def _pb_uvarint(n: int) -> bytes:
+    """يرمّز عدداً بصيغة varint."""
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        out.append(b | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+
+
+def _pb_edit_string_field(buf: bytes, field: int, new_value, depth: int = 0):
+    """يعيد بناء رسالة protobuf بعد حذف حقل نصي (new_value=None) أو استبداله،
+    نازلاً في الرسائل المتداخلة. يرفع ValueError إن كانت البِنية غير مفهومة —
+    فيتراجع المستدعي ويترك الرابط كما هو."""
+    out = bytearray()
+    i = 0
+    changed = False
+    while i < len(buf):
+        start = i
+        key, i = _pb_varint(buf, i)
+        f, wt = key >> 3, key & 7
+        if wt == 0:
+            _v, i = _pb_varint(buf, i)
+            out += buf[start:i]
+        elif wt == 1:
+            i += 8
+            out += buf[start:i]
+        elif wt == 5:
+            i += 4
+            out += buf[start:i]
+        elif wt == 2:
+            n, i = _pb_varint(buf, i)
+            payload, i = buf[i:i + n], i + n
+            if len(payload) < n:
+                raise ValueError('كتلة مقطوعة')
+            if f == field:
+                changed = True
+                if new_value is None:
+                    continue  # حذف الحقل بالكامل
+                payload = str(new_value).encode('utf-8')
+            elif depth < 4:
+                try:
+                    inner, inner_changed = _pb_edit_string_field(
+                        payload, field, new_value, depth + 1)
+                    if inner_changed:
+                        payload, changed = inner, True
+                except ValueError:
+                    pass  # ليست رسالة متداخلة: تُترك كما هي
+            out += _pb_uvarint((f << 3) | 2) + _pb_uvarint(len(payload)) + payload
+        else:
+            raise ValueError(f'نوع سلك غير مدعوم: {wt}')
+    return bytes(out), changed
+
+
+def _snap_mo_rewrite(media_url: str, new_value):
+    """يعيد الرابط نفسه بعد تعديل وصف حالة الاستخدام داخل mo (أو حذفه حين
+    new_value=None)، أو None إن تعذّر الفكّ/التعديل."""
+    import base64
+    from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+    try:
+        parts = urlparse(media_url)
+        q = dict(parse_qsl(parts.query, keep_blank_values=True))
+        mo = q.get('mo')
+        if not mo:
+            return None
+        raw = base64.urlsafe_b64decode(mo + '=' * (-len(mo) % 4))
+        edited, changed = _pb_edit_string_field(raw, _SNAP_USE_CASE_FIELD, new_value)
+        if not changed:
+            return None
+        q['mo'] = base64.urlsafe_b64encode(edited).decode().rstrip('=')
+        return urlunparse(parts._replace(query=urlencode(q)))
+    except Exception as e:
+        logger.info(f"ℹ️ تعذّر تعديل mo: {e}")
+        return None
+
+
+def _snap_url_variants(media_url: str):
+    """يبني قائمة (الوصف، الرابط) لتجريب مصادر التجهيز المختلفة لنفس المقطع."""
+    from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+    out = [('كما هو (الأساس)', media_url)]
+    try:
+        parts = urlparse(media_url)
+        q = dict(parse_qsl(parts.query, keep_blank_values=True))
+        out.append(('بلا أي معاملات', urlunparse(parts._replace(query=''))))
+        if 'mo' in q:
+            no_mo = {k: v for k, v in q.items() if k != 'mo'}
+            out.append(('بلا mo', urlunparse(parts._replace(query=urlencode(no_mo)))))
+        for label, val in (('mo بلا وصف الاستخدام', None),
+                           ('mo بوصف فارغ', ''),
+                           ('mo بوصف SpotlightWeb', 'SpotlightWeb')):
+            alt = _snap_mo_rewrite(media_url, val)
+            if alt:
+                out.append((label, alt))
+        # لاحقة المسار الثابتة (‎.27.XXXXXXX‎) تبدو واصفاً للتجهيز لا للملف
+        import re
+        stripped = re.sub(r'\.\d+\.[A-Z0-9]{5,}(?=$|\?)', '', parts.path)
+        if stripped != parts.path:
+            out.append(('بلا لاحقة التجهيز',
+                        urlunparse(parts._replace(path=stripped))))
+    except Exception as e:
+        logger.info(f"ℹ️ تعذّر بناء صيغ الرابط: {e}")
+    return out
+
+
+def _snap_probe_variant(media_url: str, timeout: int = 45):
+    """يجلب صيغة واحدة ويعيد (الكود، الحجم، نوع المحتوى) بلا حفظ."""
+    import urllib.request
+    req = urllib.request.Request(media_url, headers={'User-Agent': _SNAP_UA})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read(_SNAP_DUAL_MAX_MB * 1024 * 1024 + 1)
+            return resp.status, len(data), resp.headers.get('Content-Type', '—')
+    except Exception as e:
+        return getattr(e, 'code', None), 0, f"{type(e).__name__}: {str(e)[:40]}"
 
 
 def _snap_safe(text) -> str:
@@ -4862,7 +5070,8 @@ async def cmd_snaptest(client, message):
         lines.append("❌ لا مرشّحين في JSON الصفحة")
     else:
         for i, (key, path, u) in enumerate(cands[:4], 1):
-            lines.append(f"{i}. **{key}** — `{_snap_safe(path)[:60]}`\n`{u[:180]}`")
+            lines.append(f"{i}. **{_SNAP_SRC_LABELS.get(key, key)}** — "
+                         f"`{_snap_safe(path)[:60]}`\n`{u[:180]}`")
     if info:
         lines.append("طبقات/معاينات: " + ", ".join(
             sorted({k for _p, k, _u in info})[:4]))
@@ -4877,6 +5086,68 @@ async def cmd_snaptest(client, message):
     if cands:
         lines.append("للمقارنة البصرية: `/snapdual <الرابط>`")
     await status.edit_text("\n".join(lines)[:4000], disable_web_page_preview=True)
+
+
+@app.on_message(filters.command("snapvariants"))
+async def cmd_snapvariants(client, message):
+    """أمر أدمن: يجرّب صيغ تجهيز مختلفة لنفس مقطع السناب بحثاً عن نسخة بلا
+    لوقو — تعديل وصف حالة الاستخدام داخل معامل mo، وحذف المعاملات، وإسقاط
+    لاحقة التجهيز. يعرض جدول (كود، حجم) لكل صيغة، ثم يرسل الصيغ التي اختلف
+    حجمها عن الأساس (أي تجهيز مختلف فعلاً) لتُقارن بصرياً.
+
+    الاستخدام: /snapvariants <رابط سناب>"""
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    parts = (message.text or '').split(maxsplit=1)
+    url = extract_first_url(parts[1] if len(parts) > 1 else '')
+    if not url or 'snapchat.com' not in url.lower() or not is_safe_url(url):
+        await message.reply_text("الاستخدام: `/snapvariants <رابط سناب>`")
+        return
+    status = await message.reply_text("🧪 جارٍ تجريب صيغ التجهيز…")
+    loop = asyncio.get_event_loop()
+    cands, _info, err = await loop.run_in_executor(
+        None, _snapchat_page_candidates, url)
+    if err or not cands:
+        await status.edit_text(f"❌ لا وسائط: `{_snap_safe(err or 'بلا مرشّحين')}`")
+        return
+
+    key, _path, media = cands[0]
+    variants = _snap_url_variants(media)
+    lines = [f"🧪 **تجربة صيغ التجهيز** (المصدر: {key})", ""]
+    results = []
+    for label, alt in variants:
+        code, size, ctype = await loop.run_in_executor(
+            None, _snap_probe_variant, alt)
+        results.append((label, alt, code, size))
+        lines.append(f"• {label}: كود `{code or '—'}` | "
+                     f"{size / 1048576:.2f} م.ب | `{_snap_safe(ctype)[:28]}`")
+
+    base_size = results[0][3]
+    novel = [r for r in results[1:] if r[2] == 200 and r[3] > 0
+             and abs(r[3] - base_size) > 2048]
+    lines.append("")
+    lines.append(f"الأساس: {base_size / 1048576:.2f} م.ب — "
+                 + (f"**{len(novel)} صيغة بحجم مختلف** ⬅ تُرسل للمقارنة"
+                    if novel else "لا صيغة بحجم مختلف (التجهيز نفسه)"))
+    await status.edit_text("\n".join(lines)[:4000], disable_web_page_preview=True)
+
+    if not novel:
+        return
+    tmp = os.path.join('videos', f"snapvar_{uuid.uuid4().hex[:8]}")
+    os.makedirs(tmp, exist_ok=True)
+    try:
+        for i, (label, alt, _c, _s) in enumerate(novel[:3], 1):
+            dest = os.path.join(tmp, f"v{i}.mp4")
+            try:
+                size = await loop.run_in_executor(
+                    None, _snap_fetch_to_file, alt, dest)
+                await message.reply_video(
+                    dest, caption=f"{label} — {size / 1048576:.1f} م.ب")
+            except Exception as e:
+                await message.reply_text(
+                    f"{label}: ❌ `{_snap_safe(str(e)[:70])}`")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 @app.on_message(filters.command("snapdual"))
