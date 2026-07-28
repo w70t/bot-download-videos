@@ -704,11 +704,14 @@ async def _threads_video_fallback(url: str):
             None, lambda: _extract_direct_media(direct, 'Threads Video')
         )
         if info:
-            # yt-dlp لا يعرف مدّة/أبعاد ملف mp4 بعيد قبل تحميله، وبلا المدّة
-            # يتخطّى المقطع حدّ المدة المجاني — فنكملها من بيانات المرآة
-            for key in ('duration', 'width', 'height'):
+            # yt-dlp لا يعرف مدّة/أبعاد/مصغّرة ملف mp4 بعيد قبل تحميله: بلا
+            # المدّة يتخطّى المقطع حدّ المدة المجاني، وبلا المصغّرة تظهر
+            # المعاينة بلا صورة — فنكملها كلّها من بيانات المرآة
+            for key in ('duration', 'width', 'height', 'thumbnail', 'uploader'):
                 if meta.get(key) and not info.get(key):
                     info[key] = meta[key]
+            if meta.get('title'):
+                info['title'] = meta['title']
             logger.info("✅ ثريدز عبر المرآة العامة (بلا كوكيز)"
                         + (f" — {meta['duration']}ث" if meta.get('duration') else ""))
         return info
@@ -3473,7 +3476,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         # بيانات ثريدز من المرآة: yt-dlp لا يعرف عنوان/مدّة/أبعاد ملف mp4 بعيد،
         # فنكمل الناقص فقط ونستبدل العنوان بنصّ المنشور بدل معرّف الملف
         if _threads_meta:
-            for _k in ('duration', 'width', 'height'):
+            for _k in ('duration', 'width', 'height', 'thumbnail'):
                 if _threads_meta.get(_k) and not info.get(_k):
                     info[_k] = _threads_meta[_k]
             if _threads_meta.get('title'):

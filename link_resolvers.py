@@ -580,6 +580,14 @@ def _threads_description_meta(page: str) -> dict:
         h = _THREADS_HANDLE_RE.search(unescape(m.group(1)).strip())
         if h:
             out['uploader'] = '@' + h.group(1)
+    # صورة الغلاف: yt-dlp لا يعرف مصغّرة ملف mp4 بعيد، فبدونها تظهر المعاينة
+    # بلا صورة. نتخطّى webp لأن تلجرام يرفضه أحياناً.
+    m = _re.search(r'property=["\']og:image["\'][^>]*?content=["\']([^"\']+)["\']', page)
+    if m:
+        img = unescape(m.group(1))
+        if (img.lower().startswith(('http://', 'https://'))
+                and '.webp' not in img.lower() and is_safe_url(img)):
+            out['thumbnail'] = img
     return out
 
 

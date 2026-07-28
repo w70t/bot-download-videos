@@ -532,6 +532,28 @@ def test_threads_lookup_splits_text_from_engagement_stats():
     assert meta['uploader'] == '@en0la_19'
 
 
+def test_threads_lookup_returns_cover_thumbnail():
+    """بلا مصغّرة تظهر المعاينة بلا صورة (yt-dlp لا يعرف مصغّرة mp4 بعيد)."""
+    page = ('<meta property="og:image" content="https://x.cdninstagram.com/cover.jpg"/>'
+            '<meta property="og:video" content="https://x.cdninstagram.com/v.mp4"/>')
+    with patch('urllib.request.urlopen', return_value=_FakeHtml(page)), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        _out, meta = link_resolvers.threads_mirror_lookup(
+            'https://www.threads.com/@u/post/DbT2rAFEYfA')
+    assert meta['thumbnail'] == 'https://x.cdninstagram.com/cover.jpg'
+
+
+def test_threads_lookup_skips_webp_thumbnail():
+    # تلجرام يرفض webp أحياناً → نتركها فتسقط المعاينة لنصّية بدل أن تفشل
+    page = ('<meta property="og:image" content="https://x.cdninstagram.com/c.webp"/>'
+            '<meta property="og:video" content="https://x.cdninstagram.com/v.mp4"/>')
+    with patch('urllib.request.urlopen', return_value=_FakeHtml(page)), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        _out, meta = link_resolvers.threads_mirror_lookup(
+            'https://www.threads.com/@u/post/DbT2rAFEYfA')
+    assert 'thumbnail' not in meta
+
+
 def test_threads_lookup_without_stats_line():
     # منشور بلا تفاعلات معروضة → عنوان فقط، وبلا مفتاح stats
     page = ('<meta property="og:description" content="نصّ فقط"/>'
