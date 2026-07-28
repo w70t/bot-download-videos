@@ -54,7 +54,7 @@ from link_resolvers import (
     set_snapchat_clean_rendition, get_snapchat_clean_rendition,
     _is_music_link, resolve_music_link,
     resolve_instagram_media, instagram_mirror_lookup, resolve_tiktok_media,
-    resolve_threads_media,
+    resolve_threads_media, threads_mirror_lookup,
     twitter_mirror_lookup, twitter_mirror_media,
     resolve_tiktok_images, resolve_pinterest_media, resolve_pinterest_images,
     is_substack_note, resolve_substack_note, all_mirror_hosts,
@@ -696,7 +696,7 @@ async def _threads_video_fallback(url: str):
     if _platform_of(url) != 'threads':
         return None
     loop = asyncio.get_event_loop()
-    direct = await loop.run_in_executor(None, resolve_threads_media, url)
+    direct, meta = await loop.run_in_executor(None, threads_mirror_lookup, url)
     if not direct:
         return None
     try:
@@ -704,7 +704,13 @@ async def _threads_video_fallback(url: str):
             None, lambda: _extract_direct_media(direct, 'Threads Video')
         )
         if info:
-            logger.info("✅ ثريدز عبر المرآة العامة (بلا كوكيز)")
+            # yt-dlp لا يعرف مدّة/أبعاد ملف mp4 بعيد قبل تحميله، وبلا المدّة
+            # يتخطّى المقطع حدّ المدة المجاني — فنكملها من بيانات المرآة
+            for key in ('duration', 'width', 'height'):
+                if meta.get(key) and not info.get(key):
+                    info[key] = meta[key]
+            logger.info("✅ ثريدز عبر المرآة العامة (بلا كوكيز)"
+                        + (f" — {meta['duration']}ث" if meta.get('duration') else ""))
         return info
     except Exception as e:
         logger.warning(f"⚠️ فشل استخراج ثريدز البديل: {e}")

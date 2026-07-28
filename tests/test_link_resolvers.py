@@ -498,6 +498,35 @@ def test_threads_resolver_reads_og_video():
             assert link_resolvers.resolve_threads_media(url) == _THREADS_MP4
 
 
+def test_threads_lookup_returns_duration_and_size():
+    """بلا مدّة يتخطّى المقطع حدّ المدة المجاني (yt-dlp لا يعرف مدّة mp4 بعيد)،
+    فنقرأها من معامل efg داخل الرابط ونقرأ الأبعاد من وسوم المرآة."""
+    import base64, json
+    efg = base64.urlsafe_b64encode(
+        json.dumps({'duration_s': 45}).encode()).decode().rstrip('=')
+    media = f'https://scontent.cdninstagram.com/o1/v/x.mp4?efg={efg}'
+    page = (f'<meta property="og:video" content="{media}"/>'
+            '<meta property="og:video:width" content="1080"/>'
+            '<meta property="og:video:height" content="1920"/>')
+    with patch('urllib.request.urlopen', return_value=_FakeHtml(page)), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        out, meta = link_resolvers.threads_mirror_lookup(
+            'https://www.threads.com/@user/post/DauKPbYnR6q')
+    assert out == media
+    assert meta == {'width': 1080, 'height': 1920, 'duration': 45}
+
+
+def test_threads_duration_missing_is_not_fatal():
+    # رابط بلا efg → لا مدّة، لكن الفيديو يبقى صالحاً
+    media = 'https://scontent.cdninstagram.com/o1/v/x.mp4'
+    page = f'<meta property="og:video" content="{media}"/>'
+    with patch('urllib.request.urlopen', return_value=_FakeHtml(page)), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        out, meta = link_resolvers.threads_mirror_lookup(
+            'https://www.threads.com/@user/post/DauKPbYnR6q')
+    assert out == media and 'duration' not in meta
+
+
 def test_threads_resolver_none_for_photo_post():
     # منشور صور/نصّ: المرآة تعطي og:image بلا og:video → None فيبقى المسار الأصلي
     page = '<meta property="og:image" content="https://x/pic.jpg"/>'

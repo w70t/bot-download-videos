@@ -527,18 +527,38 @@ def _threads_post_path(url: str, timeout: int = 15):
     return f"/{m.group(1)}/post/{m.group(2)}" if m else None
 
 
-def resolve_threads_media(url: str, timeout: int = 20):
-    """يحوّل رابط منشور ثريدز إلى رابط الفيديو المباشر (mp4) عبر مرآة عامة بلا
-    كوكيز، لأن yt-dlp لا يدعم ثريدز أصلاً.
+def _threads_duration(media_url: str):
+    """مدّة الفيديو بالثواني من معامل efg داخل رابط cdninstagram (JSON مرمّز
+    base64 فيه duration_s)، أو None.
 
-    يعيد رابط mp4 عند النجاح، أو None لغير روابط المنشورات أو لمنشور بلا فيديو
-    (صور/نصّ) أو عند أي فشل — فيبقى المسار الأصلي دون تغيير في السلوك."""
+    مهمّة لا تجميلية: بلا مدّة يتخطّى المقطع حدّ المدة المجاني في البوت،
+    لأن yt-dlp لا يعرف مدّة ملف mp4 بعيد قبل تحميله."""
+    import base64
+    import json
+    import urllib.parse
+    try:
+        efg = urllib.parse.parse_qs(urllib.parse.urlparse(media_url).query).get('efg')
+        if not efg:
+            return None
+        raw = base64.urlsafe_b64decode(efg[0] + '=' * (-len(efg[0]) % 4))
+        val = json.loads(raw).get('duration_s')
+        return int(val) if isinstance(val, (int, float)) and val > 0 else None
+    except Exception:
+        return None
+
+
+def threads_mirror_lookup(url: str, timeout: int = 20):
+    """يستعلم مرايا ثريدز ويعيد (رابط الفيديو المباشر أو None، بيانات المقطع).
+
+    البيانات dict فيه width/height (من وسوم المرآة) وduration (من الرابط) —
+    يستعملها البوت للمعاينة ولتطبيق حدّ المدة المجاني."""
     import re as _re
     import urllib.request
     from html import unescape
+    meta = {}
     path = _threads_post_path(url, timeout=min(timeout, 15))
     if not path:
-        return None
+        return None, meta
     for host in _THREADS_PROXY_HOSTS:
         proxy_url = f"https://{host}{path}"
         try:
@@ -557,10 +577,31 @@ def resolve_threads_media(url: str, timeout: int = 20):
             if m:
                 media = unescape(m.group(1))
                 if media.lower().startswith(('http://', 'https://')) and is_safe_url(media):
-                    logger.info(f"🎯 ثريدز عبر {host}: {media[:90]}")
-                    return media
+                    for key, tag in (('width', 'og:video:width'),
+                                     ('height', 'og:video:height')):
+                        mm = _re.search(
+                            rf'{tag}["\'][^>]*?content=["\'](\d+)["\']', page)
+                        if mm:
+                            meta[key] = int(mm.group(1))
+                    dur = _threads_duration(media)
+                    if dur:
+                        meta['duration'] = dur
+                    logger.info(f"🎯 ثريدز عبر {host}: {media[:90]}"
+                                + (f" ({dur}ث)" if dur else ""))
+                    return media, meta
         logger.info(f"ℹ️ {host} لم يُرجع فيديو ثريدز لـ {path} (منشور صور/نصّ؟)")
-    return None
+    return None, meta
+
+
+def resolve_threads_media(url: str, timeout: int = 20):
+    """يحوّل رابط منشور ثريدز إلى رابط الفيديو المباشر (mp4) عبر مرآة عامة بلا
+    كوكيز، لأن yt-dlp لا يدعم ثريدز أصلاً.
+
+    يعيد رابط mp4 عند النجاح، أو None لغير روابط المنشورات أو لمنشور بلا فيديو
+    (صور/نصّ) أو عند أي فشل — فيبقى المسار الأصلي دون تغيير في السلوك.
+    (بلا بيانات المقطع — استخدم threads_mirror_lookup لها.)"""
+    media, _meta = threads_mirror_lookup(url, timeout)
+    return media
 
 
 # ═══════════════════════════════════════════════════════════════
