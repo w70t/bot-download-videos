@@ -1400,6 +1400,10 @@ def _snap_key_material(url: str, timeout: int = 25):
     def looks_like_key(s):
         if not isinstance(s, str) or not (20 <= len(s) <= 64):
             return None
+        # استبعاد الروابط والمسارات: حروفها من أبجدية base64 فتفكّ صدفةً
+        # إلى 24/32 بايتاً وتغرق النتيجة بمرشّحين زائفين (روابط الحسابات).
+        if any(c in s for c in ':/@ .') or s.startswith(('http', 'www')):
+            return None
         try:
             raw = base64.b64decode(s + '=' * (-len(s) % 4), validate=True)
         except Exception:
@@ -1435,6 +1439,74 @@ def _snap_key_material(url: str, timeout: int = 25):
         except Exception:
             continue
     return hits, None
+
+
+# ── تفتيش حزم جافاسكربت سناب عن رموز مجموعات التحويل ──
+# الرمز في اللاحقة (‎.27.IRZXSOY‎) واحد عبر مقاطع مختلفة المعرّفات، فليس
+# توقيعاً لكل ملف بل مُعرِّف «مجموعة تحويلات». مجموعات أخرى لها رموز أخرى،
+# ورموزها تُبنى في جافاسكربت الموقع — فنفتّشه عنها وعن أي ذكر للعلامة.
+
+# كلمات دالّة نبحث عنها داخل الحزم (مع سياقها)
+_SNAP_JS_TERMS = ('watermark', 'Watermark', 'IRZXSOY', 'transformSet',
+                  'mediaTransform', 'SpotlightSharing', 'sc-cdn.net',
+                  'rendition', 'overlayUrl')
+
+
+def _snap_script_urls(html_text: str, page_url: str):
+    """روابط حزم جافاسكربت المشار إليها في الصفحة (مطلقة)."""
+    import re
+    from urllib.parse import urljoin
+    out, seen = [], set()
+    for m in re.finditer(r'<script[^>]+src=["\']([^"\']+\.js[^"\']*)["\']', html_text):
+        u = urljoin(page_url, m.group(1).replace('&amp;', '&'))
+        if u not in seen and is_safe_url(u):
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def _snap_scan_scripts(page_url: str, token: str = '', max_files: int = 12,
+                       budget_mb: int = 24, timeout: int = 30):
+    """ينزّل حزم جافاسكربت الصفحة ويفتّشها عن الكلمات الدالّة ورموز مشابهة
+    لرمز مجموعة التحويل. يعيد (عدد الملفات، الميغابايت، النتائج، الرموز)."""
+    import re
+    import urllib.request
+    try:
+        req = urllib.request.Request(page_url, headers={'User-Agent': _SNAP_UA})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            html_text = resp.read(3_000_000).decode('utf-8', 'ignore')
+    except Exception as e:
+        return 0, 0.0, [(f"تعذّر جلب الصفحة: {type(e).__name__}", '')], []
+
+    scripts = _snap_script_urls(html_text, page_url)
+    budget = budget_mb * 1024 * 1024
+    hits, tokens, used, files = [], set(), 0, 0
+    # رموز مرشّحة: سبعة محارف كبيرة/أرقام بين علامتَي اقتباس أو بعد نقطة
+    token_re = re.compile(r'["\'.]([A-Z0-9]{7})["\'.]')
+
+    for src in scripts[:max_files]:
+        if used >= budget:
+            break
+        try:
+            req = urllib.request.Request(src, headers={'User-Agent': _SNAP_UA})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read(min(budget - used, 8_000_000)).decode(
+                    'utf-8', 'ignore')
+        except Exception:
+            continue
+        files += 1
+        used += len(body)
+        for term in _SNAP_JS_TERMS:
+            idx = body.find(term)
+            if idx >= 0:
+                ctx = body[max(0, idx - 60):idx + 90].replace('\n', ' ')
+                hits.append((f"{term} — {os.path.basename(src.split('?')[0])[:28]}",
+                             ctx))
+        for m in token_re.finditer(body):
+            tokens.add(m.group(1))
+        if token and token in body:
+            tokens.add(token)
+    return files, used / 1048576, hits, sorted(tokens)[:40]
 
 
 def _snap_probe_variant(media_url: str, timeout: int = 45):
@@ -5296,6 +5368,63 @@ async def cmd_snaptest(client, message):
     if cands:
         lines.append("للمقارنة البصرية: `/snapdual <الرابط>`")
     await status.edit_text("\n".join(lines)[:4000], disable_web_page_preview=True)
+
+
+@app.on_message(filters.command("snapjs"))
+async def cmd_snapjs(client, message):
+    """أمر أدمن: يفتّش حزم جافاسكربت سناب عن رموز مجموعات التحويل وأي ذكر
+    للعلامة، ثم يجرّب الرموز المرشّحة على نفس المقطع.
+
+    الاستخدام: /snapjs <رابط سناب>"""
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    parts = (message.text or '').split(maxsplit=1)
+    url = extract_first_url(parts[1] if len(parts) > 1 else '')
+    if not url or 'snapchat.com' not in url.lower() or not is_safe_url(url):
+        await message.reply_text("الاستخدام: `/snapjs <رابط سناب>`")
+        return
+    status = await message.reply_text("📜 جارٍ تفتيش حزم جافاسكربت…")
+    loop = asyncio.get_event_loop()
+    cands, _info, err = await loop.run_in_executor(
+        None, _snapchat_page_candidates, url)
+    if err or not cands:
+        await status.edit_text(f"❌ لا وسائط: `{_snap_safe(err or 'بلا مرشّحين')}`")
+        return
+    media = cands[0][2]
+    split = _snap_transform_base(media)
+    token = split[2] if split else ''
+
+    files, mb, hits, tokens = await loop.run_in_executor(
+        None, _snap_scan_scripts, url, token)
+
+    lines = [f"📜 **تفتيش جافاسكربت** ({files} ملفاً، {mb:.1f} م.ب)", ""]
+    if hits:
+        lines.append("**مطابقات الكلمات الدالّة:**")
+        for name, ctx in hits[:6]:
+            lines.append(f"• `{_snap_safe(name)}`\n`{_snap_safe(ctx)[:150]}`")
+    else:
+        lines.append("لا مطابقة لأي كلمة دالّة في الحزم المفحوصة.")
+
+    others = [t for t in tokens if t != token]
+    lines.append(f"\n**رموز مرشّحة** (الحالي `{token or '—'}`): "
+                 + (f"`{', '.join(others[:14])}`" if others else "لا شيء"))
+    await status.edit_text("\n".join(lines)[:4000], disable_web_page_preview=True)
+
+    if not others or not split:
+        return
+    # جرّب الرموز المرشّحة على نفس المقطع بالتحويل الحالي
+    base, num, _tok, query = split
+    tried = []
+    for cand in others[:12]:
+        code, size, ctype = await loop.run_in_executor(
+            None, _snap_head, f"{base}.{num}.{cand}{query}")
+        if code in (200, 206) and size > 0:
+            tried.append((cand, size, ctype))
+    await message.reply_text(
+        ("**رموز استجابت:**\n" + "\n".join(
+            f"• `{c}` → {s / 1048576:.2f} م.ب | `{_snap_safe(t)[:20]}`"
+            for c, s, t in tried))
+        if tried else "لا رمز مرشّح استجاب — الرمز مرتبط بالمقطع أو بالجلسة.")
 
 
 @app.on_message(filters.command("snaphunt"))
