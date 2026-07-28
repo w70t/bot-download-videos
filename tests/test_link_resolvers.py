@@ -731,6 +731,49 @@ def test_tiktok_analysis_collects_public_fields():
     assert out['account_created'].strftime('%Y-%m-%d') == '2026-04-16'
 
 
+def test_tiktok_analysis_prefers_explicit_location_field():
+    """صفحة المقطع تحوي locationCreated الصريح — أدقّ من region في المرآة،
+    ويعطي الدولة بعينها. ومعه كائن المؤلّف فيغني عن طلب صفحة الحساب."""
+    import json as _json
+    scope = {'__DEFAULT_SCOPE__': {'webapp.video-detail': {'itemInfo': {'itemStruct': {
+        'locationCreated': 'MX', 'textLanguage': 'es', 'IsAigc': True,
+        'createTime': 1785124050,
+        'author': {'verified': True, 'createTime': 1680056526,
+                   'avatarLarger': 'https://x/tos-alisg-avt-0068/a.jpeg'},
+    }}}}}
+    page = ('<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">'
+            + _json.dumps(scope) + '</script>')
+
+    def fake(req, *a, **k):
+        url = req if isinstance(req, str) else req.full_url
+        if 'tikwm' in url:
+            raise AssertionError('لا ينبغي سؤال المرآة بعد نجاح صفحة المقطع')
+        return _FakeHtml(page)
+
+    with patch('urllib.request.urlopen', side_effect=fake):
+        out = link_resolvers.tiktok_source_analysis(
+            'https://www.tiktok.com/@lacasafamososmx/video/7667049361813130503')
+    assert out['created_in'] == 'MX'
+    assert out['text_language'] == 'es'
+    assert out['verified'] is True
+    assert out['ai_generated'] is True
+    assert out['account_created'].strftime('%Y-%m-%d') == '2023-03-29'
+
+
+def test_tiktok_analysis_skips_undetermined_language():
+    # «un» تعني لغة غير محدّدة فلا نعرضها كأنها لغة حقيقية
+    import json as _json
+    scope = {'__DEFAULT_SCOPE__': {'webapp.video-detail': {'itemInfo': {'itemStruct': {
+        'locationCreated': 'DE', 'textLanguage': 'un'}}}}}
+    page = ('<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">'
+            + _json.dumps(scope) + '</script>')
+    with patch('urllib.request.urlopen', return_value=_FakeHtml(page)):
+        out = link_resolvers.tiktok_source_analysis(
+            'https://www.tiktok.com/@u/video/7666463874119404833')
+    assert out['created_in'] == 'DE'
+    assert 'text_language' not in out
+
+
 def test_tiktok_analysis_handles_photo_slideshow_urls():
     """ألبومات الصور مسارها /photo/ لا /video/ — ولولا قبولها لضاع التحليل
     على كل منشورات الصور (المعرّف يحمل الطابع الزمني في الحالتين)."""

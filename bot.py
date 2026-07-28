@@ -2371,20 +2371,26 @@ def _build_source_lines(info):
     كلها بيانات علنية. ملاحظتان تصحيحيّتان مهمّتان:
     • التاريخ يُغلَّف بعلامة LTR لأن «2023-03-29» ينقلب بصرياً في السياق
       العربي فيُقرأ «29-03-2023» — أي يوماً وشهراً معكوسين.
-    • مركز البيانات ليس بلد صاحب الحساب: alisg هو المركز الافتراضي لتيك توك
-      خارج أوروبا وأمريكا، فعرضه كـ«سنغافورة» بجانب بلد النشر يوهم أن صاحب
-      الحساب سنغافوري. لا نعرضه إلا لأوروبا، حيث يدلّ فعلاً على التسجيل
-      (إقامة البيانات إلزامية بموجب حماية البيانات الأوروبية)."""
+    • لا نعرض مركز البيانات إطلاقاً: alisg هو المركز الافتراضي لتيك توك خارج
+      أوروبا وأمريكا فلا يدلّ على بلد صاحب الحساب، و«أوروبا» وحدها مبهمة —
+      وحقل created_in يعطي الدولة بعينها فأغنى عنه."""
     a = (info or {}).get('_source_analysis') or {}
     if not a:
         return []
     lines = []
-    where = _country_label(a.get('video_region'))
+    # created_in حقل تيك توك الصريح لبلد إنشاء المقطع — أدقّ من region في
+    # المرآة، ويعطي الدولة بعينها فيغني عن أي ذكر مبهم لمنطقة كأوروبا
+    where = _country_label(a.get('created_in') or a.get('video_region'))
     if where:
         lines.append(f"🌍 نُشر من: {where}")
-    lang = _LANG_AR.get(str(a.get('language') or '').lower().split('-')[0])
+    lang = _LANG_AR.get(
+        str(a.get('text_language') or a.get('language') or '').lower().split('-')[0])
     if lang:
-        lines.append(f"🗣️ لغة الحساب: {lang}")
+        lines.append(f"🗣️ اللغة: {lang}")
+    if a.get('verified'):
+        lines.append("✅ حساب موثّق")
+    if a.get('ai_generated'):
+        lines.append("🤖 محتوى مولَّد بالذكاء الاصطناعي")
     created = a.get('account_created')
     if created:
         # ‎ يمنع انقلاب التاريخ في العرض العربي
@@ -2397,8 +2403,6 @@ def _build_source_lines(info):
         except Exception:
             age = ''
         lines.append(f"📅 الحساب أُنشئ: {stamp}{age}")
-    if a.get('storage_region') == 'EU':
-        lines.append("🇪🇺 مسجَّل في الاتحاد الأوروبي")
     return lines
 
 

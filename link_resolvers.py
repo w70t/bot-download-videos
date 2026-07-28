@@ -878,8 +878,44 @@ def tiktok_source_analysis(url: str, timeout: int = 20) -> dict:
     if mu:
         out['username'] = mu.group(1)
 
-    # ٢) منطقة نشر المقطع من المرآة (وتاريخ أدقّ إن توفّر)
-    if out.get('video_id'):
+    # ٢) صفحة المقطع نفسها: أغنى مصدر وأدقّه. تحوي حقل locationCreated الصريح
+    #    (بلد إنشاء المقطع — أدقّ من region في المرآة) وكائن المؤلّف كاملاً،
+    #    فيغنينا نجاحُها عن طلب صفحة الحساب. لا تعمل لمنشورات الصور (لها مسار
+    #    آخر) فيبقى المساران التاليان بديلاً.
+    if out.get('username') and out.get('video_id'):
+        try:
+            page, _f = fetch(full, _BROWSER_UA, 4_000_000)
+            j = re.search(r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>',
+                          page, re.S)
+            scope = json.loads(j.group(1))['__DEFAULT_SCOPE__'] if j else {}
+            item = ((scope.get('webapp.video-detail') or {}).get('itemInfo')
+                    or {}).get('itemStruct') or {}
+            if item.get('locationCreated'):
+                out['created_in'] = str(item['locationCreated']).upper()
+            lang = item.get('textLanguage')
+            if lang and lang != 'un':      # «un» = لغة غير محدّدة
+                out['text_language'] = str(lang)
+            if item.get('IsAigc'):
+                out['ai_generated'] = True
+            ts = _tt_ts(item.get('createTime'))
+            if ts:
+                out['published'] = ts
+            author = item.get('author') or {}
+            if author.get('verified'):
+                out['verified'] = True
+            ats = _tt_ts(author.get('createTime'))
+            if ats:
+                out['account_created'] = ats
+            avatar = author.get('avatarLarger') or ''
+            for seg, region in _TT_STORAGE_REGIONS:
+                if seg in avatar:
+                    out['storage_region'] = region
+                    break
+        except Exception as e:
+            logger.info(f"ℹ️ تعذّر قراءة صفحة مقطع تيك توك: {e}")
+
+    # ٣) المرآة: بلد النشر حين لا تعطيه الصفحة (منشورات الصور خاصةً)
+    if out.get('video_id') and not out.get('created_in'):
         for host in _TIKTOK_API_HOSTS:
             try:
                 api = (f"https://{host}/api/?url="
@@ -894,8 +930,8 @@ def tiktok_source_analysis(url: str, timeout: int = 20) -> dict:
                 out['published'] = ts
             break
 
-    # ٣) بيانات الحساب من صفحته العامة
-    if out.get('username'):
+    # ٤) صفحة الحساب: احتياطيّ حين لا تعطينا صفحة المقطع بيانات المؤلّف
+    if out.get('username') and not out.get('account_created'):
         try:
             page, _f = fetch(f"https://www.tiktok.com/@{out['username']}", _BROWSER_UA)
             j = re.search(r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>',
@@ -915,7 +951,7 @@ def tiktok_source_analysis(url: str, timeout: int = 20) -> dict:
         except Exception as e:
             logger.info(f"ℹ️ تعذّر تحليل حساب تيك توك @{out.get('username')}: {e}")
     if out:
-        logger.info(f"🔎 تحليل تيك توك: منطقة={out.get('video_region','—')} "
+        logger.info(f"🔎 تحليل تيك توك: بلد={out.get('created_in') or out.get('video_region','—')} "
                     f"حساب=@{out.get('username','—')} "
                     f"أُنشئ={str(out.get('account_created','—'))[:10]}")
     return out
