@@ -31,7 +31,8 @@ logger = logging.getLogger(__name__)
 #          التحويل «SpotlightSharing» المذكور صراحةً داخل بارامتر mo).
 #   1034 → mp4 لنفس المقطع بلا أي لوقو، ولا تذكره صفحة سبوت لايت إطلاقاً
 #          (ظهر في صفحات حسابات المنشئين، وبارامتر mo الخاص به بلا بروفايل
-#          مشاركة). متوفّر لأغلب المقاطع لا كلّها.
+#          مشاركة). موجود لكل مقطع في عيّنة من 59 مقطعاً — لكن ليس دائماً تحت
+#          مضيف/مسار نسخة المشاركة، انظر _SNAP_FALLBACK_BASES.
 #   256/1400 (jpeg) و1306/1430 (webp) → صور مصغّرة، وهي بلا لوقو أصلاً وهذا
 #          ما يثبت أن اللوقو من بروفايل التحويل لا من المقطع الأصلي.
 # فالحل: إعادة كتابة الرندر 27 إلى 1034 بعد التأكّد من وجوده فعلياً. النسخة
@@ -41,6 +42,27 @@ logger = logging.getLogger(__name__)
 # يظهر في الصفحة، فلا فائدة منها.
 # ═══════════════════════════════════════════════════════════════
 _SNAP_CLEAN_RENDITION = os.getenv('SNAPCHAT_CLEAN_RENDITION', '1034').strip() or '1034'
+
+
+# مسارات احتياطية للنسخة النظيفة. رندرات المقطع الواحد ليست كلها تحت مضيف/مسار
+# واحد: فحص ميداني أظهر مقاطع نسخةُ مشاركتها على bolt-gcdn/bb بينما نسختها
+# النظيفة على cf-st/d. تبديل الرقم مع إبقاء المسار كان يفشل معها (≈8% من
+# المقاطع) فتعود بنسخة اللوقو رغم أن النسخة النظيفة موجودة فعلاً على مسار آخر.
+# فنجرّب المسار الأصلي أولاً ثم هذه المسارات: التغطية صارت 59/59 في عيّنة
+# مفحوصة (4 منها احتاجت مساراً احتياطياً) بعد أن كانت 24/26.
+_SNAP_FALLBACK_BASES = [b.strip().rstrip('/') for b in os.getenv(
+    'SNAPCHAT_FALLBACK_BASES',
+    'https://cf-st.sc-cdn.net/d,https://bolt-gcdn.sc-cdn.net/3'
+).split(',') if b.strip()]
+
+
+def _snap_candidate_bases(primary: str):
+    """مسارات البحث عن النسخة النظيفة: الأصلي أولاً ثم الاحتياطية، بلا تكرار."""
+    bases = [primary.rstrip('/')]
+    for b in _SNAP_FALLBACK_BASES:
+        if b not in bases:
+            bases.append(b)
+    return bases
 
 
 def get_snapchat_clean_rendition() -> str:
@@ -134,24 +156,19 @@ def snapchat_clean_rendition(media_url: str, timeout: int = 10,
     m = _SNAP_SHARING_RENDITION_RE.search(parts.path or '')
     if not m:
         return media_url  # ليس رابط رندر مشاركة — لا شيء نعيد كتابته
-    clean = (f"{parts.scheme}://{parts.netloc}{parts.path[:m.start()]}"
-             f"/{m.group(1)}.{want}.{m.group(2)}")
-    if not is_safe_url(clean):
-        return media_url
-    import urllib.request
-    req = urllib.request.Request(clean, method='HEAD',
-                                 headers={'User-Agent': _BROWSER_UA})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            ctype = (resp.headers.get_content_type() or '').lower()
-            # التخزين يردّ 404 بجسم XML؛ الفيديو يأتي video/mp4 وأحياناً
-            # application/octet-stream، فنرفض أنواع النصّ/الترميز فقط
-            if resp.status == 200 and not ctype.endswith(('xml', 'html')):
-                logger.info(f"🎯 سناب بلا لوقو (رندر {want}): {clean[:90]}")
-                return clean
-        logger.info(f"ℹ️ لا رندر نظيف لـ {m.group(1)} — نبقي نسخة المشاركة")
-    except Exception as e:
-        logger.info(f"ℹ️ تعذّر التحقّق من نسخة سناب بلا لوقو ({m.group(1)}): {e}")
+    mid, ctx = m.group(1), m.group(2)
+    for base in _snap_candidate_bases(
+            f"{parts.scheme}://{parts.netloc}{parts.path[:m.start()]}"):
+        clean = f"{base}/{mid}.{want}.{ctx}"
+        if not is_safe_url(clean):
+            continue
+        # التخزين يردّ 404 بجسم XML؛ الفيديو يأتي video/mp4 وأحياناً
+        # application/octet-stream، فنرفض أنواع النصّ/الترميز فقط
+        status, ctype, _size = _snap_head(clean, timeout)
+        if status == 200 and not ctype.endswith(('xml', 'html')):
+            logger.info(f"🎯 سناب بلا لوقو (رندر {want}): {clean[:90]}")
+            return clean
+    logger.info(f"ℹ️ لا رندر نظيف لـ {mid} — نبقي نسخة المشاركة")
     return media_url
 
 
@@ -224,26 +241,53 @@ def snapchat_probe_renditions(page_url: str, timeout: int = 20) -> dict:
         media_id = max(counts, key=counts.get)
     mine = [h for h in hits if h.group(1) == media_id]
     first = mine[0]
-    base = first.group(0)[:first.group(0).rindex('/')]
     ctx = first.group(3)
+    # رندرات المقطع الواحد قد تكون موزّعة على مضيفات/مسارات مختلفة، فنمسح كل
+    # مسار تذكره الصفحة لهذا المقطع بالإضافة للمسارات الاحتياطية
+    bases = []
+    for h in mine:
+        b = h.group(0)[:h.group(0).rindex('/')]
+        if b not in bases:
+            bases.append(b)
+    for b in _SNAP_FALLBACK_BASES:
+        if b not in bases:
+            bases.append(b)
     # كل الأرقام التي تذكرها الصفحة لهذا المقطع — نسخة اللوقو من بينها، فأي
     # رقم فيديو لا تذكره الصفحة هو المرشّح للنسخة النظيفة
     page_nums = {h.group(2) for h in mine}
     out.update(media_id=media_id, context=ctx,
                page_rendition=','.join(sorted(page_nums, key=int)))
 
-    def probe(n):
-        st, ct, cl = _snap_head(f"{base}/{media_id}.{n}.{ctx}", 15)
+    def probe(job):
+        b, n = job
+        st, ct, cl = _snap_head(f"{b}/{media_id}.{n}.{ctx}", 15)
         return n, st, ct, cl
 
-    with ThreadPoolExecutor(12) as ex:
-        for n, st, ct, cl in ex.map(probe, _SNAP_SCAN_RANGE):
-            if st == 200 and not ct.endswith(('xml', 'html')):
-                out['found'].append((n, ct, cl))
-    out['found'].sort()
-    out['videos'] = [n for n, ct, _c in out['found']
-                     if 'video' in ct or 'octet-stream' in ct]
-    out['clean'] = [n for n in out['videos'] if str(n) not in page_nums]
+    seen = set()
+
+    def scan(base_list):
+        jobs = [(b, n) for n in _SNAP_SCAN_RANGE for b in base_list]
+        with ThreadPoolExecutor(24) as ex:
+            for n, st, ct, cl in ex.map(probe, jobs):
+                if st == 200 and not ct.endswith(('xml', 'html')) and n not in seen:
+                    seen.add(n)
+                    out['found'].append((n, ct, cl))
+
+    def summarize():
+        out['found'].sort()
+        out['videos'] = [n for n, ct, _c in out['found']
+                         if 'video' in ct or 'octet-stream' in ct]
+        out['clean'] = [n for n in out['videos'] if str(n) not in page_nums]
+
+    # مسح على مرحلتين: المسار الأول يكفي لأغلب المقاطع، فلا ندفع كلفة بقية
+    # المسارات إلا حين لا نجد نسخة نظيفة (كل مسار إضافي يضاعف عدد الطلبات)
+    scan(bases[:1])
+    summarize()
+    if not out['clean'] and len(bases) > 1:
+        logger.info(f"ℹ️ لا نسخة نظيفة على المسار الأول لـ {media_id} — "
+                    f"نجرّب {len(bases) - 1} مساراً آخر")
+        scan(bases[1:])
+        summarize()
     logger.info(f"👻 فحص رندرات سناب {out['media_id']}: "
                 f"فيديو={out['videos']} نظيف={out['clean']}")
     return out

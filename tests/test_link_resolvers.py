@@ -120,10 +120,38 @@ def test_snapchat_clean_rendition_accepts_octet_stream():
 
 
 def test_snapchat_clean_rendition_keeps_original_when_missing():
-    # لا رندر نظيف لهذا المقطع (404) → نبقي نسخة المشاركة كما هي
+    # لا رندر نظيف على أي مسار (404 في كل مكان) → نبقي نسخة المشاركة كما هي
     with patch('urllib.request.urlopen', side_effect=OSError('404')), \
             patch.object(link_resolvers, 'is_safe_url', return_value=True):
         assert snapchat_clean_rendition(_SNAP_27) == _SNAP_27
+
+
+def test_snapchat_clean_rendition_falls_back_to_other_base():
+    """رندرات المقطع الواحد قد تكون على مضيف/مسار غير مسار نسخة المشاركة،
+    فحين يفشل المسار الأصلي نجرّب المسارات الاحتياطية بدل التسليم باللوقو."""
+    sharing = 'https://bolt-gcdn.sc-cdn.net/bb/hkAuDagsnNZrUsnw1giGG.27.IRZXSOY'
+
+    def fake_urlopen(req, *a, **k):
+        url = req if isinstance(req, str) else req.full_url
+        # النسخة النظيفة موجودة على cf-st/d فقط، لا على مسار نسخة المشاركة
+        if url.startswith('https://cf-st.sc-cdn.net/d/'):
+            return _FakeHead(200, 'video/mp4')
+        raise OSError('404')
+
+    with patch('urllib.request.urlopen', side_effect=fake_urlopen), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        out = snapchat_clean_rendition(sharing)
+    assert out == ('https://cf-st.sc-cdn.net/d/'
+                   'hkAuDagsnNZrUsnw1giGG.1034.IRZXSOY')
+
+
+def test_snapchat_clean_rendition_prefers_original_base():
+    # المسار الأصلي يُجرَّب أولاً ولا نقفز للاحتياطي بلا داعٍ
+    with patch('urllib.request.urlopen',
+               return_value=_FakeHead(200, 'video/mp4')), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        out = snapchat_clean_rendition(_SNAP_27)
+    assert out.startswith('https://bolt-gcdn.sc-cdn.net/bp/')
 
 
 def test_snapchat_clean_rendition_rejects_error_body():
