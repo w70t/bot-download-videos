@@ -55,6 +55,7 @@ from link_resolvers import (
     _is_music_link, resolve_music_link,
     resolve_instagram_media, instagram_mirror_lookup, resolve_tiktok_media,
     resolve_threads_media, threads_mirror_lookup,
+    resolve_facebook_share, is_facebook_story,
     twitter_mirror_lookup, twitter_mirror_media,
     resolve_tiktok_images, resolve_pinterest_media, resolve_pinterest_images,
     is_substack_note, resolve_substack_note, all_mirror_hosts,
@@ -5811,6 +5812,21 @@ async def handle_url(client, message):
         logger.warning(f"🚫 Blocked unsafe/internal URL from user {user_id}: {url[:100]}")
         await message.reply_text(t('invalid_url', lang))
         return
+
+    # 📘 فيسبوك: زرّ المشاركة يعطي «/share/<code>/» ولا مستخرِج له في yt-dlp،
+    #    وفيسبوك كثيراً ما يلفّ الوجهة بصفحة الدخول فيصل yt-dlp إلى login.php
+    #    ويردّ «Unsupported URL». نوسّع الرابط ونفكّ الغلاف ليصل الرابط الأساسي.
+    if _platform_of(url) == 'facebook':
+        _fb = await asyncio.get_event_loop().run_in_executor(
+            None, resolve_facebook_share, url)
+        if _fb and _fb != url:
+            url = _fb
+        # الستوري يتطلّب تسجيل دخول فعلاً (محقَّق: التحويل لصفحة الدخول،
+        # وm.facebook.com يردّ صفحة بلا وسائط) → رسالة واضحة بدل خطأ مضلّل
+        if is_facebook_story(url):
+            logger.info(f"🔒 ستوري فيسبوك (يتطلّب دخول) من المستخدم {user_id}")
+            await message.reply_text(t('fb_story_login', lang))
+            return
 
     # 🎯 سناب شات: جرّب أولاً النسخة النظيفة من خدمة الوسائط الداخلية (بلا لوقو
     #    مطبوع)، وإن تعذّرت فالسلوك السابق: الفيديو الخام من صفحة الويب

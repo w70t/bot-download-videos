@@ -459,6 +459,71 @@ def test_instagram_lookup_mirror_outage_not_flagged():
     assert unavailable is False
 
 
+# ── فيسبوك: توسيع روابط المشاركة وكشف الستوري ───────────────────
+
+class _FakeFinal:
+    """محاكاة استجابة urlopen تُرجع الرابط النهائي بعد التحويل."""
+    def __init__(self, final):
+        self._f = final
+
+    def geturl(self):
+        return self._f
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_facebook_unwraps_login_wrapper():
+    """فيسبوك يلفّ الوجهة بصفحة الدخول فيصل yt-dlp إلى login.php ويردّ
+    «Unsupported URL» — نفكّ الغلاف فيصل الرابط الأساسي المدعوم."""
+    real = 'https://www.facebook.com/watch/?v=123456'
+    wrapped = ('https://www.facebook.com/login.php?next='
+               + 'https%3A%2F%2Fwww.facebook.com%2Fwatch%2F%3Fv%3D123456')
+    assert link_resolvers._fb_unwrap_login(wrapped) == real
+    # رابط بلا غلاف يعود كما هو
+    assert link_resolvers._fb_unwrap_login(real) == real
+
+
+def test_facebook_share_link_expanded():
+    real = 'https://www.facebook.com/watch/?v=123456'
+    with patch('urllib.request.urlopen', return_value=_FakeFinal(real)), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        out = link_resolvers.resolve_facebook_share(
+            'https://www.facebook.com/share/1ETgKZXJXD/?mibextid=wwXIfr')
+    assert out == real
+
+
+def test_facebook_non_share_links_untouched():
+    # روابط أساسية أو غير فيسبوك: بلا أي طلب شبكي
+    for u in ('https://www.facebook.com/watch/?v=1',
+              'https://www.facebook.com/user/videos/1/',
+              'https://youtube.com/watch?v=1', ''):
+        assert link_resolvers.resolve_facebook_share(u) == u
+
+
+def test_facebook_story_detected_even_behind_login():
+    """الستوري يتطلّب دخولاً (محقَّق ميدانياً) → نكشفه لنعرض رسالة مفهومة."""
+    story = ('https://www.facebook.com/stories/122099222907153209/'
+             'UzpfSVNDOjE1NjMyNDcxNzE5NDE3NDA=/?view_single=1')
+    assert link_resolvers.is_facebook_story(story)
+    wrapped = ('https://www.facebook.com/login.php?next='
+               'https%3A%2F%2Fwww.facebook.com%2Fstories%2F122%2FUzpf%3D%2F')
+    assert link_resolvers.is_facebook_story(wrapped)
+    # فيديو عادي ليس ستوري، وغير فيسبوك لا يُفحص أصلاً
+    assert not link_resolvers.is_facebook_story(
+        'https://www.facebook.com/watch/?v=1')
+    assert not link_resolvers.is_facebook_story('https://youtube.com/watch?v=1')
+
+
+def test_facebook_share_survives_network_failure():
+    with patch('urllib.request.urlopen', side_effect=OSError('400')):
+        u = 'https://www.facebook.com/share/ABC/'
+        assert link_resolvers.resolve_facebook_share(u) == u
+
+
 # ── resolve_threads_media (ثريدز عبر مرآة عامة) ─────────────────
 
 class _FakeHtml:

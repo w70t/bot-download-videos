@@ -487,6 +487,78 @@ def resolve_instagram_media(url: str, timeout: int = 20):
 
 
 # ═══════════════════════════════════════════════════════════════
+# فيسبوك: توسيع روابط المشاركة وفكّ غلاف صفحة الدخول
+# زرّ المشاركة في فيسبوك اليوم يعطي «facebook.com/share/<code>/»، ولا مستخرِج
+# في yt-dlp يطابق هذه الصيغة إطلاقاً (ولا /share/v/ ولا /stories/) — الصيغ
+# المدعومة هي /watch/?v= و/<user>/videos/ و/reel/ فقط. فيسبوك يحوّل رابط
+# المشاركة للرابط الأساسي، لكنه كثيراً ما يلفّه بصفحة الدخول:
+#   login.php?next=<الرابط الحقيقي مرمّزاً>
+# فيصل yt-dlp إلى login.php ويردّ «Unsupported URL» — خطأ مضلّل لأن المشكلة
+# ليست في الرابط. فنوسّع الرابط أولاً ونفكّ غلاف الدخول ونسلّم الرابط الأساسي.
+# ملاحظة محقَّقة: ستوري فيسبوك يحتاج تسجيل دخول فعلاً — النسخة العادية تحوّل
+# لصفحة الدخول، وm.facebook.com يردّ صفحة بلا أي وسائط. فالتوسيع لا يجعل
+# الستوري قابلاً للتحميل بلا كوكيز، لكنه يجعل الخطأ مفهوماً.
+# ═══════════════════════════════════════════════════════════════
+_FB_SHARE_RE = re.compile(r'/share(?:/[a-z])?/[A-Za-z0-9_-]+', re.I)
+_FB_STORY_RE = re.compile(r'/stories/\d+', re.I)
+
+
+def _fb_unwrap_login(url: str) -> str:
+    """يعيد الوجهة الحقيقية من غلاف صفحة دخول فيسبوك (login.php?next=…)."""
+    import urllib.parse
+    try:
+        p = urllib.parse.urlparse(url or '')
+    except Exception:
+        return url
+    if 'login' not in (p.path or '').lower():
+        return url
+    nxt = urllib.parse.parse_qs(p.query or '').get('next')
+    if nxt and nxt[0].lower().startswith(('http://', 'https://')):
+        return nxt[0]
+    return url
+
+
+def is_facebook_story(url: str) -> bool:
+    """هل الرابط ستوري فيسبوك؟ (يتطلّب تسجيل دخول — لا يعمل بلا كوكيز)."""
+    low = (url or '').lower()
+    if not any(m in low for m in PLATFORM_URL_MARKERS['facebook']):
+        return False
+    return bool(_FB_STORY_RE.search(_fb_unwrap_login(url)))
+
+
+def resolve_facebook_share(url: str, timeout: int = 20) -> str:
+    """يوسّع رابط مشاركة فيسبوك إلى الرابط الأساسي الذي يفهمه yt-dlp.
+
+    يتبع التحويل ثم يفكّ غلاف صفحة الدخول إن وُجد. يعيد الرابط الأصلي كما هو
+    لغير روابط فيسبوك أو للروابط الأساسية أصلاً أو عند أي فشل."""
+    import urllib.request
+    low = (url or '').lower()
+    if not any(m in low for m in PLATFORM_URL_MARKERS['facebook']):
+        return url
+    # الروابط الأساسية لا تحتاج توسيعاً (نتفادى طلباً شبكياً بلا فائدة)
+    if not (_FB_SHARE_RE.search(url or '') or 'fb.watch' in low):
+        return url
+    # وكيل البوت أولاً: فيسبوك يردّ 400 لوكيل المتصفح على روابط المشاركة،
+    # بينما يعطي التحويل الصحيح لوكلاء معاينة الروابط (محقَّق ميدانياً)
+    final = None
+    for ua in (_BOT_UA, _BROWSER_UA):
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': ua})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                final = r.geturl() or url
+            break
+        except Exception as e:
+            logger.info(f"ℹ️ توسيع رابط فيسبوك تعذّر بـ{ua[:24]}: {e}")
+    if not final:
+        return url
+    final = _fb_unwrap_login(final)
+    if final and final != url and is_safe_url(final):
+        logger.info(f"🎯 فيسبوك: رابط المشاركة وُسّع إلى {final[:100]}")
+        return final
+    return url
+
+
+# ═══════════════════════════════════════════════════════════════
 # ثريدز: مرآة عامة (بدون كوكيز)
 # yt-dlp لا يملك مستخرِجاً لثريدز إطلاقاً فيردّ "Unsupported URL"، وصفحة
 # المنشور واجهة جافاسكربت لا وسائط فيها للزوّار: لا og:video ولا JSON مضمّن،
