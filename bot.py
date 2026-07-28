@@ -49,7 +49,9 @@ from cookies_manager import (
 )
 from link_resolvers import (
     resolve_snapchat_spotlight, snapchat_clean_rendition,
-    snapchat_downloadable_url, _is_music_link, resolve_music_link,
+    snapchat_downloadable_url, snapchat_probe_renditions,
+    set_snapchat_clean_rendition, get_snapchat_clean_rendition,
+    _is_music_link, resolve_music_link,
     resolve_instagram_media, instagram_mirror_lookup, resolve_tiktok_media,
     twitter_mirror_lookup, twitter_mirror_media,
     resolve_tiktok_images, resolve_pinterest_media, resolve_pinterest_images,
@@ -832,6 +834,24 @@ async def _substack_video_fallback(url: str):
 # ═══════════════════════════════════════════════════════════════
 SNAPCHAT_MEDIA_SERVICE = os.getenv(
     'SNAPCHAT_MEDIA_SERVICE', 'https://ms.sc-jpl.com/web/getStoryElements')
+
+# رقم الرندر النظيف الافتراضي (للزرّ «إعادة للافتراضي»)
+_SNAP_DEFAULT_RENDITION = (os.getenv('SNAPCHAT_CLEAN_RENDITION', '1034').strip()
+                           or '1034')
+
+
+def _snap_rendition() -> str:
+    """رقم الرندر النظيف المعمول به: إعداد قاعدة البيانات (يضبطه الأدمن بزرّ)
+    وإلا متغيّر البيئة فالافتراضي.
+
+    يزامن القيمة داخل link_resolvers فتسري على كل مسارات سناب دفعةً واحدة،
+    وتطبَّق فور ضغط الزرّ بلا إعادة تشغيل. القيمة الفارغة/غير الرقمية يتجاهلها
+    الضابط ويعيد المعمول به."""
+    try:
+        return set_snapchat_clean_rendition(
+            subdb.get_setting('snapchat_clean_rendition', ''))
+    except Exception:
+        return get_snapchat_clean_rendition()
 SNAPCHAT_CLEAN_MEDIA = os.getenv(
     'SNAPCHAT_CLEAN_MEDIA', '1').strip().lower() not in ('0', 'false', 'no', 'off')
 
@@ -5738,6 +5758,7 @@ async def handle_url(client, message):
         #    الحساب داخل البكسل. فنحوّله للرندر 1034 (نفس المقطع بلا لوقو) بعد
         #    التأكّد أنه منشور فعلاً. لا يمسّ الروابط الأخرى: أي رابط ليس رندر
         #    مشاركة يعود كما هو، فلا ينكسر أي مسار يعمل اليوم.
+        _snap_rendition()   # يزامن الرقم الذي اعتمده الأدمن من لوحة الإعدادات
         url = await _loop.run_in_executor(None, snapchat_clean_rendition, url)
         # روابط سناب بلا امتداد، وyt-dlp يقرأ رمز السياق (IRZXSOY) امتداداً
         # غريباً فيرفض التحميل — نلحق «#.mp4» ليعرف أنه mp4 (لا يُرسل للخادم،
@@ -6435,6 +6456,59 @@ async def handle_reject_payment(client, callback_query):
 
 
 # زر الرجوع الموحّد لكل شاشات إعدادات الاشتراك
+def _snap_settings_view():
+    """شاشة «سناب بلا لوقو»: الرقم المعمول به وأزرار الفحص وإعادة الافتراضي."""
+    cur = _snap_rendition()
+    text = (
+        "👻 **سناب شات — النسخة بلا لوقو**\n\n"
+        f"الرندر المعمول به: **{cur}**\n\n"
+        "سناب ينشر كل مقطع بعدّة نسخ. النسخة التي تعطيها صفحته يحرق فيها اللوقو "
+        "واسم الحساب داخل الصورة نفسها، وهناك نسخة أخرى بلا لوقو إطلاقاً — "
+        "والبوت يستعملها تلقائياً.\n\n"
+        "**لو رجع اللوقو على كل الروابط،** فغالباً سناب غيّر ترقيم النسخ: اضغط "
+        "«فحص برابط» وأرسل أي رابط سناب، وسأمسح الأرقام وأعطيك زرّاً للرقم "
+        "الصحيح تضغطه فيُحفظ فوراً.\n\n"
+        "⚠️ نحو **8%** من المقاطع أصلاً بلا نسخة نظيفة (يرجع اللوقو تلقائياً بدل "
+        "الفشل)، فمقطع واحد بلوقو ليس عطلاً — جرّب 3 روابط قبل الحكم."
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔍 فحص برابط", callback_data="sub_snapprobe")],
+        [InlineKeyboardButton(f"↩️ إعادة للافتراضي ({_SNAP_DEFAULT_RENDITION})",
+                              callback_data="sub_snapreset")],
+        [InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")],
+    ])
+    return text, kb
+
+
+def _snap_probe_view(res):
+    """يحوّل نتيجة فحص الرندرات إلى (نصّ، أزرار): زرّ لكل رقم فيديو نظيف."""
+    if res.get('error'):
+        return ("👻 **فحص سناب**\n\n❌ " + res['error'], InlineKeyboardMarkup(
+            [[InlineKeyboardButton("« رجوع", callback_data="sub_snapchat")]]))
+    cur = _snap_rendition()
+    lines = ["👻 **نتيجة فحص النسخ**", "",
+             f"المقطع: `{res['media_id']}`",
+             f"الصفحة تعطي: **{res['page_rendition']}** (نسخة اللوقو)", ""]
+    for n, ctype, size in res['found']:
+        kind = "🎬 فيديو" if ('video' in ctype or 'octet-stream' in ctype) else "🖼️ صورة"
+        tag = "  ← المعمول به" if str(n) == cur else ""
+        lines.append(f"• `{n}` — {kind} · {size // 1024} ك.ب{tag}")
+    rows = []
+    if res['clean']:
+        lines += ["", f"✅ نسخ بلا لوقو: **{', '.join(str(n) for n in res['clean'])}**",
+                  "اضغط الرقم لاعتماده فوراً:"]
+        rows = [[InlineKeyboardButton(
+            f"{'✅ ' if str(n) == cur else ''}اعتمد الرندر {n}",
+            callback_data=f"sub_snapset_{n}")] for n in res['clean']]
+    elif res['videos']:
+        lines += ["", "⚠️ لا نسخة بلا لوقو لهذا المقطع تحديداً.",
+                  "جرّب رابطاً آخر — إن تكرّر على 3 روابط فسناب أوقف النسخة النظيفة."]
+    else:
+        lines += ["", "❌ لا نسخة فيديو إطلاقاً — سناب غيّر شيئاً جوهرياً."]
+    rows.append([InlineKeyboardButton("« رجوع", callback_data="sub_snapchat")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
 def _sub_settings_back_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("« رجوع", callback_data="back_to_sub_settings")]
@@ -6630,6 +6704,8 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
          InlineKeyboardButton("📢 بث جماعي", callback_data="sub_broadcast")],
         [InlineKeyboardButton("📨 تذكير غير النشطين", callback_data="sub_remind_inactive"),
          InlineKeyboardButton("💾 نسخة احتياطية", callback_data="sub_backup_channel")],
+        [InlineKeyboardButton(f"👻 سناب بلا لوقو: رندر {_snap_rendition()}",
+                              callback_data="sub_snapchat")],
         [InlineKeyboardButton("⭐ قائمة الاستثناء", callback_data="sub_exempt")],
     ])
 
@@ -6909,6 +6985,49 @@ async def handle_subscription_settings(client, callback_query):
             client, callback_query.message,
             user_id=callback_query.from_user.id, edit=True
         )
+        return
+
+    if action == 'snapchat':
+        text, kb = _snap_settings_view()
+        await callback_query.message.edit_text(text, reply_markup=kb)
+        await callback_query.answer()
+        return
+
+    if action == 'snapprobe':
+        await callback_query.message.edit_text(
+            "🔍 **فحص نسخ سناب**\n\n"
+            "أرسل أي رابط سناب (سبوت لايت أو رابط مشاركة).\n"
+            "سأمسح أرقام النسخ على هذا المقطع وأعطيك زرّاً لكل نسخة بلا لوقو.\n\n"
+            "_يستغرق نحو 15 ثانية._",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("« رجوع", callback_data="sub_snapchat")]])
+        )
+        pending_downloads[callback_query.from_user.id] = {
+            'waiting_for': 'snap_probe_url'}
+        await callback_query.answer()
+        return
+
+    if action == 'snapreset':
+        subdb.set_setting('snapchat_clean_rendition', _SNAP_DEFAULT_RENDITION)
+        set_snapchat_clean_rendition(_SNAP_DEFAULT_RENDITION)
+        await callback_query.answer(
+            f"↩️ رجع للافتراضي: رندر {_SNAP_DEFAULT_RENDITION}", show_alert=True)
+        text, kb = _snap_settings_view()
+        await callback_query.message.edit_text(text, reply_markup=kb)
+        return
+
+    if action.startswith('snapset_'):
+        num = action[len('snapset_'):]
+        if not num.isdigit():
+            await callback_query.answer("❌ رقم غير صالح", show_alert=True)
+            return
+        subdb.set_setting('snapchat_clean_rendition', num)
+        set_snapchat_clean_rendition(num)
+        await callback_query.answer(
+            f"✅ اعتُمد الرندر {num} — يسري فوراً بلا إعادة تشغيل",
+            show_alert=True)
+        text, kb = _snap_settings_view()
+        await callback_query.message.edit_text(text, reply_markup=kb)
         return
 
     if action == 'add_domain':
@@ -8105,6 +8224,24 @@ async def handle_admin_input(client, message):
             await message.reply_text(
                 f"✅ **تم تحديث سعر الاشتراك {plan_name}**\n\nالسعر الجديد: {value_txt}"
             )
+            del pending_downloads[user_id]
+
+        elif waiting_for == 'snap_probe_url':
+            probe_url = extract_first_url(message.text) or message.text.strip()
+            if 'snapchat.com' not in probe_url.lower() or not is_safe_url(probe_url):
+                await message.reply_text(
+                    "❌ أرسل رابط سناب صحيحاً (snapchat.com).",
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("« رجوع",
+                                               callback_data="sub_snapchat")]]))
+                del pending_downloads[user_id]
+                return
+            wait = await message.reply_text("🔍 جارٍ مسح نسخ هذا المقطع…")
+            res = await asyncio.get_event_loop().run_in_executor(
+                None, snapchat_probe_renditions, probe_url)
+            text, kb = _snap_probe_view(res)
+            await wait.edit_text(text, reply_markup=kb,
+                                 disable_web_page_preview=True)
             del pending_downloads[user_id]
 
         elif waiting_for == 'add_adult_domain':

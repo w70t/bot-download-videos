@@ -9,6 +9,8 @@ import link_resolvers
 from link_resolvers import (
     _is_music_link, _music_search_query, resolve_snapchat_spotlight,
     snapchat_clean_rendition, _is_snap_video_url, snapchat_downloadable_url,
+    snapchat_probe_renditions, set_snapchat_clean_rendition,
+    get_snapchat_clean_rendition,
     resolve_instagram_media, instagram_mirror_lookup, _is_real_instagram_host,
     resolve_tiktok_media, resolve_tiktok_images,
     resolve_twitter_media, _extract_twitter_media, all_mirror_hosts,
@@ -64,13 +66,16 @@ _SNAP_1034 = 'https://bolt-gcdn.sc-cdn.net/bp/u7YkX9hEzOyaij7eKhiSd.1034.IRZXSOY
 
 
 class _FakeHead:
-    """محاكاة استجابة طلب HEAD بحالة ونوع محتوى."""
-    def __init__(self, status, ctype):
-        self.status, self._ctype = status, ctype
+    """محاكاة استجابة طلب HEAD بحالة ونوع محتوى وحجم."""
+    def __init__(self, status, ctype, length=1234):
+        self.status, self._ctype, self._len = status, ctype, length
         self.headers = self
 
     def get_content_type(self):
         return self._ctype
+
+    def get(self, name, default=None):
+        return str(self._len) if name.lower() == 'content-length' else default
 
     def __enter__(self):
         return self
@@ -159,6 +164,92 @@ def test_snapchat_downloadable_url_keeps_cache_key_stable():
     from url_utils import cache_key_for_url
     assert cache_key_for_url(snapchat_downloadable_url(_SNAP_1034)) == \
         cache_key_for_url(_SNAP_1034)
+
+
+def test_snapchat_rendition_setter_validates_and_restores():
+    """الأدمن يغيّر الرقم بزرّ، فالضابط مصدر الحقيقة الوحيد — ويرفض ما ليس رقماً."""
+    original = get_snapchat_clean_rendition()
+    try:
+        assert set_snapchat_clean_rendition('2048') == '2048'
+        assert get_snapchat_clean_rendition() == '2048'
+        # قيمة فارغة/غير رقمية لا تُفسد المعمول به
+        assert set_snapchat_clean_rendition('') == '2048'
+        assert set_snapchat_clean_rendition('abc') == '2048'
+        assert set_snapchat_clean_rendition(None) == '2048'
+    finally:
+        set_snapchat_clean_rendition(original)
+    assert get_snapchat_clean_rendition() == original
+
+
+def test_snapchat_clean_rendition_honours_explicit_number():
+    # الرقم المُمرَّر يتقدّم على الافتراضي (يمرّره البوت من قاعدة البيانات)
+    with patch('urllib.request.urlopen',
+               return_value=_FakeHead(200, 'video/mp4')), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        out = snapchat_clean_rendition(_SNAP_27, rendition='2048')
+    assert out.endswith('.2048.IRZXSOY')
+
+
+def test_snapchat_probe_rejects_non_snapchat():
+    # بلا أي طلب شبكي
+    res = snapchat_probe_renditions('https://youtube.com/watch?v=1')
+    assert res['error'] and not res['found']
+
+
+class _FakePage:
+    """صفحة سناب وهمية لطلب GET."""
+    def __init__(self, body):
+        self._b = body.encode('utf-8')
+
+    def read(self, *a):
+        return self._b
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_snapchat_probe_finds_clean_rendition():
+    """النسخ التي تذكرها الصفحة هي نسخة اللوقو، وأي رندر فيديو لا تذكره هو
+    المرشّح النظيف. المصغّرات لا تُحسب فيديو."""
+    page = ('<meta property="og:video" content="https://bolt-gcdn.sc-cdn.net/'
+            'bp/u7YkX9hEzOyaij7eKhiSd.27.IRZXSOY?mo=x"/>'
+            '"https://bolt-gcdn.sc-cdn.net/bp/u7YkX9hEzOyaij7eKhiSd.256.IRZXSOY"')
+    # ما هو منشور فعلاً على التخزين لهذا المقطع
+    available = {27: 'video/mp4', 256: 'image/jpeg', 1034: 'video/mp4',
+                 1306: 'image/webp'}
+
+    def fake_urlopen(req, *a, **k):
+        url = req if isinstance(req, str) else req.full_url
+        if 'snapchat.com' in url:
+            return _FakePage(page)
+        num = int(url.rsplit('/', 1)[1].split('.')[1])
+        if num in available:
+            return _FakeHead(200, available[num])
+        raise OSError('404')
+
+    with patch('urllib.request.urlopen', side_effect=fake_urlopen), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        res = snapchat_probe_renditions(
+            'https://www.snapchat.com/spotlight/ABC')
+    assert res['error'] is None
+    assert res['media_id'] == 'u7YkX9hEzOyaij7eKhiSd'
+    assert res['context'] == 'IRZXSOY'
+    assert res['videos'] == [27, 1034]
+    # 27 تذكره الصفحة (نسخة اللوقو) فيُستبعد؛ يبقى 1034 وحده
+    assert res['clean'] == [1034]
+
+
+def test_snapchat_probe_reports_page_structure_change():
+    # صفحة بلا أي رابط وسائط → رسالة تقول إن العلّة تحتاج كوداً لا رقماً
+    with patch('urllib.request.urlopen',
+               side_effect=lambda *a, **k: _FakePage('<html>no media</html>')), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        res = snapchat_probe_renditions('https://www.snapchat.com/spotlight/ABC')
+    assert 'تعديل كود' in res['error']
+    assert not res['clean']
 
 
 def test_snapchat_resolver_extracts_extensionless_og_video():

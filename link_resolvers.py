@@ -42,6 +42,25 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════
 _SNAP_CLEAN_RENDITION = os.getenv('SNAPCHAT_CLEAN_RENDITION', '1034').strip() or '1034'
 
+
+def get_snapchat_clean_rendition() -> str:
+    """رقم الرندر النظيف المعمول به الآن."""
+    return _SNAP_CLEAN_RENDITION
+
+
+def set_snapchat_clean_rendition(value) -> str:
+    """يضبط رقم الرندر النظيف وقت التشغيل (يستدعيه البوت من إعداد قاعدة
+    البيانات كي يغيّره الأدمن بزرّ بلا لمس ملفات ولا إعادة تشغيل).
+
+    مصدر واحد للحقيقة: تغييره هنا يسري على كل المسارات دفعةً واحدة
+    (_is_snap_video_url وresolve_snapchat_spotlight وsnapchat_clean_rendition).
+    القيمة غير الرقمية تُتجاهَل ويبقى المعمول به كما هو."""
+    global _SNAP_CLEAN_RENDITION
+    v = str(value or '').strip()
+    if v.isdigit():
+        _SNAP_CLEAN_RENDITION = v
+    return _SNAP_CLEAN_RENDITION
+
 # «/<معرّف الوسائط>.27.<رمز السياق>» في نهاية مسار رابط CDN سناب
 _SNAP_SHARING_RENDITION_RE = re.compile(
     r'/([A-Za-z0-9_-]{10,32})\.27\.([A-Za-z0-9]{4,16})\Z')
@@ -94,13 +113,20 @@ def snapchat_downloadable_url(media_url: str) -> str:
     return f"{media_url}#.mp4"
 
 
-def snapchat_clean_rendition(media_url: str, timeout: int = 10) -> str:
+def snapchat_clean_rendition(media_url: str, timeout: int = 10,
+                             rendition: str = None) -> str:
     """يحوّل رابط وسائط سناب من رندر المشاركة (27، اللوقو واسم الحساب محروقان
     داخل الصورة) إلى الرندر النظيف (1034، نفس المقطع بلا لوقو).
+
+    rendition: رقم الرندر المطلوب (يمرّره البوت من إعداد قاعدة البيانات ليغيّره
+    الأدمن بزرّ بلا لمس ملفات). عند غيابه يُستعمل متغيّر البيئة ثم الافتراضي.
 
     يتحقّق بطلب HEAD أن النسخة النظيفة منشورة فعلاً قبل اعتمادها، فإن لم تكن
     (بعض المقاطع لا رندر نظيف لها) يعيد الرابط الأصلي دون تغيير في السلوك.
     يُسقط الاستعلام لأنه يصف الرندر القديم، والتخزين يتجاهله أصلاً."""
+    want = str(rendition or _SNAP_CLEAN_RENDITION).strip()
+    if not want.isdigit():
+        want = _SNAP_CLEAN_RENDITION
     try:
         parts = urlparse(media_url or '')
     except Exception:
@@ -109,7 +135,7 @@ def snapchat_clean_rendition(media_url: str, timeout: int = 10) -> str:
     if not m:
         return media_url  # ليس رابط رندر مشاركة — لا شيء نعيد كتابته
     clean = (f"{parts.scheme}://{parts.netloc}{parts.path[:m.start()]}"
-             f"/{m.group(1)}.{_SNAP_CLEAN_RENDITION}.{m.group(2)}")
+             f"/{m.group(1)}.{want}.{m.group(2)}")
     if not is_safe_url(clean):
         return media_url
     import urllib.request
@@ -121,13 +147,106 @@ def snapchat_clean_rendition(media_url: str, timeout: int = 10) -> str:
             # التخزين يردّ 404 بجسم XML؛ الفيديو يأتي video/mp4 وأحياناً
             # application/octet-stream، فنرفض أنواع النصّ/الترميز فقط
             if resp.status == 200 and not ctype.endswith(('xml', 'html')):
-                logger.info(f"🎯 سناب بلا لوقو (رندر {_SNAP_CLEAN_RENDITION}): "
-                            f"{clean[:90]}")
+                logger.info(f"🎯 سناب بلا لوقو (رندر {want}): {clean[:90]}")
                 return clean
         logger.info(f"ℹ️ لا رندر نظيف لـ {m.group(1)} — نبقي نسخة المشاركة")
     except Exception as e:
         logger.info(f"ℹ️ تعذّر التحقّق من نسخة سناب بلا لوقو ({m.group(1)}): {e}")
     return media_url
+
+
+# أرقام الرندر التي نمسحها بحثاً عن نسخة نظيفة إن غيّر سناب الترقيم. النطاق
+# يغطّي الأرقام المعروفة وجوارها (27 فيديو، 256/1306/1400/1430 صور، 1034 نظيف).
+_SNAP_SCAN_RANGE = sorted(set(
+    list(range(0, 64)) + list(range(250, 262)) + list(range(1000, 1100))
+    + list(range(1300, 1312)) + list(range(1395, 1440))))
+
+# رابط رندر داخل نصّ الصفحة (غير مثبّت بالنهاية، بعكس نظيره أعلاه)
+_SNAP_RENDITION_IN_TEXT_RE = re.compile(
+    r'https://[^"\'\\\s]*sc-cdn\.net[^"\'\\\s]*?'
+    r'/([A-Za-z0-9_-]{10,32})\.(\d{1,5})\.([A-Za-z0-9]{4,16})')
+
+
+def _snap_head(url: str, timeout: int = 15):
+    """(الحالة، نوع المحتوى، الحجم) لطلب HEAD، أو (0, '', 0) عند أي فشل."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, method='HEAD',
+                                     headers={'User-Agent': _BROWSER_UA})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return (r.status, (r.headers.get_content_type() or '').lower(),
+                    int(r.headers.get('Content-Length') or 0))
+    except Exception:
+        return 0, '', 0
+
+
+def snapchat_probe_renditions(page_url: str, timeout: int = 20) -> dict:
+    """يمسح أرقام رندر مقطع سناب حقيقي ويعيد ما هو منشور فعلاً — أداة صيانة
+    تُجيب: أي رقم يعطي فيديو نظيفاً إن غيّر سناب الترقيم.
+
+    يعيد dict فيه: error (نصّ عند التعذّر)، media_id، context، page_rendition
+    (رقم نسخة اللوقو كما في الصفحة)، found (قائمة (رقم، نوع، حجم))، videos،
+    و clean (أرقام الفيديو عدا نسخة الصفحة — أي المرشّحة لتكون بلا لوقو).
+    طلب شبكي متزامن: يُنفَّذ خارج حلقة الأحداث."""
+    import urllib.request
+    from concurrent.futures import ThreadPoolExecutor
+    out = {'error': None, 'media_id': None, 'context': None,
+           'page_rendition': None, 'found': [], 'videos': [], 'clean': []}
+    if 'snapchat.com' not in (page_url or '').lower() or not is_safe_url(page_url):
+        out['error'] = 'ليس رابط سناب صالحاً'
+        return out
+    try:
+        req = urllib.request.Request(page_url,
+                                     headers={'User-Agent': _BROWSER_UA,
+                                              'Accept-Language': 'en-US,en;q=0.9'})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            html_text = r.read(3_000_000).decode('utf-8', 'ignore')
+    except Exception as e:
+        out['error'] = f'تعذّر جلب الصفحة: {type(e).__name__}'
+        return out
+    flat = html_text.replace('\\/', '/')
+    hits = list(_SNAP_RENDITION_IN_TEXT_RE.finditer(flat))
+    if not hits:
+        out['error'] = ('لم أجد رابط وسائط في الصفحة — غالباً سناب غيّر بنيتها، '
+                        'وهذا يحتاج تعديل كود لا مجرّد تغيير رقم')
+        return out
+    # المقطع المطلوب: معرّف og:video إن وُجد، وإلا الأكثر تكراراً في الصفحة
+    og = re.search(r'og:video[^>]*content=["\']([^"\']+)["\']', flat)
+    media_id = None
+    if og:
+        om = _SNAP_RENDITION_IN_TEXT_RE.search(og.group(1))
+        if om:
+            media_id = om.group(1)
+    if not media_id:
+        counts = {}
+        for h in hits:
+            counts[h.group(1)] = counts.get(h.group(1), 0) + 1
+        media_id = max(counts, key=counts.get)
+    mine = [h for h in hits if h.group(1) == media_id]
+    first = mine[0]
+    base = first.group(0)[:first.group(0).rindex('/')]
+    ctx = first.group(3)
+    # كل الأرقام التي تذكرها الصفحة لهذا المقطع — نسخة اللوقو من بينها، فأي
+    # رقم فيديو لا تذكره الصفحة هو المرشّح للنسخة النظيفة
+    page_nums = {h.group(2) for h in mine}
+    out.update(media_id=media_id, context=ctx,
+               page_rendition=','.join(sorted(page_nums, key=int)))
+
+    def probe(n):
+        st, ct, cl = _snap_head(f"{base}/{media_id}.{n}.{ctx}", 15)
+        return n, st, ct, cl
+
+    with ThreadPoolExecutor(12) as ex:
+        for n, st, ct, cl in ex.map(probe, _SNAP_SCAN_RANGE):
+            if st == 200 and not ct.endswith(('xml', 'html')):
+                out['found'].append((n, ct, cl))
+    out['found'].sort()
+    out['videos'] = [n for n, ct, _c in out['found']
+                     if 'video' in ct or 'octet-stream' in ct]
+    out['clean'] = [n for n in out['videos'] if str(n) not in page_nums]
+    logger.info(f"👻 فحص رندرات سناب {out['media_id']}: "
+                f"فيديو={out['videos']} نظيف={out['clean']}")
+    return out
 
 
 def resolve_snapchat_spotlight(url: str, timeout: int = 20) -> str:
