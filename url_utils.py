@@ -21,7 +21,10 @@ PLATFORM_URL_MARKERS = {
     # لتفادي مطابقة نطاقات تنتهي بـ x.com (مثل netflix.com).
     'twitter': ['twitter.', '//x.com', 't.co/'],
     'reddit': ['reddit.', 'redd.it'],
-    'snapchat': ['snapchat.'],
+    # sc-cdn.net: مضيف وسائط سناب. بعد تحويل الرابط للنسخة النظيفة يصير هذا هو
+    # الرابط العامل، فبدونه يُعدّ المقطع «منصة أخرى» فيضيع اسم المنصة في
+    # المعاينة ويظهر معرّف الملف عنواناً بدل «Snapchat Video».
+    'snapchat': ['snapchat.', 'sc-cdn.net'],
     'pinterest': ['pinterest.', 'pin.it'],
     'tiktok': ['tiktok.'],
 }

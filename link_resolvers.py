@@ -172,6 +172,42 @@ def snapchat_clean_rendition(media_url: str, timeout: int = 10,
     return media_url
 
 
+# رندرات المصغّرة، بترتيب الأفضلية. jpeg أولاً لأن تلجرام يرفض webp أحياناً.
+# تعيش مع النسخة النظيفة في نفس العائلة (29 من 30 مقطعاً في فحص ميداني).
+_SNAP_THUMB_RENDITIONS = ('256', '1400')
+
+
+def snapchat_thumbnail_url(media_url: str, timeout: int = 8):
+    """رابط مصغّرة مقطع سناب (بلا لوقو مثل بقية المصغّرات)، أو None.
+
+    yt-dlp لا يعطي مصغّرة لرابط ملف مباشر، فتظهر المعاينة بلا صورة. المصغّرة
+    كائن مجاور للنسخة النظيفة يُشتقّ من نفس الرابط بتبديل رقم الرندر.
+    يتحقّق بطلب HEAD أنها صورة فعلاً قبل إعادتها كي لا تفشل المعاينة."""
+    try:
+        p = urlparse(media_url or '')
+    except Exception:
+        return None
+    host = (p.hostname or '').lower()
+    if not (host == 'sc-cdn.net' or host.endswith('.sc-cdn.net')):
+        return None
+    m = _SNAP_RENDITION_PATH_RE.search(p.path or '')
+    if not m:
+        return None
+    mid, ctx = m.group(1), m.group(3)
+    primary = f"{p.scheme}://{p.netloc}{p.path[:m.start()]}"
+    for base in _snap_candidate_bases(primary):
+        for rid in _SNAP_THUMB_RENDITIONS:
+            thumb = f"{base}/{mid}.{rid}.{ctx}"
+            if not is_safe_url(thumb):
+                continue
+            status, ctype, _size = _snap_head(thumb, timeout)
+            if status == 200 and ctype.startswith('image/'):
+                logger.info(f"🖼️ مصغّرة سناب (رندر {rid}): {thumb[:90]}")
+                return thumb
+    logger.info("ℹ️ لا مصغّرة سناب متاحة — معاينة نصية")
+    return None
+
+
 # أرقام الرندر التي نمسحها بحثاً عن نسخة نظيفة إن غيّر سناب الترقيم. النطاق
 # يغطّي الأرقام المعروفة وجوارها (27 فيديو، 256/1306/1400/1430 صور، 1034 نظيف).
 _SNAP_SCAN_RANGE = sorted(set(

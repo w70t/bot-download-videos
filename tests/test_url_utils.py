@@ -87,6 +87,16 @@ class TestPlatformOf:
         # 't.co/' بالشرطة حتى لا يطابق snapcha[t.co]m
         assert _platform_of('https://snapchat.com/t/abc') == 'snapchat'
 
+    def test_snapchat_cdn_host_is_snapchat(self):
+        # بعد التحويل للنسخة النظيفة يصير رابط CDN هو العامل، فلا بد أن يبقى
+        # معروفاً كسناب وإلا ضاع اسم المنصة وظهر معرّف الملف عنواناً
+        assert _platform_of(
+            'https://bolt-gcdn.sc-cdn.net/bp/abcDEF123456789x.1034.IRZXSOY'
+        ) == 'snapchat'
+        assert _platform_of(
+            'https://cf-st.sc-cdn.net/d/abcDEF123456789x.27.IRZXSOY'
+        ) == 'snapchat'
+
     def test_unknown(self):
         assert _platform_of('https://example.com/v') == 'other'
 

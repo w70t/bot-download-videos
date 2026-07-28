@@ -50,6 +50,7 @@ from cookies_manager import (
 from link_resolvers import (
     resolve_snapchat_spotlight, snapchat_clean_rendition,
     snapchat_downloadable_url, snapchat_probe_renditions,
+    snapchat_thumbnail_url,
     set_snapchat_clean_rendition, get_snapchat_clean_rendition,
     _is_music_link, resolve_music_link,
     resolve_instagram_media, instagram_mirror_lookup, resolve_tiktok_media,
@@ -2241,7 +2242,9 @@ def _looks_like_media_id(title: str) -> bool:
     s = (title or '').strip()
     if not s or ' ' in s:
         return False  # فارغ أو فيه مسافات (كلمات مقروءة) → ليس معرّفاً
-    core = s.replace('_', '').replace('-', '')
+    # النقطة تدخل في أسماء ملفات سناب (RG3vywiIqsKhqon9qFsTQ.1034) فنُسقطها
+    # مثل الشرطات وإلا فشل فحص isalnum وظهر المعرّف عنواناً
+    core = s.replace('_', '').replace('-', '').replace('.', '')
     return (len(s) >= 24 and core.isalnum()
             and any(c.isalpha() for c in core)
             and any(c.isdigit() for c in core))
@@ -5876,7 +5879,8 @@ async def handle_url(client, message):
         await status.edit_text(t('adult_blocked', lang))
         return
 
-    title = info.get('title', 'Video')[:50]
+    # نفس تنظيف عنوان رسالة الرفع: معرّفات CDN القبيحة تصير «Snapchat Video»
+    title = _clean_media_title(info.get('title'), url)[:50]
     duration = info.get('duration', 0)
     duration_str = f"{int(duration)//60}:{int(duration)%60:02d}" if duration else "0:00"
     
@@ -5979,6 +5983,10 @@ async def handle_url(client, message):
     caption = t('link_preview', lang, title=title, details=details)
 
     thumb = _best_thumbnail_url(info)
+    if not thumb and platform == 'snapchat':
+        # yt-dlp لا يعطي مصغّرة لرابط ملف سناب المباشر، فنشتقّها من الرابط نفسه
+        thumb = await asyncio.get_event_loop().run_in_executor(
+            None, snapchat_thumbnail_url, url)
     if thumb:
         try:
             await message.reply_photo(thumb, caption=caption, reply_markup=keyboard)

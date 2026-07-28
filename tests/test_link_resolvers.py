@@ -168,6 +168,40 @@ def test_snapchat_clean_rendition_ignores_non_sharing_urls():
         assert snapchat_clean_rendition(u) == u
 
 
+def test_snapchat_thumbnail_prefers_jpeg_rendition():
+    """yt-dlp لا يعطي مصغّرة لرابط ملف مباشر، فنشتقّها من الرابط نفسه.
+    نفضّل 256 (jpeg) لأن تلجرام يرفض webp أحياناً."""
+    with patch('urllib.request.urlopen',
+               return_value=_FakeHead(200, 'image/jpeg')), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        out = link_resolvers.snapchat_thumbnail_url(_SNAP_1034)
+    assert out == _SNAP_1034.replace('.1034.', '.256.')
+
+
+def test_snapchat_thumbnail_falls_back_to_next_rendition():
+    # 256 غير موجودة لهذا المقطع → نجرّب 1400 قبل الاستسلام
+    def fake(req, *a, **k):
+        url = req if isinstance(req, str) else req.full_url
+        if '.1400.' in url:
+            return _FakeHead(200, 'image/jpeg')
+        raise OSError('404')
+
+    with patch('urllib.request.urlopen', side_effect=fake), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        out = link_resolvers.snapchat_thumbnail_url(_SNAP_1034)
+    assert out.endswith('.1400.IRZXSOY')
+
+
+def test_snapchat_thumbnail_none_for_video_or_foreign_url():
+    # نوع فيديو (ليس صورة) أو مضيف غير سناب → None فتبقى المعاينة نصية
+    with patch('urllib.request.urlopen',
+               return_value=_FakeHead(200, 'video/mp4')), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        assert link_resolvers.snapchat_thumbnail_url(_SNAP_1034) is None
+    assert link_resolvers.snapchat_thumbnail_url('https://youtube.com/x') is None
+    assert link_resolvers.snapchat_thumbnail_url('') is None
+
+
 def test_snapchat_downloadable_url_appends_mp4_hint():
     """yt-dlp يقرأ رمز السياق امتداداً غريباً ويرفض التحميل، فنلحق «#.mp4».
     يشمل نسخة اللوقو الاحتياطية (27) لأن العلّة نفسها فيها."""
