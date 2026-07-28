@@ -70,6 +70,30 @@ def _is_snap_video_url(u: str) -> bool:
     return bool(m and m.group(2) in ('27', _SNAP_CLEAN_RENDITION))
 
 
+def snapchat_downloadable_url(media_url: str) -> str:
+    """يلحق «#.mp4» برابط وسائط سناب كي يقبله yt-dlp.
+
+    روابط سناب تنتهي برمز السياق (‎…‎.1034.IRZXSOY) بلا امتداد، وyt-dlp يأخذ
+    ما بعد آخر نقطة امتداداً فيراه غريباً ويرفض التحميل كلّياً:
+    «The extracted extension ('IRZXSOY') is unusual and will be skipped».
+    يقرأ yt-dlp الامتداد من آخر نقطة قبل «?» فقط، فلا يفيد أي معامل استعلام.
+
+    الجزء بعد «#» لا يُرسل للخادم إطلاقاً، وcache_key_for_url يُسقطه أصلاً
+    فيبقى مفتاح الكاش كما هو — بلا أي أثر جانبي. يشمل نسخة اللوقو الاحتياطية
+    (الرندر 27) لأن العلّة نفسها فيها."""
+    try:
+        p = urlparse(media_url or '')
+    except Exception:
+        return media_url
+    host = (p.hostname or '').lower()
+    if not (host == 'sc-cdn.net' or host.endswith('.sc-cdn.net')):
+        return media_url
+    # رابط بامتداد صريح أو بجزء موجود سلفاً لا يحتاج شيئاً
+    if p.fragment or not _SNAP_RENDITION_PATH_RE.search(p.path or ''):
+        return media_url
+    return f"{media_url}#.mp4"
+
+
 def snapchat_clean_rendition(media_url: str, timeout: int = 10) -> str:
     """يحوّل رابط وسائط سناب من رندر المشاركة (27، اللوقو واسم الحساب محروقان
     داخل الصورة) إلى الرندر النظيف (1034، نفس المقطع بلا لوقو).

@@ -49,7 +49,7 @@ from cookies_manager import (
 )
 from link_resolvers import (
     resolve_snapchat_spotlight, snapchat_clean_rendition,
-    _is_music_link, resolve_music_link,
+    snapchat_downloadable_url, _is_music_link, resolve_music_link,
     resolve_instagram_media, instagram_mirror_lookup, resolve_tiktok_media,
     twitter_mirror_lookup, twitter_mirror_media,
     resolve_tiktok_images, resolve_pinterest_media, resolve_pinterest_images,
@@ -5739,6 +5739,10 @@ async def handle_url(client, message):
         #    التأكّد أنه منشور فعلاً. لا يمسّ الروابط الأخرى: أي رابط ليس رندر
         #    مشاركة يعود كما هو، فلا ينكسر أي مسار يعمل اليوم.
         url = await _loop.run_in_executor(None, snapchat_clean_rendition, url)
+        # روابط سناب بلا امتداد، وyt-dlp يقرأ رمز السياق (IRZXSOY) امتداداً
+        # غريباً فيرفض التحميل — نلحق «#.mp4» ليعرف أنه mp4 (لا يُرسل للخادم،
+        # ومفتاح الكاش يُسقطه فيبقى كما هو)
+        url = snapchat_downloadable_url(url)
 
     # 🎵 روابط الأغاني (Shazam/Apple Music/Spotify) لا تُحمّل مباشرة →
     #    استخرج اسم الأغنية وابحث عنها في يوتيوب، ثم أكمل التحميل على رابط يوتيوب.

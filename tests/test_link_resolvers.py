@@ -8,7 +8,7 @@ import json
 import link_resolvers
 from link_resolvers import (
     _is_music_link, _music_search_query, resolve_snapchat_spotlight,
-    snapchat_clean_rendition, _is_snap_video_url,
+    snapchat_clean_rendition, _is_snap_video_url, snapchat_downloadable_url,
     resolve_instagram_media, instagram_mirror_lookup, _is_real_instagram_host,
     resolve_tiktok_media, resolve_tiktok_images,
     resolve_twitter_media, _extract_twitter_media, all_mirror_hosts,
@@ -133,6 +133,32 @@ def test_snapchat_clean_rendition_ignores_non_sharing_urls():
     # روابط ليست رندر مشاركة تعود كما هي بلا أي طلب شبكي
     for u in (_SNAP_1034, 'https://cf-st.sc-cdn.net/d/abc.mp4', 'x', ''):
         assert snapchat_clean_rendition(u) == u
+
+
+def test_snapchat_downloadable_url_appends_mp4_hint():
+    """yt-dlp يقرأ رمز السياق امتداداً غريباً ويرفض التحميل، فنلحق «#.mp4».
+    يشمل نسخة اللوقو الاحتياطية (27) لأن العلّة نفسها فيها."""
+    assert snapchat_downloadable_url(_SNAP_1034) == _SNAP_1034 + '#.mp4'
+    assert snapchat_downloadable_url(_SNAP_27) == _SNAP_27 + '#.mp4'
+    # مع استعلام: الجزء يلحق في النهاية بعد الاستعلام
+    assert snapchat_downloadable_url(_SNAP_1034 + '?uc=46') == \
+        _SNAP_1034 + '?uc=46#.mp4'
+
+
+def test_snapchat_downloadable_url_leaves_others_untouched():
+    # امتداد صريح، أو جزء موجود سلفاً، أو مضيف غير سناب → بلا تغيير
+    for u in (_SNAP_1034 + '#.mp4',
+              'https://cf-st.sc-cdn.net/d/abc.mp4',
+              'https://evil.com/x/abcdefghijklmno.27.IRZXSOY',
+              'https://youtube.com/watch?v=1', ''):
+        assert snapchat_downloadable_url(u) == u
+
+
+def test_snapchat_downloadable_url_keeps_cache_key_stable():
+    # مفتاح الكاش يُسقط الجزء، فلا يتكرّر الملف في الكاش بسبب «#.mp4»
+    from url_utils import cache_key_for_url
+    assert cache_key_for_url(snapchat_downloadable_url(_SNAP_1034)) == \
+        cache_key_for_url(_SNAP_1034)
 
 
 def test_snapchat_resolver_extracts_extensionless_og_video():
