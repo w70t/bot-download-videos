@@ -3,6 +3,7 @@
 
 from unittest.mock import patch
 
+import base64
 import json
 
 import link_resolvers
@@ -13,6 +14,7 @@ from link_resolvers import (
     get_snapchat_clean_rendition,
     resolve_instagram_media, instagram_mirror_lookup, _is_real_instagram_host,
     _instagram_media_id_to_shortcode, _instagram_story_path, is_instagram_story,
+    instagram_highlight_id, instagram_highlight_items, _instagram_reel_item,
     resolve_tiktok_media, resolve_tiktok_images,
     resolve_twitter_media, _extract_twitter_media, all_mirror_hosts,
     twitter_mirror_lookup, _twitter_payload_sensitive,
@@ -595,6 +597,142 @@ def test_is_instagram_story():
     assert not is_instagram_story('https://www.facebook.com/stories/123/')
     assert not is_instagram_story('')
     assert not is_instagram_story(None)
+
+
+# ── «الأبرز» كاملاً (reels_media بلا كوكيز) ─────────────────────
+
+def test_instagram_highlight_id_from_both_link_forms():
+    # الصيغة الطويلة: الرقم في المسار
+    assert instagram_highlight_id(
+        'https://www.instagram.com/stories/highlights/18080105828054122/'
+    ) == '18080105828054122'
+    # الصيغة المختصرة: base64 لنصّ «highlight:<رقم>»
+    assert instagram_highlight_id(
+        'https://www.instagram.com/s/aGlnaGxpZ2h0OjE4MDgwMTA1ODI4MDU0MTIy'
+        '?story_media_id=3740582527900321836'
+    ) == '18080105828054122'
+
+
+def test_instagram_highlight_id_rejects_others():
+    # ستوري مفرد/ريل/بروفايل/منصّة أخرى → None بلا أي طلب شبكي
+    assert instagram_highlight_id(
+        'https://www.instagram.com/stories/user/3950648105099614764') is None
+    assert instagram_highlight_id('https://www.instagram.com/reel/ABC123/') is None
+    assert instagram_highlight_id('https://www.instagram.com/someuser/') is None
+    assert instagram_highlight_id('https://www.tiktok.com/s/abcdefgh') is None
+    assert instagram_highlight_id('') is None
+    assert instagram_highlight_id(None) is None
+    # ‏/s/ يفكّ لشيء ليس «أبرز» → None (لا نخمّن)
+    assert instagram_highlight_id(
+        'https://www.instagram.com/s/' + base64.b64encode(
+            b'story:123').decode().rstrip('=')) is None
+    # مرمّز غير صالح إطلاقاً → None بلا استثناء
+    assert instagram_highlight_id('https://www.instagram.com/s/!!!!!!!!') is None
+
+
+def test_instagram_reel_item_picks_best_video():
+    # يختار أعلى دقّة من video_versions ويأخذ المصغّرة من الصور
+    item = {
+        'pk': 123, 'taken_at': 1760124715, 'video_duration': 12.4,
+        'video_versions': [
+            {'url': 'https://cdn/small.mp4', 'width': 480, 'height': 854},
+            {'url': 'https://cdn/big.mp4', 'width': 720, 'height': 1280},
+        ],
+        'image_versions2': {'candidates': [
+            {'url': 'https://cdn/cover.jpg', 'width': 720, 'height': 1280}]},
+    }
+    with patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        out = _instagram_reel_item(item)
+    assert out['kind'] == 'video'
+    assert out['url'] == 'https://cdn/big.mp4'
+    assert out['width'] == 720 and out['height'] == 1280
+    assert out['duration'] == 12          # مقرّبة لعدد صحيح
+    assert out['thumbnail'] == 'https://cdn/cover.jpg'
+    assert out['pk'] == '123'
+
+
+def test_instagram_reel_item_photo_and_invalid():
+    # عنصر صورة (بلا video_versions) → kind=photo
+    photo = {'pk': 9, 'image_versions2': {'candidates': [
+        {'url': 'https://cdn/p.jpg', 'width': 1080, 'height': 1920}]}}
+    with patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        out = _instagram_reel_item(photo)
+    assert out['kind'] == 'photo' and out['duration'] is None
+    # بلا أي وسائط → None
+    assert _instagram_reel_item({'pk': 1}) is None
+    # رابط غير آمن (SSRF) → None
+    with patch.object(link_resolvers, 'is_safe_url', return_value=False):
+        assert _instagram_reel_item(photo) is None
+
+
+class _FakeJson:
+    """محاكاة استجابة urlopen تُرجع JSON."""
+    def __init__(self, payload):
+        self._b = json.dumps(payload).encode()
+
+    def read(self):
+        return self._b
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _highlight_payload(n=3, title='Sapcetoon', owner='bakrnurechi'):
+    return {'reels': {'highlight:18080105828054122': {
+        'title': title, 'user': {'username': owner, 'pk': 1695903393},
+        'items': [{
+            'pk': 3740521833326757660 + i, 'taken_at': 1760124715,
+            'video_duration': 12.0,
+            'video_versions': [{'url': f'https://cdn/v{i}.mp4',
+                                'width': 720, 'height': 1280}],
+            'image_versions2': {'candidates': [
+                {'url': f'https://cdn/t{i}.jpg', 'width': 720, 'height': 1280}]},
+        } for i in range(n)],
+    }}}
+
+
+def test_instagram_highlight_items_parses_all():
+    with patch('urllib.request.urlopen',
+               return_value=_FakeJson(_highlight_payload(3))), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        title, owner, items = instagram_highlight_items('18080105828054122')
+    assert (title, owner) == ('Sapcetoon', 'bakrnurechi')
+    assert len(items) == 3
+    assert all(i['kind'] == 'video' and i['duration'] == 12 for i in items)
+
+
+def test_instagram_highlight_items_respects_limit():
+    # سقف الأدمن يقصّ القائمة (٢٥ عنصراً افتراضاً)
+    with patch('urllib.request.urlopen',
+               return_value=_FakeJson(_highlight_payload(10))), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        _t, _o, items = instagram_highlight_items('18080105828054122', limit=4)
+    assert len(items) == 4
+
+
+def test_instagram_highlight_items_empty_and_errors():
+    # مجموعة خاصة/محذوفة → قائمة فارغة (يعود البوت لتحميل العنصر الواحد)
+    with patch('urllib.request.urlopen', return_value=_FakeJson({'reels': {}})):
+        assert instagram_highlight_items('18080105828054122') == ('', '', [])
+    # عطل شبكي → فارغة بلا استثناء
+    with patch('urllib.request.urlopen', side_effect=OSError('boom')):
+        assert instagram_highlight_items('18080105828054122') == ('', '', [])
+    # معرّف غير رقمي → لا طلب شبكي إطلاقاً
+    assert instagram_highlight_items('abc') == ('', '', [])
+    assert instagram_highlight_items('') == ('', '', [])
+
+
+def test_instagram_highlight_items_unexpected_key():
+    # لو غيّر إنستغرام شكل المفتاح، نأخذ أول مجموعة بدل الفشل
+    payload = _highlight_payload(2)
+    payload['reels'] = {'weird_key': list(payload['reels'].values())[0]}
+    with patch('urllib.request.urlopen', return_value=_FakeJson(payload)), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        _t, _o, items = instagram_highlight_items('18080105828054122')
+    assert len(items) == 2
 
 
 def test_instagram_lookup_expired_or_private_story_flagged():

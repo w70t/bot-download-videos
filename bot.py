@@ -56,7 +56,7 @@ from link_resolvers import (
     resolve_instagram_media, instagram_mirror_lookup, resolve_tiktok_media,
     resolve_threads_media, threads_mirror_lookup,
     resolve_facebook_share, is_facebook_story, is_instagram_story,
-    _instagram_story_path,
+    _instagram_story_path, instagram_highlight_id, instagram_highlight_items,
     twitter_mirror_lookup, twitter_mirror_media,
     resolve_tiktok_images, tiktok_source_analysis,
     resolve_pinterest_media, resolve_pinterest_images,
@@ -905,6 +905,20 @@ def _snap_rendition() -> str:
 SNAPCHAT_CLEAN_MEDIA = os.getenv(
     'SNAPCHAT_CLEAN_MEDIA', '1').strip().lower() not in ('0', 'false', 'no', 'off')
 
+# 📚 سقف عناصر «الأبرز» الواحد. مجموعة قد تبلغ ١٠٠ عنصر (ساعة رفعاً)، فالسقف
+# يحمي الجهاز والنطاق. يُدار من لوحة الأدمن ويسري فوراً بلا إعادة تشغيل.
+_IG_HIGHLIGHT_MAX_DEFAULT = os.getenv('INSTAGRAM_HIGHLIGHT_MAX_ITEMS', '25')
+
+
+def _ig_highlight_max() -> int:
+    """عدد عناصر «الأبرز» المسموح تحميلها دفعة واحدة (إعداد الأدمن ثم البيئة)."""
+    try:
+        val = int(subdb.get_setting(
+            'ig_highlight_max_items', _IG_HIGHLIGHT_MAX_DEFAULT))
+    except Exception:
+        val = 25
+    return val if 1 <= val <= 200 else 25
+
 # معرّف السناب داخل الرابط: 59 محرفاً من أبجدية base64-url
 _SNAP_ID_PATTERN = r'[A-Za-z0-9_-]{59}'
 
@@ -1387,6 +1401,29 @@ def _download_images_with_gallery_dl(url, dest_dir, cookie_file=None):
             f"لـ {url[:80]} — السبب: {detail}"
         )
     return files
+
+
+def _download_direct_media(src, dest_dir, index, kind):
+    """ينزّل ملف وسائط واحد من رابط مباشر إلى dest_dir ويعيد مساره أو None.
+    يُستدعى داخل executor (طلب شبكي متزامن) عنصراً عنصراً ليظهر التقدّم."""
+    import urllib.request
+    os.makedirs(dest_dir, exist_ok=True)
+    ua = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+          '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+    try:
+        ext = os.path.splitext(src.split('?', 1)[0])[1].lower()
+        if kind == 'photo' and ext not in _IMAGE_EXTS:
+            ext = '.jpg'
+        elif kind == 'video' and ext not in _TWEET_VIDEO_EXTS:
+            ext = '.mp4'
+        dest = os.path.join(dest_dir, f"{index:03d}{ext}")
+        req = urllib.request.Request(src, headers={'User-Agent': ua})
+        with urllib.request.urlopen(req, timeout=120) as resp, open(dest, 'wb') as fh:
+            shutil.copyfileobj(resp, fh)
+        return dest if os.path.getsize(dest) > 0 else None
+    except Exception as e:
+        logger.warning(f"⚠️ فشل تنزيل وسيط مباشر ({kind}) رقم {index}: {e}")
+        return None
 
 
 def _download_images_from_urls(image_urls, dest_dir):
@@ -3163,6 +3200,253 @@ async def download_and_send_tweet_media(client, message, url, status_msg,
         return True  # عولج (بخطأ) — لا تكمل لمسار الفيديو
     finally:
         cleanup_download_dir(dl_dir)
+
+
+async def _safe_delete(msg):
+    """يحذف رسالة ويتجاهل فشل الحذف (محذوفة أصلاً/صلاحيات)."""
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+
+async def _album_limits_blocked(status_msg, user_id, lang) -> bool:
+    """يطبّق حدود العضو (الحد اليومي وبوابة الدعوة) على مسار الألبوم الكامل.
+    يعيد True إذا مُنع التحميل وعُرضت الرسالة المناسبة."""
+    if subdb.is_user_subscribed(user_id) or is_admin(user_id):
+        return False
+    base_limit = subdb.get_daily_limit()
+    if base_limit != -1:
+        effective = base_limit + subdb.get_bonus_downloads(user_id)
+        used = subdb.check_daily_limit(user_id)
+        if used >= effective:
+            await status_msg.edit_text(
+                t('daily_limit_exceeded', lang, limit=effective, count=used),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(t('subscribe_now', lang),
+                                          callback_data="show_plans")],
+                    [_invite_button(lang)],
+                ])
+            )
+            return True
+    return await _invite_gate_blocked(status_msg, user_id, lang)
+
+
+async def _ig_highlight_fetch(url):
+    """(العنوان، الناشر، العناصر، العدد الكلي) لمجموعة «أبرز» من رابطها.
+    العناصر مقصوصة على سقف الأدمن؛ العدد الكلي قبل القصّ ليُعلَم العضو."""
+    hid = instagram_highlight_id(url)
+    if not hid:
+        return None
+    loop = asyncio.get_event_loop()
+    try:
+        title, owner, items = await loop.run_in_executor(
+            None, lambda: instagram_highlight_items(hid))
+    except Exception as e:
+        logger.warning(f"⚠️ تعذّر جلب «الأبرز» من {url[:70]}: {e}")
+        return None
+    if not items:
+        return None
+    cap = _ig_highlight_max()
+    return title, owner, items[:cap], len(items)
+
+
+async def _ig_highlight_prompt(message, url, user_id, lang) -> bool:
+    """يسأل العضو: «هذا المقطع فقط» أم «الأبرز كامل»؟ لروابط «الأبرز» وحدها.
+
+    يعيد True إذا تولّى الرابط (سؤال معروض أو تحميل كامل جارٍ) فيتوقّف مسار
+    handle_url هنا، وFalse ليكمل المسار المعتاد بلا أي تغيير — وهذا ما يحدث
+    لكل رابط ليس «أبرز»، ولمجموعة تعذّر جلبها (فيعمل تحميل العنصر الواحد)."""
+    if not instagram_highlight_id(url):
+        return False
+    probing = await message.reply_text(t('highlight_checking', lang))
+    fetched = await _ig_highlight_fetch(url)
+    if not fetched:
+        await _safe_delete(probing)
+        return False  # مجموعة خاصة/محذوفة أو عطل → المسار المعتاد للعنصر الواحد
+    title, owner, items, total = fetched
+
+    # لا عنصر مفرد مشتقّ من الرابط (رابط مجموعة بلا story_media_id) → لا خيار
+    # حقيقي: نزّل المجموعة مباشرة بدل سؤال إجابته واحدة
+    if not _instagram_story_path(url) or len(items) < 2:
+        if len(items) < 2 and _instagram_story_path(url):
+            await _safe_delete(probing)
+            return False  # عنصر واحد فقط → المسار المعتاد أدقّ (كاش/جودة)
+        return await _ig_highlight_download(
+            message, probing, url, user_id, lang, title, owner, items, total)
+
+    pending_downloads[user_id] = {
+        'waiting_for': 'ig_highlight', 'url': url, 'items': items,
+        'title': title, 'owner': owner, 'total': total, 'message': message,
+    }
+    secs = sum(i.get('duration') or 0 for i in items)
+    await probing.edit_text(
+        t('highlight_choose', lang, title=(title or 'Highlight')[:60],
+          owner=owner or '—', count=len(items),
+          duration=f"{secs // 60}:{secs % 60:02d}"),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(t('highlight_btn_all', lang, count=len(items)),
+                                  callback_data='ighl_all')],
+            [InlineKeyboardButton(t('highlight_btn_one', lang),
+                                  callback_data='ighl_one')],
+        ])
+    )
+    return True
+
+
+async def _ig_highlight_download(message, status_msg, url, user_id, lang,
+                                 title, owner, items, total):
+    """ينزّل عناصر «الأبرز» ويرسلها ألبومات (١٠ لكل ألبوم). يعيد True دائماً
+    (عولج الرابط) — فحتى الفشل يعرض رسالة واضحة بدل العودة لمسار الفيديو."""
+    user_name = (message.from_user.first_name if message.from_user else None) or "User"
+    user_username = message.from_user.username if message.from_user else None
+
+    # 🔒 حدود العضو تنطبق على المجموعة كما تنطبق على المقطع الواحد — وإلا صار
+    #    رابط «الأبرز» بابَ التفافٍ على الحد اليومي وبوابة الدعوة معاً
+    if await _album_limits_blocked(status_msg, user_id, lang):
+        return True
+
+    loop = asyncio.get_event_loop()
+    dl_dir = os.path.join('videos', 'hl_' + uuid.uuid4().hex)
+    ckey = cache_key_for_url(url)
+    try:
+        # ⚡ كاش الألبوم: نفس «الأبرز» حُمّل سابقاً → أعِد إرساله بلا أي تحميل
+        if await _try_send_album_from_cache(
+            app, message, status_msg, ckey,
+            user_id, user_name, user_username, url, lang
+        ):
+            return True
+
+        files = []
+        for i, it in enumerate(items, 1):
+            if i == 1 or i % 3 == 0 or i == len(items):
+                try:
+                    await status_msg.edit_text(t('highlight_downloading', lang,
+                                                 current=i, total=len(items)))
+                except Exception:
+                    pass
+            path = await loop.run_in_executor(
+                None, lambda it=it, i=i: _download_direct_media(
+                    it['url'], dl_dir, i, it['kind']))
+            if path:
+                files.append((it['kind'], path))
+        if not files:
+            await status_msg.edit_text(t('download_failed', lang))
+            return True
+
+        # طبّع الصور لصيغ تلجرام، واضمن مسار صوت في كل فيديو (بلا صوت يعرضه
+        # تلجرام صورة متحركة بدل فيديو)
+        entries = []
+        for kind, path in files:
+            if kind == 'photo':
+                norm = _normalize_images_for_telegram([path])
+                if norm:
+                    entries.append(('photo', norm[0]))
+            else:
+                await loop.run_in_executor(
+                    None, lambda p=path: _ensure_video_has_audio(p))
+                entries.append(('video', path))
+        if not entries:
+            await status_msg.edit_text(t('download_failed', lang))
+            return True
+
+        bot_username = await _get_bot_username(app)
+        caption = t('highlight_caption', lang,
+                    title=(title or 'Highlight').replace('`', "'")[:200],
+                    owner=owner or '—', count=len(entries),
+                    promo=(f"\n\n📥 @{bot_username}" if bot_username else ""))
+        if total > len(items):
+            caption += t('highlight_capped', lang, shown=len(items), total=total)
+
+        n_albums = (len(entries) + 9) // 10
+        if n_albums > 1:
+            try:
+                await status_msg.edit_text(t('highlight_uploading', lang,
+                                             current=1, total=n_albums))
+            except Exception:
+                pass
+        sent_messages = await _send_media_album(
+            app, message.chat.id, entries, caption)
+        await _safe_delete(status_msg)
+        n_photos = sum(1 for k, _ in entries if k == 'photo')
+        logger.info(f"✅ أُرسل «أبرز» إنستغرام للمستخدم {user_id}: "
+                    f"{len(entries) - n_photos} فيديو + {n_photos} صورة")
+
+        log_messages = []
+        if sent_messages:
+            try:
+                log_messages = await forward_images_to_log_channel(
+                    client=app, message=message, sent_messages=sent_messages,
+                    user_id=user_id, user_name=user_name, username=user_username,
+                    url=url, video_info={'title': title or 'Highlight'},
+                    title=title or 'Highlight'
+                ) or []
+            except Exception as log_error:
+                logger.error(f"⚠️ خطأ في إرسال «الأبرز» للقناة: {log_error}")
+
+        # 💾 كاش الألبوم بمعرّفات الملفات — إعادة الإرسال لاحقاً بلا تحميل
+        try:
+            src_msgs = log_messages if len(log_messages) == len(sent_messages) \
+                else sent_messages
+            lines = _album_cache_lines(src_msgs)
+            if lines:
+                subdb.save_cached_media(
+                    url_key=ckey, quality=ALBUM_CACHE_QUALITY, kind='album',
+                    file_id="\n".join(lines), title=(title or 'Highlight'),
+                    file_size_mb=0, duration=0
+                )
+                logger.info(f"💾 حُفظ كاش «الأبرز»: {ckey} ({len(lines)} وسيطاً)")
+        except Exception as e:
+            logger.warning(f"⚠️ تعذّر حفظ كاش «الأبرز»: {e}")
+
+        try:
+            subdb.add_download_history(user_id, url, title or 'Highlight',
+                                       'best', 'album', 'instagram', 0,
+                                       from_cache=False)
+        except Exception:
+            pass
+
+        await _send_daily_remaining_notice(message, user_id, lang)
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ خطأ في تحميل «أبرز» إنستغرام: {e}")
+        await send_error_to_admin(user_id, user_name, str(e), url,
+                                  traceback.format_exc())
+        try:
+            await status_msg.edit_text(t('download_failed', lang))
+        except Exception:
+            pass
+        return True
+    finally:
+        cleanup_download_dir(dl_dir)
+
+
+@app.on_callback_query(filters.regex(r'^ighl_'))
+async def handle_ig_highlight_choice(client, callback_query):
+    """زرّا اختيار «الأبرز»: المجموعة كاملة، أو المقطع الواحد بالمسار المعتاد."""
+    user_id = callback_query.from_user.id
+    lang = subdb.get_user_language(user_id)
+    pend = pending_downloads.get(user_id)
+    if not (isinstance(pend, dict) and pend.get('waiting_for') == 'ig_highlight'):
+        await callback_query.answer("⏱️ انتهت صلاحية الطلب — أعد إرسال الرابط",
+                                    show_alert=True)
+        return
+    pending_downloads.pop(user_id, None)
+    await callback_query.answer()
+    url, message = pend['url'], pend['message']
+
+    if callback_query.data == 'ighl_all':
+        await _ig_highlight_download(
+            message, callback_query.message, url, user_id, lang,
+            pend.get('title'), pend.get('owner'), pend['items'],
+            pend.get('total') or len(pend['items']))
+        return
+
+    # المقطع الواحد: المسار المعتاد كاملاً (كاش، أزرار الجودة/الصوت، الحدود)
+    await _safe_delete(callback_query.message)
+    await process_download_from_queue(
+        DownloadTask(url=url, message=message, user_id=user_id))
 
 
 class PreviewStatus:
@@ -6038,9 +6322,15 @@ async def handle_url(client, message):
         )
         return
     
+    # 📚 «أبرز» إنستغرام: الرابط يشير لعنصر واحد، لكن المجموعة كاملة متاحة بلا
+    #    كوكيز — اسأل العضو أيّهما يريد قبل أي تحميل. (بعد حدّ التكرار والطابور
+    #    كي لا يفتح تكرارُ الروابط طلباتٍ لإنستغرام بلا ضابط)
+    if await _ig_highlight_prompt(message, url, user_id, lang):
+        return
+
     # No active downloads, process normally
     pending_downloads[user_id] = url
-    
+
     status = await message.reply_text(t('processing', lang))
     
     try:
@@ -6934,6 +7224,8 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
          InlineKeyboardButton("💾 نسخة احتياطية", callback_data="sub_backup_channel")],
         [InlineKeyboardButton(f"👻 سناب بلا لوقو: رندر {_snap_rendition()}",
                               callback_data="sub_snapchat")],
+        [InlineKeyboardButton(f"📚 حد عناصر «الأبرز»: {_ig_highlight_max()}",
+                              callback_data="sub_ighl_max")],
         [InlineKeyboardButton("⭐ قائمة الاستثناء", callback_data="sub_exempt")],
     ])
 
@@ -7218,6 +7510,21 @@ async def handle_subscription_settings(client, callback_query):
     if action == 'snapchat':
         text, kb = _snap_settings_view()
         await callback_query.message.edit_text(text, reply_markup=kb)
+        await callback_query.answer()
+        return
+
+    if action == 'ighl_max':
+        await callback_query.message.edit_text(
+            "📚 **حد عناصر «الأبرز»**\n\n"
+            f"الحالي: **{_ig_highlight_max()}** عنصراً لكل مجموعة.\n\n"
+            "مجموعة «الأبرز» قد تبلغ ١٠٠ عنصر (نحو ساعة رفعاً من الجهاز)، "
+            "فالحدّ يحمي الجهاز والنطاق. المجموعة الأكبر تُقصّ لهذا العدد "
+            "ويُخبَر العضو بذلك.\n\n"
+            "أرسل رقماً بين **1** و**200**:",
+            reply_markup=_sub_settings_back_kb()
+        )
+        pending_downloads[callback_query.from_user.id] = {
+            'waiting_for': 'ig_highlight_max'}
         await callback_query.answer()
         return
 
@@ -8365,6 +8672,22 @@ async def handle_admin_input(client, message):
             await message.reply_text(
                 f"✅ **تم تحديث الحد الأقصى**\n\n"
                 f"المدة الجديدة: {minutes} دقيقة ({minutes//60} ساعة و {minutes%60} دقيقة)"
+            )
+            del pending_downloads[user_id]
+
+        elif waiting_for == 'ig_highlight_max':
+            try:
+                n = int(message.text.strip())
+            except ValueError:
+                await message.reply_text("❌ أرسل رقماً صحيحاً بين 1 و200.")
+                return
+            if not 1 <= n <= 200:
+                await message.reply_text("❌ الرقم يجب أن يكون بين 1 و200.")
+                return
+            subdb.set_setting('ig_highlight_max_items', str(n))
+            await message.reply_text(
+                f"✅ **تم تحديث حد «الأبرز»**\n\n"
+                f"العدد الجديد: **{n}** عنصراً لكل مجموعة — يسري فوراً."
             )
             del pending_downloads[user_id]
 

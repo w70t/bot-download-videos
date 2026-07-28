@@ -469,6 +469,129 @@ def _instagram_story_path(url: str):
     return f"/p/{code}" if code else None
 
 
+# ═══════════════════════════════════════════════════════════════
+# «الأبرز» (Highlights) كاملاً بلا كوكيز
+# نقطة إنستغرام الداخلية reels_media تسلّم مجموعة «أبرز» عامة كاملة لأي زائر
+# بترويسة X-IG-App-ID وحدها — بلا كوكيز ولا تسجيل دخول. محقَّق ميدانياً على
+# highlight:18080105828054122: ٧٣٩ كيلوبايت JSON فيها ٢٥ عنصراً، لكل عنصر رابط
+# mp4 مباشر ومصغّرة ومدّة وأبعاد ووقت نشر — ونزل أول عنصر (2,246,911 بايت).
+# ملاحظة حدود: نفس النقطة بمعرّف حساب (reel_ids=<رقم الحساب>) تردّ 200 ومصفوفة
+# فارغة حتى لحساب لديه ستوري نشط الآن — فتعداد ستوري الـ٢٤ ساعة مقفل للزوّار
+# عمداً (تسع نقاط أخرى جُرّبت: 401/404/302). المتاح: عنصر تعرف رقمه، أو «أبرز»
+# تعرف رقم مجموعته.
+# ═══════════════════════════════════════════════════════════════
+_IG_APP_ID = os.getenv('INSTAGRAM_APP_ID', '936619743392459')
+_IG_REELS_MEDIA_URL = os.getenv(
+    'INSTAGRAM_REELS_MEDIA_API',
+    'https://i.instagram.com/api/v1/feed/reels_media/')
+
+_INSTAGRAM_HIGHLIGHT_PATH_RE = re.compile(r'/stories/highlights/(\d{8,25})', re.I)
+_INSTAGRAM_SHARE_PATH_RE = re.compile(r'/s/([A-Za-z0-9_\-=]{8,})', re.I)
+_INSTAGRAM_HIGHLIGHT_TOKEN_RE = re.compile(r'^highlight:(\d{8,25})$', re.I)
+
+
+def instagram_highlight_id(url: str):
+    """رقم مجموعة «الأبرز» من رابطها، أو None لغير روابط الأبرز.
+
+    صيغتان: الطويلة «/stories/highlights/<رقم>/»، والمختصرة «/s/<مرمّز>» حيث
+    المرمّز base64 لنصّ «highlight:<رقم>»."""
+    import base64
+    u = url or ''
+    if not any(h in u.lower() for h in ('instagram.com', 'instagr.am')):
+        return None
+    m = _INSTAGRAM_HIGHLIGHT_PATH_RE.search(u)
+    if m:
+        return m.group(1)
+    m = _INSTAGRAM_SHARE_PATH_RE.search(u)
+    if not m:
+        return None
+    token = m.group(1)
+    try:
+        raw = base64.b64decode(token + '=' * (-len(token) % 4)).decode(
+            'utf-8', 'ignore').strip()
+    except Exception:
+        return None
+    hm = _INSTAGRAM_HIGHLIGHT_TOKEN_RE.match(raw)
+    return hm.group(1) if hm else None
+
+
+def _instagram_reel_item(item: dict):
+    """يحوّل عنصر reels_media إلى صيغة موحّدة، أو None إن لم يصلح للتحميل."""
+    vids = item.get('video_versions') or []
+    if vids:
+        best = max(vids, key=lambda v: (v.get('width') or 0) * (v.get('height') or 0))
+        media = best.get('url') or ''
+        kind = 'video'
+        width, height = best.get('width'), best.get('height')
+    else:
+        cands = ((item.get('image_versions2') or {}).get('candidates')) or []
+        if not cands:
+            return None
+        best = max(cands, key=lambda c: (c.get('width') or 0) * (c.get('height') or 0))
+        media = best.get('url') or ''
+        kind = 'photo'
+        width, height = best.get('width'), best.get('height')
+    if not media or not is_safe_url(media):
+        return None
+    thumbs = ((item.get('image_versions2') or {}).get('candidates')) or []
+    thumb = thumbs[0].get('url') if thumbs else None
+    dur = item.get('video_duration')
+    return {
+        'kind': kind,
+        'url': media,
+        'thumbnail': thumb if (thumb and is_safe_url(thumb)) else None,
+        'duration': int(round(dur)) if dur else None,
+        'width': width or None,
+        'height': height or None,
+        'pk': str(item.get('pk') or ''),
+        'taken_at': item.get('taken_at') or None,
+    }
+
+
+def instagram_highlight_items(highlight_id: str, limit: int = 0, timeout: int = 25):
+    """يجلب مجموعة «أبرز» عامة كاملة بلا كوكيز.
+
+    يعيد (العنوان، اسم الناشر، قائمة العناصر) — والقائمة فارغة لمجموعة خاصة
+    أو محذوفة أو عند أي فشل، فيبقى السلوك الحالي (تحميل العنصر الواحد).
+    limit>0 يقصّ القائمة على أول هذا العدد (سقف الأدمن)."""
+    import json
+    import urllib.request
+    if not highlight_id or not str(highlight_id).isdigit():
+        return '', '', []
+    api = f"{_IG_REELS_MEDIA_URL}?reel_ids=highlight%3A{highlight_id}"
+    try:
+        req = urllib.request.Request(api, headers={
+            'User-Agent': _BROWSER_UA,
+            'X-IG-App-ID': _IG_APP_ID,
+            'Accept': '*/*',
+            'Referer': 'https://www.instagram.com/',
+        })
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode('utf-8', 'replace'))
+    except Exception as e:
+        logger.warning(f"⚠️ تعذّر جلب «الأبرز» {highlight_id}: {e}")
+        return '', '', []
+    reels = (data or {}).get('reels') or {}
+    reel = reels.get(f"highlight:{highlight_id}")
+    if reel is None:
+        # المفتاح قد يختلف شكلاً — خذ أول مجموعة إن وُجدت
+        reel = next(iter(reels.values()), None)
+    if not reel:
+        logger.info(f"ℹ️ «الأبرز» {highlight_id} بلا عناصر (خاص/محذوف؟)")
+        return '', '', []
+    items = []
+    for raw in (reel.get('items') or []):
+        one = _instagram_reel_item(raw)
+        if one:
+            items.append(one)
+        if limit and len(items) >= limit:
+            break
+    title = str(reel.get('title') or '').strip()
+    owner = str((reel.get('user') or {}).get('username') or '').strip()
+    logger.info(f"📚 «الأبرز» {highlight_id} «{title}» لـ@{owner}: {len(items)} عنصراً")
+    return title, owner, items
+
+
 def is_instagram_story(url: str) -> bool:
     """هل الرابط ستوري إنستغرام (أو عنصر «أبرز»)؟ يُستعمل لرسالة فشل أدقّ:
     الستوري يعيش ٢٤ ساعة، فالسبب الغالب للفشل انتهاؤه لا خصوصية الحساب."""

@@ -41,6 +41,18 @@ TRANSLATIONS = {
         'images_caption': '🖼️ **{title}**\n\n📷 {count} صورة · 👤 {user}{source}{promo}',
         'downloading_album': '📥 **جاري تحميل وسائط التغريدة…**',
         'album_caption': '🐦 **{title}**\n\n📎 {count} وسائط · 👤 {user}{promo}',
+        'highlight_checking': '📚 **جاري فحص «الأبرز»…**',
+        'highlight_choose': ('📚 **{title}**\n\n'
+                             '👤 @{owner}\n'
+                             '📎 {count} عنصراً · ⏱️ {duration}\n\n'
+                             '**ماذا تريد؟**'),
+        'highlight_btn_all': '📚 الأبرز كامل ({count})',
+        'highlight_btn_one': '🎬 هذا المقطع فقط',
+        'highlight_downloading': '📥 **جاري تحميل «الأبرز»** · {current}/{total}',
+        'highlight_uploading': '📤 **جاري الإرسال** · ألبوم {current}/{total}',
+        'highlight_caption': ('📚 **{title}**\n\n'
+                             '👤 @{owner} · 📎 {count} عنصراً{promo}'),
+        'highlight_capped': ('\n\n_عُرض أول {shown} من {total} عنصراً (حدّ البوت)._'),
         'downloading': '📥 **جاري التحميل** · {percent}%\n\n{progress_bar}\n\n💾 {current_mb} / {total_mb} MB\n🚀 {speed_mb} MB/s · ⏳ {eta}s',
         'uploading': '📤 **جاري الرفع** · {percent}%\n\n{progress_bar}\n\n💾 {current_mb} / {total_mb} MB\n🚀 {speed_mb} MB/s · ⏳ {eta}s',
         'choose_quality': '📥 **اختر نوع التحميل**\n\n🎬 {title}\n🕒 {duration}',
@@ -225,6 +237,18 @@ TRANSLATIONS = {
         'images_caption': '🖼️ **{title}**\n\n📷 {count} photos · 👤 {user}{source}{promo}',
         'downloading_album': '📥 **Downloading tweet media…**',
         'album_caption': '🐦 **{title}**\n\n📎 {count} media · 👤 {user}{promo}',
+        'highlight_checking': '📚 **Checking the highlight…**',
+        'highlight_choose': ('📚 **{title}**\n\n'
+                             '👤 @{owner}\n'
+                             '📎 {count} items · ⏱️ {duration}\n\n'
+                             '**What would you like?**'),
+        'highlight_btn_all': '📚 Full highlight ({count})',
+        'highlight_btn_one': '🎬 This clip only',
+        'highlight_downloading': '📥 **Downloading highlight** · {current}/{total}',
+        'highlight_uploading': '📤 **Sending** · album {current}/{total}',
+        'highlight_caption': ('📚 **{title}**\n\n'
+                             '👤 @{owner} · 📎 {count} items{promo}'),
+        'highlight_capped': ('\n\n_Showing first {shown} of {total} items (bot limit)._'),
         'downloading': '📥 **Downloading** · {percent}%\n\n{progress_bar}\n\n💾 {current_mb} / {total_mb} MB\n🚀 {speed_mb} MB/s · ⏳ {eta}s',
         'uploading': '📤 **Uploading** · {percent}%\n\n{progress_bar}\n\n💾 {current_mb} / {total_mb} MB\n🚀 {speed_mb} MB/s · ⏳ {eta}s',
         'choose_quality': '📥 **Choose download type**\n\n🎬 {title}\n🕒 {duration}',
