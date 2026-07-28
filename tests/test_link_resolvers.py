@@ -8,6 +8,7 @@ import json
 import link_resolvers
 from link_resolvers import (
     _is_music_link, _music_search_query, resolve_snapchat_spotlight,
+    snapchat_clean_rendition, _is_snap_video_url,
     resolve_instagram_media, instagram_mirror_lookup, _is_real_instagram_host,
     resolve_tiktok_media, resolve_tiktok_images,
     resolve_twitter_media, _extract_twitter_media, all_mirror_hosts,
@@ -54,6 +55,119 @@ def test_snapchat_resolver_ignores_other_urls():
     # روابط غير سناب شات تعود كما هي دون أي طلب شبكي
     url = 'https://youtube.com/watch?v=1'
     assert resolve_snapchat_spotlight(url) == url
+
+
+# ── سناب: النسخة بلا لوقو (رندر 1034 بدل 27) ────────────────────
+
+_SNAP_27 = 'https://bolt-gcdn.sc-cdn.net/bp/u7YkX9hEzOyaij7eKhiSd.27.IRZXSOY'
+_SNAP_1034 = 'https://bolt-gcdn.sc-cdn.net/bp/u7YkX9hEzOyaij7eKhiSd.1034.IRZXSOY'
+
+
+class _FakeHead:
+    """محاكاة استجابة طلب HEAD بحالة ونوع محتوى."""
+    def __init__(self, status, ctype):
+        self.status, self._ctype = status, ctype
+        self.headers = self
+
+    def get_content_type(self):
+        return self._ctype
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_is_snap_video_url_accepts_video_renditions():
+    # رندر المشاركة (27) والرندر النظيف (1034) وملف mp4 صريح
+    assert _is_snap_video_url(_SNAP_27)
+    assert _is_snap_video_url(_SNAP_1034)
+    assert _is_snap_video_url('https://cf-st.sc-cdn.net/d/abc.mp4')
+
+
+def test_is_snap_video_url_rejects_thumbnails_and_foreign_hosts():
+    # المصغّرات (jpeg/webp) مستبعَدة كي لا نرسل صورة غلاف بدل الفيديو
+    for rid in ('256', '1306', '1400', '1430'):
+        assert not _is_snap_video_url(
+            f'https://bolt-gcdn.sc-cdn.net/bp/u7YkX9hEzOyaij7eKhiSd.{rid}.IRZXSOY')
+    # مضيف ينتحل الصيغة نفسها لا يُقبل
+    assert not _is_snap_video_url('https://evil.com/x/abcdefghijklmno.27.IRZXSOY')
+    assert not _is_snap_video_url('https://sc-cdn.net.evil.com/x/abcdefghij.27.IRZX')
+    assert not _is_snap_video_url('')
+
+
+def test_snapchat_clean_rendition_rewrites_when_available():
+    # الرندر النظيف منشور → نستبدل 27 بـ 1034 ونُسقط الاستعلام
+    with patch('urllib.request.urlopen',
+               return_value=_FakeHead(200, 'video/mp4')), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        out = snapchat_clean_rendition(_SNAP_27 + '?mo=abc&uc=46')
+    assert out == _SNAP_1034
+
+
+def test_snapchat_clean_rendition_accepts_octet_stream():
+    # بعض المقاطع تُقدَّم application/octet-stream وهي فيديو صالح
+    with patch('urllib.request.urlopen',
+               return_value=_FakeHead(200, 'application/octet-stream')), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        assert snapchat_clean_rendition(_SNAP_27) == _SNAP_1034
+
+
+def test_snapchat_clean_rendition_keeps_original_when_missing():
+    # لا رندر نظيف لهذا المقطع (404) → نبقي نسخة المشاركة كما هي
+    with patch('urllib.request.urlopen', side_effect=OSError('404')), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        assert snapchat_clean_rendition(_SNAP_27) == _SNAP_27
+
+
+def test_snapchat_clean_rendition_rejects_error_body():
+    # ردّ XML من التخزين ليس فيديو → نبقي الأصلي
+    with patch('urllib.request.urlopen',
+               return_value=_FakeHead(200, 'application/xml')), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        assert snapchat_clean_rendition(_SNAP_27) == _SNAP_27
+
+
+def test_snapchat_clean_rendition_ignores_non_sharing_urls():
+    # روابط ليست رندر مشاركة تعود كما هي بلا أي طلب شبكي
+    for u in (_SNAP_1034, 'https://cf-st.sc-cdn.net/d/abc.mp4', 'x', ''):
+        assert snapchat_clean_rendition(u) == u
+
+
+def test_snapchat_resolver_extracts_extensionless_og_video():
+    """روابط سبوت لايت اليوم بلا امتداد .mp4، والمعالج يلتقطها ثم يحوّلها
+    للرندر النظيف. وسوم og:video:type/width تشارك النمط فلا تُلتقط خطأً."""
+    page = (
+        '<meta property="og:video" content="' + _SNAP_27 + '?mo=x&amp;uc=46"/>'
+        '<meta property="og:video:type" content="video/mp4"/>'
+        '<meta property="og:video:width" content="540"/>'
+    )
+
+    class _Page:
+        def read(self, *a):
+            return page.encode('utf-8')
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _Opener:
+        addheaders = []
+
+        def open(self, *a, **k):
+            return _Page()
+
+    with patch('urllib.request.build_opener', return_value=_Opener()), \
+            patch('urllib.request.urlopen',
+                  return_value=_FakeHead(200, 'video/mp4')), \
+            patch.object(link_resolvers, 'get_cookie_file_for_url',
+                         return_value=None), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        out = resolve_snapchat_spotlight('https://www.snapchat.com/spotlight/ABC')
+    assert out == _SNAP_1034
 
 
 # ── resolve_instagram_media ─────────────────────────────────────
