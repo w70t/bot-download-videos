@@ -1227,6 +1227,96 @@ def _snap_url_variants(media_url: str):
     return out
 
 
+# ── تشخيص الملف الخام (بلا لاحقة التجهيز) ──
+# إسقاط اللاحقة ‎.<رقم>.<رمز>‎ من المسار يعطي ملفاً أكبر بأضعاف ونوعه
+# application/octet-stream — أي الأصل قبل تجهيز «مشاركة سبوت لايت» الذي يطبع
+# اللوقو ويضغط الملف. تيليجرام لا يعرضه لأنه لا يتعرّف على حاويته، فنشخّصه:
+# توقيع البايتات، والعشوائية (تكشف التشفير)، وffprobe، ثم محاولات إصلاح
+# الحاوية بلا إعادة ترميز (‎-c copy‎ فلا تفقد الجودة).
+
+# توقيعات البدايات المعروفة (الإزاحة، البايتات، الوصف)
+_SNAP_MAGICS = (
+    (4, b'ftyp', 'MP4/MOV (حاوية ISO)'),
+    (0, b'\x1a\x45\xdf\xa3', 'Matroska/WebM'),
+    (0, b'RIFF', 'AVI/RIFF'),
+    (0, b'\x00\x00\x01\xba', 'MPEG-PS'),
+    (0, b'\x00\x00\x00\x01', 'H.264/H.265 خام (Annex B)'),
+    (0, b'\x00\x00\x01', 'دفق أولي (Annex B قصير)'),
+    (0, b'#EXTM3U', 'قائمة HLS'),
+    (0, b'PK\x03\x04', 'أرشيف ZIP'),
+    (0, b'\x1f\x8b', 'مضغوط gzip'),
+    (0, b'OggS', 'Ogg'),
+    (0, b'\x47', 'MPEG-TS (ربما)'),
+)
+
+
+def _snap_identify(head: bytes):
+    """يعيد وصف نوع الملف من بايتات البداية، أو None إن كان مجهولاً."""
+    for off, sig, name in _SNAP_MAGICS:
+        if head[off:off + len(sig)] == sig:
+            return name
+    return None
+
+
+def _snap_entropy(data: bytes) -> float:
+    """عشوائية شانون (بت/بايت). القريب من 8 يعني بيانات مضغوطة أو مشفّرة،
+    والأقل بوضوح يعني بنية مقروءة."""
+    if not data:
+        return 0.0
+    import math
+    counts = [0] * 256
+    for b in data:
+        counts[b] += 1
+    n = len(data)
+    return -sum((c / n) * math.log2(c / n) for c in counts if c)
+
+
+def _snap_ffprobe(path: str) -> str:
+    """وصف مختصر لما يراه ffprobe في الملف (أو سبب رفضه)."""
+    try:
+        r = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_entries',
+             'format=format_name,duration:stream=codec_name,codec_type,width,height',
+             '-of', 'default=noprint_wrappers=1', path],
+            capture_output=True, text=True, timeout=60)
+    except Exception as e:
+        return f"تعذّر تشغيل ffprobe: {e}"
+    out = (r.stdout or '').strip()
+    return out if out else (r.stderr or '').strip()[:200] or 'بلا مخرجات'
+
+
+# محاولات إصلاح الحاوية: (وسائط الدخل، الوصف). ‎-c copy‎ = بلا إعادة ترميز
+_SNAP_REMUX_TRIES = (
+    ([], 'كشف تلقائي'),
+    (['-f', 'h264'], 'دفق H.264 خام'),
+    (['-f', 'hevc'], 'دفق H.265 خام'),
+    (['-f', 'mpegts'], 'حاوية MPEG-TS'),
+)
+
+
+def _snap_remux(src: str, dest_dir: str):
+    """يحاول لفّ الملف الخام في حاوية mp4 بلا إعادة ترميز. يعيد (المسار،
+    الوصف) لأول محاولة تنتج ملفاً فيه دفق فيديو، أو (None، سجل المحاولات)."""
+    log = []
+    for extra, label in _SNAP_REMUX_TRIES:
+        dest = os.path.join(dest_dir, f"fixed_{len(log)}.mp4")
+        try:
+            r = subprocess.run(
+                ['ffmpeg', '-y', '-loglevel', 'error', *extra, '-i', src,
+                 '-c', 'copy', '-movflags', '+faststart', dest],
+                capture_output=True, text=True, timeout=180)
+        except Exception as e:
+            log.append(f"{label}: تعذّر ({str(e)[:40]})")
+            continue
+        if r.returncode == 0 and os.path.exists(dest) and os.path.getsize(dest) > 4096:
+            if 'codec_type=video' in _snap_ffprobe(dest):
+                return dest, label
+            log.append(f"{label}: نتج ملف بلا دفق فيديو")
+        else:
+            log.append(f"{label}: {(r.stderr or '').strip()[:60] or 'فشل'}")
+    return None, ' | '.join(log)
+
+
 def _snap_probe_variant(media_url: str, timeout: int = 45):
     """يجلب صيغة واحدة ويعيد (الكود، الحجم، نوع المحتوى) بلا حفظ."""
     import urllib.request
@@ -5086,6 +5176,78 @@ async def cmd_snaptest(client, message):
     if cands:
         lines.append("للمقارنة البصرية: `/snapdual <الرابط>`")
     await status.edit_text("\n".join(lines)[:4000], disable_web_page_preview=True)
+
+
+@app.on_message(filters.command("snapraw"))
+async def cmd_snapraw(client, message):
+    """أمر أدمن: يشخّص الملف الخام (بلا لاحقة التجهيز) ويحاول إصلاح حاويته.
+
+    الاستخدام: /snapraw <رابط سناب>
+    يعرض توقيع البايتات والعشوائية وقراءة ffprobe، ثم يحاول لفّه في mp4 بلا
+    إعادة ترميز — فإن نجح أرسله لتُقارن اللوقو. الملف الخام أكبر بأضعاف من
+    نسخة المشاركة، أي أنه الأصل قبل التجهيز الذي يطبع اللوقو."""
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    parts = (message.text or '').split(maxsplit=1)
+    url = extract_first_url(parts[1] if len(parts) > 1 else '')
+    if not url or 'snapchat.com' not in url.lower() or not is_safe_url(url):
+        await message.reply_text("الاستخدام: `/snapraw <رابط سناب>`")
+        return
+    status = await message.reply_text("🔬 جارٍ تشخيص الملف الخام…")
+    loop = asyncio.get_event_loop()
+    cands, _info, err = await loop.run_in_executor(
+        None, _snapchat_page_candidates, url)
+    if err or not cands:
+        await status.edit_text(f"❌ لا وسائط: `{_snap_safe(err or 'بلا مرشّحين')}`")
+        return
+
+    raw_url = next((u for lbl, u in _snap_url_variants(cands[0][2])
+                    if lbl == 'بلا لاحقة التجهيز'), None)
+    if not raw_url:
+        await status.edit_text("❌ لا لاحقة تجهيز في هذا الرابط — لا ملف خام.")
+        return
+
+    tmp = os.path.join('videos', f"snapraw_{uuid.uuid4().hex[:8]}")
+    os.makedirs(tmp, exist_ok=True)
+    src = os.path.join(tmp, 'raw.bin')
+    try:
+        try:
+            size = await loop.run_in_executor(None, _snap_fetch_to_file, raw_url, src)
+        except Exception as e:
+            await status.edit_text(f"❌ فشل التنزيل: `{_snap_safe(str(e)[:80])}`")
+            return
+
+        with open(src, 'rb') as fh:
+            head = fh.read(64)
+            sample = head + fh.read(262144)
+        kind = _snap_identify(head) or 'مجهول'
+        entropy = _snap_entropy(sample)
+        printable = ''.join(chr(b) if 32 <= b < 127 else '·' for b in head[:32])
+        probe = await loop.run_in_executor(None, _snap_ffprobe, src)
+
+        lines = [
+            "🔬 **تشخيص الملف الخام**", "",
+            f"الحجم: {size / 1048576:.2f} م.ب",
+            f"النوع من التوقيع: **{kind}**",
+            f"أول ٣٢ بايت: `{head[:32].hex(' ')}`",
+            f"كنص: `{_snap_safe(printable)}`",
+            f"العشوائية: {entropy:.2f}/8 — " + (
+                "مشفّر أو مضغوط بإحكام" if entropy > 7.9 else "بنية مقروءة"),
+            "", "**ffprobe:**", f"`{_snap_safe(probe)[:600]}`",
+        ]
+        await status.edit_text("\n".join(lines)[:4000], disable_web_page_preview=True)
+
+        fixed, note = await loop.run_in_executor(None, _snap_remux, src, tmp)
+        if fixed:
+            await message.reply_video(
+                fixed, caption=f"✅ أُصلحت الحاوية ({note}) — "
+                               f"{os.path.getsize(fixed) / 1048576:.1f} م.ب\n"
+                               f"هل فيه لوقو؟")
+        else:
+            await message.reply_text(
+                f"❌ تعذّر إصلاح الحاوية:\n`{_snap_safe(note)[:600]}`")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 @app.on_message(filters.command("snapvariants"))
