@@ -930,6 +930,45 @@ def test_threads_short_link_falls_back_to_browser_ua():
             'https://www.threads.net/t/CuY_5aBLQnI') == '/@u/post/ABCDE'
 
 
+def test_threads_dead_share_code_is_flagged_deleted():
+    """رمز مشاركة ميت يحوّله ثريدز إلى «/?error=invalid_post».
+
+    محقَّق ميدانياً: ستة وكلاء مختلفين (تلجرام/فيسبوك/واتساب/تويتر/curl/متصفّح)
+    كلّهم يحصلون على هذا الردّ لرمز ميت، بينما رمز حيّ يتوسّع لكلّهم — فهو حكم
+    من ثريدز لا حجب. بلا هذا العلم يرى العضو «رابط غير صحيح» فيظنّ البوت
+    معطّلاً وهو سليم."""
+    with patch('urllib.request.urlopen',
+               return_value=_FakeHtml(
+                   '', final='https://www.threads.com/?error=invalid_post')):
+        status = {}
+        path = link_resolvers._threads_post_path(
+            'https://www.threads.com/share/BASA-6RWoK/', status=status)
+    assert path is None
+    assert status.get('deleted') is True
+
+
+def test_threads_lookup_propagates_deleted_flag():
+    # العلم يصل للبوت عبر meta ليعرض الرسالة الصحيحة
+    with patch('urllib.request.urlopen',
+               return_value=_FakeHtml(
+                   '', final='https://www.threads.com/?error=invalid_post')):
+        media, meta = link_resolvers.threads_mirror_lookup(
+            'https://www.threads.com/share/BASA-6RWoK/')
+    assert media is None
+    assert meta.get('deleted') is True
+
+
+def test_threads_live_code_sets_no_deleted_flag():
+    # رمز حيّ: لا علم حذف إطلاقاً
+    expanded = 'https://www.threads.com/@u/post/ABCDE'
+    with patch('urllib.request.urlopen', return_value=_FakeHtml('', final=expanded)):
+        status = {}
+        path = link_resolvers._threads_post_path(
+            'https://www.threads.com/share/XYZ12/', status=status)
+    assert path == '/@u/post/ABCDE'
+    assert 'deleted' not in status
+
+
 def test_threads_short_link_network_failure_is_safe():
     # فشل التوسيع → None بلا استثناء (يعرض البوت رسالة واضحة)
     with patch('urllib.request.urlopen', side_effect=OSError('انقطاع')):

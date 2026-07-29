@@ -819,14 +819,19 @@ _THREADS_POST_RE = re.compile(
 _THREADS_SHORT_RE = re.compile(r'/(?:t|share)/[A-Za-z0-9_-]{5,32}', re.I)
 
 
-def _threads_post_path(url: str, timeout: int = 15):
+def _threads_post_path(url: str, timeout: int = 15, status: dict = None):
     """«/@user/post/<code>» من رابط ثريدز، بعد توسيع الروابط المختصرة لأن
     المعرّف لا يظهر فيها. None لغير المنشورات.
 
     الوكيلان كلاهما ضروري ومحقَّق ميدانياً: رابط «/share/» **لا يتوسّع إطلاقاً**
     بوكيل المتصفّح (يبقى على /share/ ويُترك التحويل لجافاسكربت) بينما يعطي
     بوكيل البوت تحويلاً حقيقياً إلى /@user/post/<code>. فنجرّب البوت أولاً ثم
-    المتصفّح، ونقبل أول ردّ يظهر فيه مسار منشور."""
+    المتصفّح، ونقبل أول ردّ يظهر فيه مسار منشور.
+
+    status (اختياري): قاموس يُملأ بسبب الفشل. ثريدز يحوّل رمز المشاركة الميت
+    إلى «/?error=invalid_post» — وهو حكم صريح بأن المنشور حُذف أو صار خاصاً
+    (محقَّق: نفس الردّ لستة وكلاء مختلفين، بينما رمز حيّ يتوسّع لكلّها). بلا
+    هذا كان العضو يرى «رابط غير صحيح» فيظنّ البوت معطّلاً وهو سليم."""
     import urllib.request
     low = (url or '').lower()
     if not any(m in low for m in PLATFORM_URL_MARKERS['threads']):
@@ -844,6 +849,11 @@ def _threads_post_path(url: str, timeout: int = 15):
                 logger.info(f"🧵 وُسّع رابط ثريدز المختصر → {final[:80]}")
                 url = final
                 break
+            if 'error=invalid_post' in final:
+                if status is not None:
+                    status['deleted'] = True
+                logger.info("🚫 ثريدز: رمز مشاركة ميت (المنشور محذوف/خاص)")
+                return None
     m = _THREADS_POST_RE.search(url or '')
     return f"/{m.group(1)}/post/{m.group(2)}" if m else None
 
@@ -921,7 +931,7 @@ def threads_mirror_lookup(url: str, timeout: int = 20):
     import urllib.request
     from html import unescape
     meta = {}
-    path = _threads_post_path(url, timeout=min(timeout, 15))
+    path = _threads_post_path(url, timeout=min(timeout, 15), status=meta)
     if not path:
         return None, meta
     for host in _THREADS_PROXY_HOSTS:

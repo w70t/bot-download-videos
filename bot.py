@@ -707,6 +707,10 @@ async def _threads_video_fallback(url: str):
     loop = asyncio.get_event_loop()
     direct, meta = await loop.run_in_executor(None, threads_mirror_lookup, url)
     if not direct:
+        # ثريدز حكم صراحةً بأن رمز المشاركة ميت → رسالة واضحة بدل «رابط غير
+        # صحيح» التي تجعل العضو يظنّ البوت معطّلاً وهو سليم
+        if (meta or {}).get('deleted'):
+            _last_info_error.set('threads_deleted')
         return None
     try:
         info = await loop.run_in_executor(
@@ -2157,6 +2161,12 @@ async def process_download_from_queue(task: DownloadTask, skip_ig_highlight=Fals
                     else "Instagram post private/removed", url)
                 await status.edit_text(
                     t('story_unavailable' if _is_story else 'post_unavailable', lang))
+                return
+            # 🧵 ثريدز حكم صراحةً بأن المنشور محذوف/خاص (error=invalid_post)
+            if _last_info_error.get() == 'threads_deleted':
+                await send_error_to_admin(
+                    user_id, user_name, "Threads post deleted/private", url)
+                await status.edit_text(t('threads_deleted', lang))
                 return
             # 📖 رابط ستوري/«أبرز» فشل بلا حكم صريح (عطل مرآة، أو انتهاء لم
             #    ترفع له المرآة علماً): «رابط غير صحيح» مضلّلة — الرابط سليم
@@ -6462,6 +6472,12 @@ async def handle_url(client, message):
                     else "Instagram post private/removed", url)
                 await status.edit_text(
                     t('story_unavailable' if _is_story else 'post_unavailable', lang))
+                return
+            # 🧵 ثريدز حكم صراحةً بأن المنشور محذوف/خاص (error=invalid_post)
+            if _last_info_error.get() == 'threads_deleted':
+                await send_error_to_admin(
+                    user_id, user_name, "Threads post deleted/private", url)
+                await status.edit_text(t('threads_deleted', lang))
                 return
             # 📖 رابط ستوري/«أبرز» فشل بلا حكم صريح (عطل مرآة، أو انتهاء لم
             #    ترفع له المرآة علماً): «رابط غير صحيح» مضلّلة — الرابط سليم
