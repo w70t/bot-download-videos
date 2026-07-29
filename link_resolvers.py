@@ -808,21 +808,37 @@ _THREADS_PROXY_HOSTS = [
 _THREADS_POST_RE = re.compile(
     r'/(@[A-Za-z0-9_.]{1,40})/(?:post|video)/([A-Za-z0-9_-]{5,24})')
 
+# صيغ ثريدز المختصرة التي لا يظهر فيها معرّف المنشور فتحتاج توسيعاً:
+#   /t/<code>      — الصيغة القديمة
+#   /share/<code>  — صيغة زرّ المشاركة اليوم (threads.com)
+_THREADS_SHORT_RE = re.compile(r'/(?:t|share)/[A-Za-z0-9_-]{5,32}', re.I)
+
 
 def _threads_post_path(url: str, timeout: int = 15):
-    """«/@user/post/<code>» من رابط ثريدز، بعد توسيع الروابط المختصرة
-    (threads.net/t/<code>) لأن المعرّف لا يظهر فيها. None لغير المنشورات."""
+    """«/@user/post/<code>» من رابط ثريدز، بعد توسيع الروابط المختصرة لأن
+    المعرّف لا يظهر فيها. None لغير المنشورات.
+
+    الوكيلان كلاهما ضروري ومحقَّق ميدانياً: رابط «/share/» **لا يتوسّع إطلاقاً**
+    بوكيل المتصفّح (يبقى على /share/ ويُترك التحويل لجافاسكربت) بينما يعطي
+    بوكيل البوت تحويلاً حقيقياً إلى /@user/post/<code>. فنجرّب البوت أولاً ثم
+    المتصفّح، ونقبل أول ردّ يظهر فيه مسار منشور."""
     import urllib.request
     low = (url or '').lower()
     if not any(m in low for m in PLATFORM_URL_MARKERS['threads']):
         return None
-    if '/t/' in low:
-        try:
-            req = urllib.request.Request(url, headers={'User-Agent': _BROWSER_UA})
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                url = r.geturl() or url
-        except Exception as e:
-            logger.warning(f"⚠️ تعذّر توسيع رابط ثريدز المختصر: {e}")
+    if _THREADS_SHORT_RE.search(low):
+        for ua in (_BOT_UA, _BROWSER_UA):
+            try:
+                req = urllib.request.Request(url, headers={'User-Agent': ua})
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    final = r.geturl() or ''
+            except Exception as e:
+                logger.warning(f"⚠️ تعذّر توسيع رابط ثريدز المختصر: {e}")
+                continue
+            if _THREADS_POST_RE.search(final):
+                logger.info(f"🧵 وُسّع رابط ثريدز المختصر → {final[:80]}")
+                url = final
+                break
     m = _THREADS_POST_RE.search(url or '')
     return f"/{m.group(1)}/post/{m.group(2)}" if m else None
 

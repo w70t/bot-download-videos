@@ -890,6 +890,64 @@ def test_threads_resolver_reads_og_video():
             assert link_resolvers.resolve_threads_media(url) == _THREADS_MP4
 
 
+def test_threads_share_link_expanded_with_bot_ua():
+    """صيغة زرّ المشاركة اليوم «threads.com/share/<code>» لا تحمل معرّف المنشور.
+
+    محقَّق ميدانياً: هذه الصيغة **لا تتوسّع بوكيل المتصفّح إطلاقاً** (تبقى على
+    ‏/share/ ويُترك التحويل لجافاسكربت)، بينما تعطي بوكيل البوت تحويلاً حقيقياً.
+    وكانت الشيفرة تستعمل وكيل المتصفّح وحده وتتحقّق من «/t/» فقط — فسقط ثريدز."""
+    expanded = ('https://www.threads.com/@abdulahaj1/post/DbVHszJAZde'
+                '?xmt=AQG0WWDyCT6qVXJytVqE140non&slof=1')
+    seen = []
+
+    def _by_ua(req, *a, **k):
+        ua = req.get_header('User-agent') or ''
+        seen.append(ua)
+        # المتصفّح لا يتوسّع؛ البوت يتوسّع (كما في الواقع)
+        final = expanded if 'TelegramBot' in ua else \
+            'https://www.threads.com/share/BAVUlN0kbc/'
+        return _FakeHtml('', final=final)
+
+    with patch('urllib.request.urlopen', side_effect=_by_ua):
+        path = link_resolvers._threads_post_path(
+            'https://www.threads.com/share/BAVUlN0kbc/')
+    assert path == '/@abdulahaj1/post/DbVHszJAZde'
+    assert 'TelegramBot' in seen[0]          # البوت أولاً، فلا طلب زائد
+
+
+def test_threads_short_link_falls_back_to_browser_ua():
+    # لو لم يتوسّع بوكيل البوت، نجرّب المتصفّح قبل الاستسلام
+    expanded = 'https://www.threads.com/@u/post/ABCDE'
+
+    def _by_ua(req, *a, **k):
+        ua = req.get_header('User-agent') or ''
+        final = expanded if 'TelegramBot' not in ua else \
+            'https://www.threads.net/t/CuY_5aBLQnI'
+        return _FakeHtml('', final=final)
+
+    with patch('urllib.request.urlopen', side_effect=_by_ua):
+        assert link_resolvers._threads_post_path(
+            'https://www.threads.net/t/CuY_5aBLQnI') == '/@u/post/ABCDE'
+
+
+def test_threads_short_link_network_failure_is_safe():
+    # فشل التوسيع → None بلا استثناء (يعرض البوت رسالة واضحة)
+    with patch('urllib.request.urlopen', side_effect=OSError('انقطاع')):
+        assert link_resolvers._threads_post_path(
+            'https://www.threads.com/share/BAVUlN0kbc/') is None
+
+
+def test_threads_direct_post_needs_no_expansion():
+    # الرابط الكامل لا يستدعي الشبكة إطلاقاً
+    def _boom(*a, **k):
+        raise AssertionError('ما كان ينبغي طلب الشبكة لرابط كامل')
+
+    with patch('urllib.request.urlopen', side_effect=_boom):
+        assert link_resolvers._threads_post_path(
+            'https://www.threads.com/@user/post/DauKPbYnR6q'
+        ) == '/@user/post/DauKPbYnR6q'
+
+
 def test_threads_lookup_returns_duration_and_size():
     """بلا مدّة يتخطّى المقطع حدّ المدة المجاني (yt-dlp لا يعرف مدّة mp4 بعيد)،
     فنقرأها من معامل efg داخل الرابط ونقرأ الأبعاد من وسوم المرآة."""
