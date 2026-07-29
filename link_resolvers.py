@@ -798,9 +798,14 @@ def resolve_facebook_share(url: str, timeout: int = 20) -> str:
 # بمتغيّر البيئة THREADS_PROXY_HOSTS إن تعطّلت مرآة (بعضها يتوقّف فعلاً: عند
 # الكتابة كانت vxthreads.net وfixthreads.net تردّان 503 وvxthreads.com تعمل).
 # ═══════════════════════════════════════════════════════════════
+# مرايا ثريدز. الافتراضي vxthreads.com وحدها عن قصد: مسحٌ لـ١٣ مضيفاً بكل
+# الأنماط المعروفة (vx/fix/fx/dd/kk/ee + threads.com/.net/.org) لم يجد سواها
+# حيّاً — vxthreads.net وfixthreads.net لا تصلان، وfixthreads.com صار نطاقاً
+# معروضاً للبيع. وإبقاء الميتة في القائمة يكلّف مهلتين ضائعتين عند أي تعثّر
+# للعاملة بلا أي فائدة. أضِف بديلاً هنا فور ظهور واحد حيّ.
 _THREADS_PROXY_HOSTS = [
     h.strip() for h in os.getenv(
-        'THREADS_PROXY_HOSTS', 'vxthreads.com,vxthreads.net,fixthreads.net'
+        'THREADS_PROXY_HOSTS', 'vxthreads.com'
     ).split(',') if h.strip()
 ]
 
@@ -921,15 +926,25 @@ def threads_mirror_lookup(url: str, timeout: int = 20):
         return None, meta
     for host in _THREADS_PROXY_HOSTS:
         proxy_url = f"https://{host}{path}"
-        try:
-            req = urllib.request.Request(proxy_url, headers={
-                'User-Agent': _BOT_UA,   # المرايا تعطي وسوم المعاينة للبوتات
-                'Accept': 'text/html,*/*',
-            })
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                page = resp.read(2_000_000).decode('utf-8', 'ignore')
-        except Exception as e:
-            logger.warning(f"⚠️ تعذّر حل ثريدز عبر {host} ({path}): {e}")
+        # إعادة محاولة على أعطال الشبكة وحدها: مرايا ثريدز تردّ 504 عابراً تحت
+        # الضغط. والأهمّ أن ثريدز اليوم بلا بديل حقيقي — مسحُ كل الأنماط
+        # المعروفة (١٣ مضيفاً) لم يجد سوى vxthreads.com حيّاً، وصفحة ثريدز
+        # نفسها لا تعطي وسائط لأي وكيل، والمرآة الإنستغرامية تحيل لجدار الدخول.
+        # فالصلابة على المرآة العاملة أنفع من مضيف ميت في القائمة.
+        page = None
+        for attempt in (1, 2):
+            try:
+                req = urllib.request.Request(proxy_url, headers={
+                    'User-Agent': _BOT_UA,   # المرايا تعطي وسوم المعاينة للبوتات
+                    'Accept': 'text/html,*/*',
+                })
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    page = resp.read(2_000_000).decode('utf-8', 'ignore')
+                break
+            except Exception as e:
+                logger.warning(f"⚠️ تعذّر حل ثريدز عبر {host} ({path}) "
+                               f"محاولة {attempt}: {e}")
+        if page is None:
             continue
         for pat in (r'property=["\']og:video(?::secure_url)?["\'][^>]*?content=["\']([^"\']+)["\']',
                     r'content=["\']([^"\']+)["\'][^>]*?property=["\']og:video'):

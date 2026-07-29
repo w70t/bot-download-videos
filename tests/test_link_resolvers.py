@@ -948,6 +948,34 @@ def test_threads_direct_post_needs_no_expansion():
         ) == '/@user/post/DauKPbYnR6q'
 
 
+def test_threads_lookup_retries_transient_failure():
+    """ثريدز بلا بديل حقيقي (١٣ مضيفاً مُسحت، وحدها vxthreads.com حيّة)،
+    فالتعثّر العابر على المرآة العاملة كان يعني فشل التحميل كلّه."""
+    page = f'<meta property="og:video" content="{_THREADS_MP4}"/>'
+    seq = [OSError('504 Gateway Timeout'), _FakeHtml(page)]
+
+    def _flaky(*a, **k):
+        item = seq.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    with patch('urllib.request.urlopen', side_effect=_flaky), \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        media, _meta = link_resolvers.threads_mirror_lookup(
+            'https://www.threads.com/@user/post/DauKPbYnR6q')
+    assert media == _THREADS_MP4
+    assert not seq
+
+
+def test_threads_default_mirror_list_has_no_dead_hosts():
+    # النطاقات الميتة تكلّف مهلة ضائعة عند كل تعثّر بلا أي فائدة
+    hosts = link_resolvers._THREADS_PROXY_HOSTS
+    assert 'vxthreads.com' in hosts
+    for dead in ('vxthreads.net', 'fixthreads.net', 'fixthreads.com'):
+        assert dead not in hosts
+
+
 def test_threads_lookup_returns_duration_and_size():
     """بلا مدّة يتخطّى المقطع حدّ المدة المجاني (yt-dlp لا يعرف مدّة mp4 بعيد)،
     فنقرأها من معامل efg داخل الرابط ونقرأ الأبعاد من وسوم المرآة."""
@@ -1036,14 +1064,17 @@ def test_threads_resolver_none_for_photo_post():
 
 
 def test_threads_resolver_tries_next_mirror_on_failure():
-    """أول مرآة معطّلة (503 وقت الكتابة) → نجرّب التالية بدل الاستسلام."""
+    """مرآة ساقطة تماماً → نعيد المحاولة عليها مرّة ثم ننتقل للتالية.
+
+    الخاصيّتان معاً مقصودتان: الإعادة تنقذ التعثّر العابر (504) على المرآة
+    الوحيدة الحيّة، والانتقال ينقذ السقوط الكامل."""
     page = f'<meta property="og:video" content="{_THREADS_MP4}"/>'
     calls = []
 
     def fake(req, *a, **k):
         url = req if isinstance(req, str) else req.full_url
         calls.append(url)
-        if len(calls) == 1:
+        if 'down.example' in url:
             raise OSError('503')
         return _FakeHtml(page)
 
@@ -1054,7 +1085,8 @@ def test_threads_resolver_tries_next_mirror_on_failure():
         out = link_resolvers.resolve_threads_media(
             'https://www.threads.com/@user/post/DauKPbYnR6q')
     assert out == _THREADS_MP4
-    assert len(calls) == 2 and 'up.example' in calls[1]
+    assert [c for c in calls if 'down.example' in c].__len__() == 2  # أُعيدت مرّة
+    assert 'up.example' in calls[-1]                                 # ثم انتُقل
 
 
 def test_threads_resolver_handles_all_mirrors_down():
