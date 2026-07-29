@@ -882,6 +882,14 @@ async def _substack_video_fallback(url: str):
 TIKTOK_SOURCE_ANALYSIS = os.getenv(
     'TIKTOK_SOURCE_ANALYSIS', '1').strip().lower() not in ('0', 'false', 'no', 'off')
 
+# مهلتا تحليل مصدر تيك توك: لكل طلب، وسقف كلّي للمراحل الأربع مجتمعةً. السقف
+# الكلّي هو ما يحمي إعادة الإرسال من الكاش (المفترَض أن تكون فورية) من تباطؤ
+# تيك توك. عند تجاوزه تُرسَل الوسائط بلا سطري المصدر بدل أن ينتظر العضو.
+TIKTOK_ANALYSIS_REQUEST_TIMEOUT = int(
+    os.getenv('TIKTOK_ANALYSIS_REQUEST_TIMEOUT', '8'))
+TIKTOK_ANALYSIS_TOTAL_TIMEOUT = int(
+    os.getenv('TIKTOK_ANALYSIS_TOTAL_TIMEOUT', '12'))
+
 SNAPCHAT_MEDIA_SERVICE = os.getenv(
     'SNAPCHAT_MEDIA_SERVICE', 'https://ms.sc-jpl.com/web/getStoryElements')
 
@@ -2560,6 +2568,36 @@ async def _send_reminder_batch(client, progress_msg, targets):
     return sent_n, fail_n, removed_n
 
 
+async def _tiktok_source_lines(url):
+    """سطرا مصدر مقطع تيك توك (بلد النشر وتاريخ إنشاء الحساب) جاهزَين للوصف.
+
+    مصدر واحد لكل المسارات — بما فيها إعادة الإرسال من الكاش. الكاش يحفظ الملف
+    لا التحليل، فكان المقطع المُعاد منه يظهر بلا السطرين بينما يظهران في أول
+    تحميل لنفس الرابط؛ إعادة الحساب هنا (طلبان خفيفان، والتحميل موفَّر أصلاً)
+    توحّد المظهر وتُبقي البيانات حديثة. يعيد [] لغير تيك توك أو عند أي فشل،
+    فلا يمنع إرسال الوسائط أبداً.
+
+    محدود بمهلة كلّية: التحليل أربع مراحل، ومهلة كل طلب وحدها قد تبلغ ٢٠ث،
+    فلو تباطأ تيك توك لتجمّدت إعادة الإرسال من الكاش دقيقةً ونصفاً وهي التي
+    يُفترض أن تكون فورية. عند تجاوز المهلة نُرسل بلا السطرين."""
+    if not (TIKTOK_SOURCE_ANALYSIS and _platform_of(url) == 'tiktok'):
+        return []
+    try:
+        analysis = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(
+                None, lambda: tiktok_source_analysis(
+                    url, timeout=TIKTOK_ANALYSIS_REQUEST_TIMEOUT)),
+            timeout=TIKTOK_ANALYSIS_TOTAL_TIMEOUT)
+        return _build_source_lines({'_source_analysis': analysis})
+    except asyncio.TimeoutError:
+        logger.info(f"⏱️ تجاوز تحليل مصدر تيك توك المهلة "
+                    f"({TIKTOK_ANALYSIS_TOTAL_TIMEOUT}ث) — يُرسَل بلا سطري المصدر")
+        return []
+    except Exception as e:
+        logger.info(f"ℹ️ تعذّر تحليل مصدر تيك توك ({_url_host(url)}): {e}")
+        return []
+
+
 async def _try_send_from_cache(client, message, status_msg, ckey, quality,
                                user_id, user_name, user_username, url, lang):
     """يحاول إعادة إرسال الوسائط من الكاش بلا تحميل. يرجع True إن نجح ذلك."""
@@ -2575,7 +2613,8 @@ async def _try_send_from_cache(client, message, status_msg, ckey, quality,
     fsize = cached.get('file_size_mb') or 0.0
     cdur = cached.get('duration')
     caption = _build_media_caption(title, fsize, cdur, user_name,
-                                   bot_username=await _get_bot_username(client))
+                                   bot_username=await _get_bot_username(client),
+                                   source_lines=await _tiktok_source_lines(url))
 
     try:
         if cached['kind'] == 'audio':
@@ -2688,10 +2727,12 @@ async def _try_send_images_from_cache(client, message, status_msg, ckey,
 
     title = cached.get('title') or 'صور'
     bot_username = await _get_bot_username(client)
-    # source فارغ هنا: التحليل لقطة وقت التحميل ولا يُحفظ في الكاش، فلا نعرض
-    # بيانات قديمة عند إعادة الإرسال. (تركه غير ممرَّر يجعل t تُرجع القالب خاماً)
+    # التحليل لا يُحفظ في الكاش (لقطة وقت التحميل)، فنعيد حسابه هنا كي لا يظهر
+    # الألبوم المُعاد بلا سطري المصدر. (تركه غير ممرَّر يجعل t تُرجع القالب خاماً)
+    _src = await _tiktok_source_lines(url)
     caption = t('images_caption', lang, title=title, count=len(file_ids),
-                user=user_name, source='',
+                user=user_name,
+                source=''.join(f"\n{ln}" for ln in _src),
                 promo=(f"\n\n📥 @{bot_username}" if bot_username else ""))
 
     try:
@@ -2857,14 +2898,7 @@ async def download_and_send_images(client, message, url, status_msg,
         # 🔎 تحليل مصدر ألبوم تيك توك: مسار الصور منفصل عن مسار الفيديو، فلولا
         #    هذا لظهرت الألبومات بلا تحليل. (منشور الصور مساره /photo/ لا
         #    /video/، وقد رُوعي ذلك في نمط استخراج المعرّف)
-        _src = []
-        if TIKTOK_SOURCE_ANALYSIS and _platform_of(url) == 'tiktok':
-            try:
-                _a = await asyncio.get_event_loop().run_in_executor(
-                    None, tiktok_source_analysis, url)
-                _src = _build_source_lines({'_source_analysis': _a})
-            except Exception as _e:
-                logger.info(f"ℹ️ تعذّر تحليل مصدر ألبوم تيك توك: {_e}")
+        _src = await _tiktok_source_lines(url)
         caption = t('images_caption', lang,
                     title=title, count=len(files), user=user_name,
                     source=(''.join(f"\n{ln}" for ln in _src)),
@@ -3904,12 +3938,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         # إنستغرام عبر المرآة)، مع إزالة ` حتى لا يكسر تنسيق النسخ وحد آمن للوصف
         # 🔎 تحليل مصدر مقطع تيك توك (بيانات عامة) لعرضه مع الفيديو. طلب شبكي
         #    متزامن يُنفَّذ خارج حلقة الأحداث، وأي فشل فيه لا يمسّ التحميل.
-        if TIKTOK_SOURCE_ANALYSIS and _platform_of(url) == 'tiktok':
-            try:
-                info['_source_analysis'] = await loop.run_in_executor(
-                    None, tiktok_source_analysis, url)
-            except Exception as _e:
-                logger.info(f"ℹ️ تعذّر تحليل مصدر تيك توك: {_e}")
+        _source_lines = await _tiktok_source_lines(url)
 
         # بيانات ثريدز من المرآة: yt-dlp لا يعرف عنوان/مدّة/أبعاد ملف mp4 بعيد،
         # فنكمل الناقص فقط ونستبدل العنوان بنصّ المنشور بدل معرّف الملف
@@ -3947,7 +3976,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             title, file_size_mb, duration, user_name,
             bot_username=await _get_bot_username(client),
             stats=_threads_meta.get('stats'),
-            source_lines=_build_source_lines(info)
+            source_lines=_source_lines
         )
         
         if is_audio:
