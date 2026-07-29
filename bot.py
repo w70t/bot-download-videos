@@ -5927,6 +5927,105 @@ async def handle_backup_restore(client, message):
                 pass
 
 
+# ═══════════════════════════════════════════════════════════════
+# مراقبة المرايا
+# المشروع كلّه يقف على مرايا طرف ثالث، وهي تموت فعلاً وبلا إنذار: عند كتابة
+# هذا كانت vxthreads.net وfixthreads.net تردّان 503، وddinstagram 403، وcobalt
+# أُغلقت نهائياً. و/health يفحصها لكنه يدوي — فالعطل لا يُكتشف إلا بشكوى عضو.
+# هذه المهمة تفحصها دورياً وتراسل الأدمن **عند تغيّر الحالة فقط** (سقوط أو
+# تعافٍ)، فلا تصل رسائل متكرّرة عن عطل معروف.
+# ═══════════════════════════════════════════════════════════════
+_MIRROR_WATCH_DEFAULT = os.getenv('MIRROR_WATCH_HOURS', '1')
+
+# {المضيف: هل كان يعمل في آخر فحص} — الحالة السابقة للمقارنة
+_mirror_last_state = {}
+
+
+def _mirror_watch_hours() -> float:
+    """كل كم ساعة تُفحص المرايا (0 = تعطيل). يُدار من لوحة الأدمن ويسري في
+    الدورة التالية بلا إعادة تشغيل؛ القيمة هنا هي الافتراضي."""
+    try:
+        val = float(subdb.get_setting('mirror_watch_hours',
+                                      _MIRROR_WATCH_DEFAULT))
+    except Exception:
+        return 1.0
+    return val if 0 <= val <= 168 else 1.0
+
+
+def _check_all_mirrors():
+    """يفحص كل المرايا ويعيد {المضيف: (المنصة، يعمل؟، السبب)}.
+    طلبات شبكية متزامنة — تُنفَّذ داخل executor."""
+    out = {}
+    for platform, host in all_mirror_hosts():
+        ok, detail = _health_check_host(host)
+        out[host] = (platform, ok, detail)
+    return out
+
+
+def _mirror_state_changes(current):
+    """يقارن الفحص الحالي بالسابق ويعيد (سقطت، تعافت) — قوائم (مضيف، منصة).
+
+    مضيف مجهول (أول فحص بعد الإقلاع، أو مضيف أُضيف للتوّ) يُبلَّغ عنه إن كان
+    ساقطاً فقط — فالإقلاع بمرايا سليمة لا يرسل شيئاً، والمرآة الساقطة تستحق
+    الإبلاغ سواء كانت موجودة من قبل أم أُضيفت الآن."""
+    down, up = [], []
+    for host, (platform, ok, _detail) in current.items():
+        was = _mirror_last_state.get(host)
+        if was is None:
+            if not ok:
+                down.append((host, platform))
+        elif was and not ok:
+            down.append((host, platform))
+        elif not was and ok:
+            up.append((host, platform))
+        _mirror_last_state[host] = ok
+    # مضيف اختفى من الإعدادات لا يبقى في الذاكرة
+    for host in [h for h in _mirror_last_state if h not in current]:
+        _mirror_last_state.pop(host, None)
+    return down, up
+
+
+async def _mirror_watch_loop(client):
+    """مهمة خلفية: تفحص المرايا دورياً وتنبّه الأدمن عند تغيّر الحالة فقط."""
+    admin_id = os.getenv('ADMIN_ID')
+    if not admin_id:
+        return
+    loop = asyncio.get_event_loop()
+    # تأخير أوّلي: لا نزاحم الإقلاع بطلبات شبكية
+    await asyncio.sleep(60)
+    while True:
+        hours = _mirror_watch_hours()
+        if hours <= 0:
+            # معطّلة من اللوحة — ننام ساعة ثم نعيد السؤال (فالتفعيل يسري بلا
+            # إعادة تشغيل)، وننسى الحالة كي لا نُنبّه عن تغيّر فات أثناء التعطيل
+            _mirror_last_state.clear()
+            await asyncio.sleep(3600)
+            continue
+        try:
+            current = await loop.run_in_executor(None, _check_all_mirrors)
+            down, up = _mirror_state_changes(current)
+            if down or up:
+                lines = ["🌐 **تغيّر حالة المرايا**", ""]
+                for host, platform in down:
+                    lines.append(f"❌ **{host}** ({platform}) — لا يصل")
+                for host, platform in up:
+                    lines.append(f"✅ **{host}** ({platform}) — عاد يعمل")
+                alive = sum(1 for _p, ok, _d in current.values() if ok)
+                lines.append("")
+                lines.append(f"الوضع الآن: {alive}/{len(current)} تعمل")
+                if down:
+                    lines.append("")
+                    lines.append("_غيّر المضيف من متغيّرات البيئة "
+                                 "(‎*_PROXY_HOSTS) إن طال العطل._")
+                await client.send_message(int(admin_id), "\n".join(lines))
+                logger.info(f"🌐 تنبيه المرايا: {len(down)} سقطت، {len(up)} عادت")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"❌ خطأ في مراقبة المرايا: {e}")
+        await asyncio.sleep(max(hours * 3600, 300))
+
+
 async def _auto_backup_loop(client):
     """مهمة خلفية: ترفع نسخة احتياطية لقناة النسخ تلقائياً كل فترة."""
     interval_hours = int(os.getenv("AUTO_BACKUP_HOURS", "12"))
@@ -7352,6 +7451,10 @@ async def subscription_settings_panel(client, message, user_id=None, edit=False)
                               callback_data="sub_snapchat")],
         [InlineKeyboardButton(f"📚 حد عناصر «الأبرز»: {_ig_highlight_max()}",
                               callback_data="sub_ighl_max")],
+        [InlineKeyboardButton(
+            "🌐 مراقبة المرايا: " + (f"كل {_mirror_watch_hours():g}س"
+                                    if _mirror_watch_hours() > 0 else "❌ متوقفة"),
+            callback_data="sub_mirrorwatch")],
         [InlineKeyboardButton("⭐ قائمة الاستثناء", callback_data="sub_exempt")],
     ])
 
@@ -7636,6 +7739,25 @@ async def handle_subscription_settings(client, callback_query):
     if action == 'snapchat':
         text, kb = _snap_settings_view()
         await callback_query.message.edit_text(text, reply_markup=kb)
+        await callback_query.answer()
+        return
+
+    if action == 'mirrorwatch':
+        _h = _mirror_watch_hours()
+        _alive = sum(1 for ok in _mirror_last_state.values() if ok)
+        _total = len(_mirror_last_state)
+        await callback_query.message.edit_text(
+            "🌐 **مراقبة المرايا**\n\n"
+            f"الحالي: **{f'كل {_h:g} ساعة' if _h > 0 else 'متوقفة'}**\n"
+            + (f"آخر فحص: {_alive}/{_total} تعمل\n" if _total else "")
+            + "\nالبوت يقف على مرايا طرف ثالث، وهي تموت بلا إنذار. "
+            "المراقبة تفحصها دورياً وتراسلك **عند تغيّر الحالة فقط** — "
+            "سقوط مرآة أو تعافيها — فلا تصلك رسائل مكرّرة عن عطل معروف.\n\n"
+            "أرسل عدد الساعات (مثلاً `1` أو `6`)، أو `0` للتعطيل:",
+            reply_markup=_sub_settings_back_kb()
+        )
+        pending_downloads[callback_query.from_user.id] = {
+            'waiting_for': 'mirror_watch_hours'}
         await callback_query.answer()
         return
 
@@ -8801,6 +8923,24 @@ async def handle_admin_input(client, message):
             )
             del pending_downloads[user_id]
 
+        elif waiting_for == 'mirror_watch_hours':
+            try:
+                hours = float(message.text.strip())
+            except ValueError:
+                await message.reply_text("❌ أرسل رقماً (مثلاً 1 أو 6، أو 0 للتعطيل).")
+                return
+            if not 0 <= hours <= 168:
+                await message.reply_text("❌ الرقم يجب أن يكون بين 0 و168 ساعة.")
+                return
+            subdb.set_setting('mirror_watch_hours', str(hours))
+            await message.reply_text(
+                "✅ **تم إيقاف مراقبة المرايا.**" if hours == 0 else
+                f"✅ **تم ضبط مراقبة المرايا**\n\n"
+                f"الفحص كل **{hours:g}** ساعة — يسري من الدورة التالية.\n"
+                f"تصلك رسالة عند سقوط مرآة أو تعافيها فقط."
+            )
+            del pending_downloads[user_id]
+
         elif waiting_for == 'ig_highlight_max':
             try:
                 n = int(message.text.strip())
@@ -9557,6 +9697,7 @@ def main():
     loop.create_task(daily_report_task())
     loop.create_task(daily_cleanup_task())
     loop.create_task(_auto_backup_loop(app))  # نسخ احتياطي تلقائي لقناة النسخ
+    loop.create_task(_mirror_watch_loop(app))  # تنبيه الأدمن عند سقوط مرآة
     loop.create_task(_register_bot_commands(app))  # قائمة أوامر / في تلجرام
     
     try:
