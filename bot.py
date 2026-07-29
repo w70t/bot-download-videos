@@ -3989,6 +3989,35 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                            progress_bar='▱▱▱▱▱▱▱▱▱▱')
         await status_msg.edit_text(initial_progress)
         
+        # 🔒 حدّ المدة المجاني — الحارس الثاني (بعد التحميل، قبل الرفع)
+        #    الفحص قبل التحميل شرطه «duration and duration > الحد»، فالمدّة
+        #    المجهولة تمرّ بلا حدّ إطلاقاً. وهي مجهولة في **كل** مسارات المرايا
+        #    (إنستغرام · ثريدز · تيك توك · تويتر · بينتريست · Substack) لأن
+        #    yt-dlp لا يعرف مدّة ملف mp4 بعيد قبل تحميله — فكان أي عضو مجاني
+        #    ينزّل ما شاء طوله عبر رابط مرآة.
+        #    نقيسها الآن من الملف نفسه (ffprobe محلي، بلا أي طلب شبكي) ونطبّق
+        #    الحدّ قبل الرفع. لا يمسّ هذا ترتيب المرايا ولا أولويتها إطلاقاً —
+        #    التحميل يتمّ كما هو، والفحص على الملف الناتج وحده.
+        if not duration:
+            try:
+                _p = await loop.run_in_executor(
+                    None, lambda: probe_video(file_path))
+                if _p and _p[4]:
+                    duration = _p[4]
+                    logger.info(f"⏱️ مدّة مجهولة من المصدر — قيست من الملف: "
+                                f"{int(duration)}ث")
+            except Exception as _e:
+                logger.info(f"ℹ️ تعذّر قياس مدّة الملف: {_e}")
+        if (duration and not subdb.is_user_subscribed(user_id)
+                and not is_admin(user_id)):
+            _max_min = _user_max_duration_minutes(user_id)
+            if duration > _max_min * 60:
+                logger.info(f"⛔ تجاوز حدّ المدة بعد التحميل "
+                            f"({int(duration)}ث > {_max_min * 60}ث) — لم يُرفع")
+                await show_subscription_screen(
+                    client, status_msg, user_id, title, duration, _max_min)
+                return   # المجلد المؤقت يُحذف في finally
+
         # الوصف الموحّد: العنوان قابل للنسخ + يوزر البوت (يبقى مع الفيديو)
         caption = _build_media_caption(
             title, file_size_mb, duration, user_name,
