@@ -2568,6 +2568,15 @@ async def _send_reminder_batch(client, progress_msg, targets):
     return sent_n, fail_n, removed_n
 
 
+# ذاكرة نتائج تحليل تيك توك. بلد نشر المقطع وتاريخ إنشاء الحساب **حقائق ثابتة**
+# لا تتغيّر أبداً بعد النشر، فحفظ السطرين بمفتاح الرابط يجعل كل إرسال تالٍ لنفس
+# المقطع فورياً بلا أي طلب شبكي — وهو ما يُلغي تكلفة الثانيتين على الإرسال من
+# الكاش (وهو بالضبط الحالة التي تتكرّر فيها الروابط). الفشل لا يُخزَّن كي
+# يُعاد لاحقاً بدل إخفاء السطرين إلى الأبد.
+_TIKTOK_SOURCE_CACHE = {}
+_TIKTOK_SOURCE_CACHE_MAX = 500
+
+
 async def _tiktok_source_lines(url):
     """سطرا مصدر مقطع تيك توك (بلد النشر وتاريخ إنشاء الحساب) جاهزَين للوصف.
 
@@ -2582,13 +2591,17 @@ async def _tiktok_source_lines(url):
     يُفترض أن تكون فورية. عند تجاوز المهلة نُرسل بلا السطرين."""
     if not (TIKTOK_SOURCE_ANALYSIS and _platform_of(url) == 'tiktok'):
         return []
+    key = cache_key_for_url(url)
+    cached_lines = _TIKTOK_SOURCE_CACHE.get(key)
+    if cached_lines is not None:
+        return list(cached_lines)
     try:
         analysis = await asyncio.wait_for(
             asyncio.get_event_loop().run_in_executor(
                 None, lambda: tiktok_source_analysis(
                     url, timeout=TIKTOK_ANALYSIS_REQUEST_TIMEOUT)),
             timeout=TIKTOK_ANALYSIS_TOTAL_TIMEOUT)
-        return _build_source_lines({'_source_analysis': analysis})
+        lines = _build_source_lines({'_source_analysis': analysis})
     except asyncio.TimeoutError:
         logger.info(f"⏱️ تجاوز تحليل مصدر تيك توك المهلة "
                     f"({TIKTOK_ANALYSIS_TOTAL_TIMEOUT}ث) — يُرسَل بلا سطري المصدر")
@@ -2596,6 +2609,11 @@ async def _tiktok_source_lines(url):
     except Exception as e:
         logger.info(f"ℹ️ تعذّر تحليل مصدر تيك توك ({_url_host(url)}): {e}")
         return []
+    if lines:
+        if len(_TIKTOK_SOURCE_CACHE) >= _TIKTOK_SOURCE_CACHE_MAX:
+            _TIKTOK_SOURCE_CACHE.pop(next(iter(_TIKTOK_SOURCE_CACHE)), None)
+        _TIKTOK_SOURCE_CACHE[key] = list(lines)
+    return lines
 
 
 async def _try_send_from_cache(client, message, status_msg, ckey, quality,
