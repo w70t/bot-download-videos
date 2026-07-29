@@ -1,9 +1,97 @@
 # -*- coding: utf-8 -*-
 """اختبارات أدوات الروابط (url_utils)."""
 
+from unittest.mock import patch
+
+import url_utils
 from url_utils import (
     is_safe_url, cache_key_for_url, extract_first_url, _platform_of, _url_host,
+    clear_host_cache,
 )
+
+
+class TestHostCache:
+    """ذاكرة فحص المضيف: getaddrinfo حاجب (قيس ٢٠–٢١٥ م.ث) ويُستدعى داخل
+    حلقة الأحداث لكل رسالة — فالذاكرة تُلغي التكرار دون إضعاف الحماية."""
+
+    def setup_method(self):
+        clear_host_cache()
+
+    def teardown_method(self):
+        clear_host_cache()
+
+    def test_resolution_happens_once_per_host(self):
+        calls = []
+
+        def _fake(host, _port):
+            calls.append(host)
+            return [(2, 1, 6, '', ('93.184.216.34', 0))]
+
+        with patch.object(url_utils.socket, 'getaddrinfo', side_effect=_fake):
+            for _ in range(25):
+                assert is_safe_url('https://example.com/a')
+        assert len(calls) == 1        # ٢٤ رحلة DNS أُلغيت
+
+    def test_private_verdict_also_cached(self):
+        calls = []
+
+        def _fake(host, _port):
+            calls.append(host)
+            return [(2, 1, 6, '', ('10.0.0.5', 0))]
+
+        with patch.object(url_utils.socket, 'getaddrinfo', side_effect=_fake):
+            assert not is_safe_url('https://internal.example/a')
+            assert not is_safe_url('https://internal.example/b')
+        assert len(calls) == 1
+
+    def test_cache_is_per_host(self):
+        def _fake(host, _port):
+            ip = '10.0.0.5' if host == 'bad.example' else '93.184.216.34'
+            return [(2, 1, 6, '', (ip, 0))]
+
+        with patch.object(url_utils.socket, 'getaddrinfo', side_effect=_fake):
+            assert is_safe_url('https://good.example/a')
+            assert not is_safe_url('https://bad.example/a')
+            assert is_safe_url('https://good.example/b')
+
+    def test_local_names_never_reach_dns(self):
+        # الأسماء المحلية تُرفض بلا أي طلب — قبل الذاكرة وقبل الشبكة
+        def _boom(*a):
+            raise AssertionError('ما كان ينبغي حلّ هذا المضيف')
+
+        with patch.object(url_utils.socket, 'getaddrinfo', side_effect=_boom):
+            assert not is_safe_url('http://localhost/x')
+            assert not is_safe_url('http://db.internal/x')
+            assert not is_safe_url('http://x.local/x')
+
+    def test_expired_entry_is_re_resolved(self):
+        calls = []
+
+        def _fake(host, _port):
+            calls.append(host)
+            return [(2, 1, 6, '', ('93.184.216.34', 0))]
+
+        with patch.object(url_utils.socket, 'getaddrinfo', side_effect=_fake):
+            is_safe_url('https://example.com/a')
+            with patch.object(url_utils, '_HOST_TTL', -1):
+                is_safe_url('https://example.com/a')
+        assert len(calls) == 2
+
+    def test_cache_is_bounded(self):
+        def _fake(host, _port):
+            return [(2, 1, 6, '', ('93.184.216.34', 0))]
+
+        with patch.object(url_utils.socket, 'getaddrinfo', side_effect=_fake), \
+                patch.object(url_utils, '_HOST_CACHE_MAX', 8):
+            for i in range(40):
+                is_safe_url(f'https://h{i}.example/a')
+        assert len(url_utils._host_cache) <= 8
+
+    def test_unresolvable_host_stays_unsafe(self):
+        with patch.object(url_utils.socket, 'getaddrinfo',
+                          side_effect=OSError('لا يُحلّ')):
+            assert not is_safe_url('https://nope.invalid/a')
+            assert not is_safe_url('https://nope.invalid/a')
 
 
 class TestIsSafeUrl:

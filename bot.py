@@ -5866,6 +5866,10 @@ async def handle_backup_restore(client, message):
         loop = asyncio.get_event_loop()
         if is_sql:
             ok, result = await loop.run_in_executor(None, lambda: pg_backup.restore_from_sql(path))
+            # الاستعادة تكتب في الجداول مباشرةً (لا عبر set_setting)، فذاكرة
+            # الإعدادات واللغات تصير قديمة — نفرغها فور نجاحها
+            if ok:
+                subdb.clear_caches()
             if ok:
                 await status.edit_text(
                     "✅ **تم استيراد ملف SQL.**\n"
@@ -5878,6 +5882,7 @@ async def handle_backup_restore(client, message):
         else:
             ok, result = await loop.run_in_executor(None, lambda: pg_backup.restore_from_json(path))
             if ok:
+                subdb.clear_caches()   # نفس السبب: كتابة مباشرة تتجاوز الضابطات
                 summary = "\n".join(f"• {tbl}: {cnt} صف" for tbl, cnt in result.items()) or "—"
                 await status.edit_text(f"✅ **تمت الاستعادة بنجاح:**\n{summary}")
             else:

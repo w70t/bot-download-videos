@@ -6,9 +6,12 @@
 من النصوص، وتحديد المنصة. لا تعتمد على قاعدة البيانات أو عميل تيليجرام.
 """
 
+import os
 import re
 import socket
 import ipaddress
+import threading
+import time
 from urllib.parse import urlparse, parse_qsl, urlencode
 
 # ربط أجزاء الرابط بالمنصة المناسبة لاختيار ملف الـ cookies الصحيح
@@ -30,17 +33,30 @@ PLATFORM_URL_MARKERS = {
 }
 
 
-def _is_private_host(host: str) -> bool:
-    """هل المضيف عنوان داخلي/خاص/loopback أو غير قابل للحل؟ (حماية SSRF)
-    يرجع True لمنع التحميل (أي العنوان غير آمن)."""
-    if not host:
-        return True
-    host = host.strip().strip('[]').lower()
-    # احجب أسماء المضيف المحلية الواضحة
-    if host in ('localhost', 'localhost.localdomain') or host.endswith('.local') \
-            or host.endswith('.internal'):
-        return True
-    # حل اسم المضيف إلى عناوين IP وافحص كل عنوان
+# ═══════════════════════════════════════════════════════════════
+# ذاكرة نتيجة فحص المضيف (حماية SSRF)
+# ‏socket.getaddrinfo استدعاء حاجب، وقياسه ميدانياً ٢٠–٢١٥ م.ث للطلب الواحد،
+# والمتكرّر يكلّف مثل الأول تماماً (لا تخزين في النظام). وهو يُستدعى داخل حلقة
+# الأحداث لكل رسالة، فيُجمّد البوت لكل الأعضاء قبل أن يبدأ أي عمل. المضيفات
+# قليلة ومتكرّرة (تيك توك، إنستغرام، المرايا…) فتخزين الحكم يُلغي التكلفة.
+#
+# المهلة قصيرة عمداً: حكم «آمن» مخزَّن يوسّع نافذة إعادة ربط DNS نظرياً، فنبقيها
+# دقائق معدودة. والحكم «غير آمن» يُخزَّن أيضاً (تخزينه لا يضعف الحماية).
+# ═══════════════════════════════════════════════════════════════
+_HOST_TTL = int(os.getenv('URL_HOST_CACHE_TTL', '300'))
+_HOST_CACHE_MAX = int(os.getenv('URL_HOST_CACHE_MAX', '512'))
+_host_cache = {}
+_host_lock = threading.Lock()
+
+
+def clear_host_cache():
+    """يفرغ ذاكرة فحص المضيفات (للاختبارات أو بعد تغيّر الشبكة)."""
+    with _host_lock:
+        _host_cache.clear()
+
+
+def _resolve_is_private(host: str) -> bool:
+    """الفحص الفعلي بلا ذاكرة: يحلّ المضيف ويفحص كل عناوينه."""
     try:
         infos = socket.getaddrinfo(host, None)
     except Exception:
@@ -56,6 +72,34 @@ def _is_private_host(host: str) -> bool:
                 or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
             return True
     return False
+
+
+def _is_private_host(host: str) -> bool:
+    """هل المضيف عنوان داخلي/خاص/loopback أو غير قابل للحل؟ (حماية SSRF)
+    يرجع True لمنع التحميل (أي العنوان غير آمن).
+
+    النتيجة مخزَّنة بمهلة قصيرة — انظر تعليق الذاكرة أعلاه."""
+    if not host:
+        return True
+    host = host.strip().strip('[]').lower()
+    # احجب أسماء المضيف المحلية الواضحة (بلا أي طلب شبكي ولا تخزين)
+    if host in ('localhost', 'localhost.localdomain') or host.endswith('.local') \
+            or host.endswith('.internal'):
+        return True
+
+    now = time.monotonic()
+    with _host_lock:
+        hit = _host_cache.get(host)
+        if hit is not None and now - hit[1] < _HOST_TTL:
+            return hit[0]
+
+    verdict = _resolve_is_private(host)   # خارج القفل: لا نحجب بقيّة الخيوط
+
+    with _host_lock:
+        if len(_host_cache) >= _HOST_CACHE_MAX:
+            _host_cache.pop(next(iter(_host_cache)), None)
+        _host_cache[host] = (verdict, now)
+    return verdict
 
 
 def is_safe_url(url: str) -> bool:

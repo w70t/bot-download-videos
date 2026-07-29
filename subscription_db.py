@@ -11,6 +11,8 @@ from datetime import datetime, timedelta
 from contextlib import contextmanager
 import logging
 import os
+import threading
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -181,6 +183,8 @@ def delete_user(user_id: int):
         # حتى لا تبقى إحصائيات الجنس منتفخة بأعضاء غادروا.
         cursor.execute('DELETE FROM member_survey WHERE user_id = %s', (user_id,))
         cursor.execute('DELETE FROM member_answers WHERE user_id = %s', (user_id,))
+    with _cache_lock:
+        _lang_cache.pop(user_id, None)   # لا نُبقِ لغة عضو محذوف في الذاكرة
     logger.info(f"🗑️ تم حذف المستخدم {user_id} من قاعدة البيانات")
 
 def get_recent_users(limit: int = 50):
@@ -209,21 +213,57 @@ def get_all_subscribers():
 # دوال الإعدادات
 # ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# ذاكرة الإعدادات واللغات
+# ‏psycopg2 متزامن، فكل استعلام من معالج async يُجمّد حلقة الأحداث لكل الأعضاء
+# طوال رحلته. والإعدادات (الحد اليومي، المدة القصوى، معرّف Binance، مفاتيح
+# التشغيل…) يغيّرها الأدمن بضغطة زر مرّة كل حين، ولغة العضو أندر تغيّراً — ومع
+# ذلك كانت تُسأل عنها القاعدة عشرات المرات في الرسالة الواحدة.
+#
+# الصحّة مضمونة بالإبطال لا بالمهلة: كل كتابة (set_setting/set_user_language)
+# تمسح مفتاحها فوراً، فلا يرى الأدمن قيمة قديمة بعد ضغط الزر أبداً. المهلة
+# شبكة أمان للكتابات من خارج البوت (تعديل يدوي في القاعدة).
+# ═══════════════════════════════════════════════════════════════
+_SETTINGS_TTL = int(os.getenv('SETTINGS_CACHE_TTL', '60'))
+_LANG_TTL = int(os.getenv('LANG_CACHE_TTL', '300'))
+_LANG_CACHE_MAX = int(os.getenv('LANG_CACHE_MAX', '2000'))
+_settings_cache = {}
+_lang_cache = {}
+_cache_lock = threading.Lock()
+
+
+def clear_caches():
+    """يفرغ ذاكرتَي الإعدادات واللغات (للاختبارات أو بعد استعادة نسخة)."""
+    with _cache_lock:
+        _settings_cache.clear()
+        _lang_cache.clear()
+
+
 def get_setting(key: str, default: str = None) -> str:
-    """الحصول على قيمة إعداد"""
+    """الحصول على قيمة إعداد (مخزَّن مؤقتاً — يُبطَل فوراً عند أي كتابة)."""
+    now = time.monotonic()
+    with _cache_lock:
+        hit = _settings_cache.get(key)
+        if hit is not None and now - hit[1] < _SETTINGS_TTL:
+            return hit[0] if hit[0] is not None else default
     with db_cursor() as cursor:
         cursor.execute('SELECT value FROM settings WHERE key = %s', (key,))
         result = cursor.fetchone()
-    return result[0] if result else default
+    value = result[0] if result else None
+    with _cache_lock:
+        _settings_cache[key] = (value, now)
+    return value if value is not None else default
 
 def set_setting(key: str, value: str):
-    """تحديث قيمة إعداد"""
+    """تحديث قيمة إعداد (يُبطل الذاكرة فوراً فيسري التغيير في الحال)"""
     with db_cursor(commit=True) as cursor:
         cursor.execute('''
             INSERT INTO settings (key, value)
             VALUES (%s, %s)
             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
         ''', (key, value))
+    with _cache_lock:
+        _settings_cache[key] = (value, time.monotonic())
     logger.info(f"✅ تم تحديث الإعداد {key} = {value}")
 
 def get_max_duration() -> int:
@@ -673,7 +713,13 @@ def set_daily_limit(limit: int):
 # ═══════════════════════════════════════════════════════════════
 
 def get_user_language(user_id: int):
-    """الحصول على لغة المستخدم"""
+    """الحصول على لغة المستخدم (مخزَّن مؤقتاً — أكثر استعلام تكراراً في البوت،
+    ويُبطَل فوراً عند تغيير اللغة)."""
+    now = time.monotonic()
+    with _cache_lock:
+        hit = _lang_cache.get(user_id)
+        if hit is not None and now - hit[1] < _LANG_TTL:
+            return hit[0]
     with db_cursor() as cursor:
         cursor.execute('''
             SELECT language
@@ -682,19 +728,23 @@ def get_user_language(user_id: int):
         ''', (user_id,))
         result = cursor.fetchone()
 
-    if result and result[0]:
-        return result[0]
-
-    return 'ar'  # Default to Arabic
+    lang = result[0] if (result and result[0]) else 'ar'  # الافتراضي عربي
+    with _cache_lock:
+        if len(_lang_cache) >= _LANG_CACHE_MAX:
+            _lang_cache.pop(next(iter(_lang_cache)), None)
+        _lang_cache[user_id] = (lang, now)
+    return lang
 
 def set_user_language(user_id: int, language: str):
-    """تحديد لغة المستخدم"""
+    """تحديد لغة المستخدم (يُبطل الذاكرة فوراً فتظهر اللغة الجديدة في الحال)"""
     with db_cursor(commit=True) as cursor:
         cursor.execute('''
             INSERT INTO users (user_id, language)
             VALUES (%s, %s)
             ON CONFLICT (user_id) DO UPDATE SET language = excluded.language
         ''', (user_id, language))
+    with _cache_lock:
+        _lang_cache[user_id] = (language, time.monotonic())
 
 
 # ═══════════════════════════════════════════════════════════════
