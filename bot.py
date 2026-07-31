@@ -78,6 +78,11 @@ from content_filter import (
 from video_processing import (
     get_file_size_mb, generate_video_thumbnail, finalize_video, probe_video,
 )
+from video_quality import (
+    DEFAULT_QUALITY, ADMIN_QUALITY_ROWS, QUALITY_LABEL_KEYS,
+    normalize_quality, format_selector, format_sort as quality_format_sort,
+    quality_display, all_cache_qualities,
+)
 from download_errors import (
     _is_drm_error, _is_geo_restricted_error, _is_youtube_cookie_issue,
     _is_facebook_cookie_issue, _is_cookie_file_issue, _is_restricted_content_error,
@@ -157,6 +162,24 @@ def is_admin(user_id) -> bool:
     """نقطة تحقق واحدة من صلاحية الأدمن. تفشل بأمان إذا لم يُضبط ADMIN_ID."""
     admin_id = os.getenv("ADMIN_ID")
     return bool(admin_id) and str(user_id) == str(admin_id)
+
+
+def download_type_keyboard(user_id, lang):
+    """أزرار نوع التحميل تحت معاينة الرابط.
+
+    العضو العادي: زرّا «فيديو / صوت» فقط (والفيديو 1080p).
+    الأدمن وحده: أزرار الجودة كاملة، وفيها «أعلى جودة» بلا سقف دقة (4K فأعلى).
+    """
+    if not is_admin(user_id):
+        return [[
+            InlineKeyboardButton(t('btn_video', lang), callback_data=f"quality_{DEFAULT_QUALITY}"),
+            InlineKeyboardButton(t('btn_audio', lang), callback_data="quality_audio"),
+        ]]
+    return [
+        [InlineKeyboardButton(t(QUALITY_LABEL_KEYS[q], lang), callback_data=f"quality_{q}")
+         for q in row]
+        for row in ADMIN_QUALITY_ROWS
+    ]
 
 
 # Initialize Queue Manager
@@ -2290,11 +2313,8 @@ async def process_download_from_queue(task: DownloadTask, skip_ig_highlight=Fals
             await show_subscription_screen(app, status, user_id, title, duration, max_duration_minutes)
             return
         
-        # Show download type (video / audio)
-        keyboard = [
-            [InlineKeyboardButton(t('btn_video', lang), callback_data="quality_best"),
-             InlineKeyboardButton(t('btn_audio', lang), callback_data="quality_audio")],
-        ]
+        # Show download type (video / audio) — الأدمن يرى خيارات الجودة كاملة
+        keyboard = download_type_keyboard(user_id, lang)
 
         await status.edit_text(
             t('choose_quality', lang, title=title, duration=duration_str),
@@ -3471,6 +3491,12 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         await status_msg.edit_text(ban_text, reply_markup=ban_kb)
         return
 
+    # 🎚️ نقطة الفرض الوحيدة لصلاحية الجودة: «أعلى جودة» (max) للأدمن وحده،
+    #    وأي طلب بها من غيره يُخفَّض إلى 1080p. تسبق فحص الكاش عمداً حتى يبقى
+    #    مفتاح الكاش مطابقاً للجودة المحمّلة فعلاً (فلا يصل ملف الأدمن الضخم
+    #    لعضو طلب الجودة العادية).
+    quality = normalize_quality(quality, admin=is_admin(user_id))
+
     is_audio = (quality == 'audio')
     ckey = cache_key_for_url(url)
 
@@ -3486,45 +3512,9 @@ async def download_and_upload(client, message, url, quality, callback_query=None
 
     try:
         os.makedirs(dl_dir, exist_ok=True)
-        # إعدادات التحميل
-        # نُفضّل ترميز H.264 + صوت AAC (m4a) لأنه متوافق 100% مع مشغّل تلجرام؛
-        # ترميز HEVC/H.265 وVP9/AV1 داخل MP4 يشغّله تلجرام بلا صوت على كثير من
-        # الأجهزة (أو يجمّد الصورة). المنصات ذات الصيغ المدمجة (فيديو+صوت في صيغة
-        # واحدة) مثل تيك توك تُصدّرها yt-dlp باسم ترميز "h264"/"h265" لا "avc1"،
-        # فمُحدِّد bestvideo[vcodec^=avc1] لا يطابقها فيسقط إلى best العام الذي
-        # يختار H.265 (bytevc1) الأعلى بت-ريت ⇒ فيديو بلا صوت متقطّع. لذا نضيف
-        # فرعاً صريحاً يفضّل H.264 المدمج داخل حدّ الدقة نفسه قبل best العام.
-        # سلسلة احتياطية تنازلية لضمان نجاح التحميل دائماً.
-        quality_formats = {
-            'best': (
-                'bestvideo[height<=1080][vcodec^=avc1]+bestaudio[ext=m4a]/'
-                'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/'
-                "best[height<=1080][vcodec~='^(avc1|h264)']/"
-                'best[height<=1080][ext=mp4]/best[height<=1080]/best'
-            ),
-            'medium': (
-                'bestvideo[height<=720][vcodec^=avc1]+bestaudio[ext=m4a]/'
-                'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/'
-                "best[height<=720][vcodec~='^(avc1|h264)']/"
-                'best[height<=720][ext=mp4]/best[height<=720]/best'
-            ),
-            '480': (
-                'bestvideo[height<=480][vcodec^=avc1]+bestaudio[ext=m4a]/'
-                'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/'
-                "best[height<=480][vcodec~='^(avc1|h264)']/"
-                'best[height<=480][ext=mp4]/best[height<=480]/best'
-            ),
-            '360': (
-                'bestvideo[height<=360][vcodec^=avc1]+bestaudio[ext=m4a]/'
-                'bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/'
-                "best[height<=360][vcodec~='^(avc1|h264)']/"
-                'best[height<=360][ext=mp4]/best[height<=360]/best'
-            ),
-            'audio': 'bestaudio/best'  # النسخة الناجحة - تحميل أفضل جودة صوت
-        }
-        
+        # إعدادات التحميل — مُحدِّدات الصيغ في وحدة video_quality (تُختبر مباشرةً)
         is_audio = (quality == 'audio')
-        
+
         # الحصول على event loop مبكراً
         loop = asyncio.get_event_loop()
         
@@ -3601,7 +3591,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         logger.info("🚀 Using optimized download settings for better performance")
         
         ydl_opts = {
-            'format': quality_formats.get(quality, 'best'),
+            'format': format_selector(quality),
             # حدّ طول العنوان بالبايت (B) لا بالأحرف: الأحرف العربية/الإيموجي
             # تأخذ عدة بايتات، وحدّ اسم الملف في لينكس 255 بايت. 150B يترك
             # مساحة كافية للاحقات yt-dlp المؤقتة (.fXXX/.part) والامتداد.
@@ -3630,6 +3620,13 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             },
         }
         
+        # 🏆 أعلى جودة: رتّب الصيغ بالدقّة أولاً حتى تفوز 4K/1440p على 1080p
+        #    مهما كان ترميزها (يوتيوب لا يوفّر فوق 1080p إلا بـ VP9/AV1).
+        _fsort = quality_format_sort(quality)
+        if _fsort:
+            ydl_opts['format_sort'] = _fsort
+            logger.info(f"🏆 أعلى جودة متاحة (بلا سقف دقة) للمستخدم {user_id}")
+
         # اختيار ملف cookies المطابق لمنصة الرابط (ضروري لستوري فيسبوك/إنستغرام)
         cookie_file = get_cookie_file_for_url(url)
         if cookie_file:
@@ -4166,10 +4163,9 @@ async def _show_history(client, message):
     if not rows:
         await message.reply_text(t('history_empty', lang))
         return
-    qmap = {'best': '1080p', 'medium': '720p', '480': '480p', '360': '360p', 'audio': 'MP3'}
     buttons = []
     for hid, title, quality, kind, created, url in rows:
-        qd = 'MP3' if kind == 'audio' else qmap.get(quality, quality or '')
+        qd = quality_display(quality, kind)
         label = f"{(title or 'فيديو')[:35]} • {qd}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"redl_{hid}")])
     await message.reply_text(
@@ -5256,7 +5252,7 @@ async def cmd_uncache(client, message):
         return
     ckey = cache_key_for_url(url)
     removed = []
-    for q in ('best', 'medium', '480', '360', 'audio', IMAGE_CACHE_QUALITY):
+    for q in all_cache_qualities() + (IMAGE_CACHE_QUALITY, ALBUM_CACHE_QUALITY):
         try:
             if subdb.delete_cached_media(ckey, q):
                 removed.append(q)
@@ -6590,11 +6586,9 @@ async def handle_url(client, message):
         await show_subscription_screen(client, status, user_id, title, duration, max_duration_minutes)
         return
 
-    # معاينة مرتّبة: صورة مصغّرة + معلومات المقطع + زرا فيديو/صوت
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(t('btn_video', lang), callback_data="quality_best"),
-         InlineKeyboardButton(t('btn_audio', lang), callback_data="quality_audio")],
-    ])
+    # معاينة مرتّبة: صورة مصغّرة + معلومات المقطع + أزرار نوع التحميل
+    # (الأدمن يرى خيارات الجودة كاملة، والعضو زرّي فيديو/صوت)
+    keyboard = InlineKeyboardMarkup(download_type_keyboard(user_id, lang))
 
     details = t('preview_duration', lang, duration=duration_str)
     platform = _platform_of(url)
