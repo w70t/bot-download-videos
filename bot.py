@@ -78,6 +78,9 @@ from content_filter import (
 from video_processing import (
     get_file_size_mb, generate_video_thumbnail, finalize_video, probe_video,
 )
+from upload_limits import (
+    upload_limit_mb, fits_upload_limit, should_shrink_before_reject,
+)
 from video_quality import (
     DEFAULT_QUALITY, ADMIN_QUALITY_ROWS, QUALITY_LABEL_KEYS,
     normalize_quality, format_selector, format_sort as quality_format_sort,
@@ -3852,9 +3855,30 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         
         logger.info(f"📊 حجم الملف النهائي: {file_size_mb:.2f} MB")
 
-        # التحقق من الحجم
-        if file_size_mb > 2000:
-            await status_msg.edit_text(t('file_too_large', lang, size=f"{file_size_mb:.1f}"))
+        # 🗜️ الأدمن ومقاطع 4K: الملف ينزل بترميز VP9/AV1 بحجم ضخم، وتجهيزه
+        #    لتلجرام يعيد ترميزه إلى H.264 فيتقلّص كثيراً. جرّب التجهيز قبل
+        #    الرفض بدل رفض مقطع يسع فعلاً بعد الترميز. العضو العادي على حاله
+        #    (رفض فوري) حتى لا يُثقَل الجهاز بإعادة ترميز 4K لكل رابط ضخم.
+        #    النتيجة تُحفظ ليُستخدم التجهيز مرة واحدة لا مرتين.
+        _finalized = None
+        if should_shrink_before_reject(file_size_mb, admin=is_admin(user_id),
+                                       is_audio=is_audio):
+            logger.info(f"🗜️ {file_size_mb:.1f}MB فوق السقف — تجهيز لتلجرام "
+                        f"(H.264) قبل الرفض")
+            try:
+                await status_msg.edit_text(t('shrinking', lang, size=f"{file_size_mb:.1f}"))
+            except Exception:
+                pass
+            _finalized = await loop.run_in_executor(
+                None, lambda: finalize_video(file_path))
+            file_size_mb = get_file_size_mb(file_path)
+            logger.info(f"🗜️ الحجم بعد التجهيز: {file_size_mb:.2f} MB")
+
+        # التحقق من الحجم (السقف صلب: بايروجرام يرفض ما فوقه قبل بدء الرفع)
+        if not fits_upload_limit(file_size_mb):
+            await status_msg.edit_text(t('file_too_large', lang,
+                                         size=f"{file_size_mb:.1f}",
+                                         max=upload_limit_mb()))
             os.remove(file_path)
             return
         # Upload
@@ -3929,10 +3953,14 @@ async def download_and_upload(client, message, url, quality, callback_query=None
 
         else:
             # تجهيز الفيديو لكل المنصات: H.264/AAC + faststart (يمنع تجمّد الصورة)
-            # + تاريخ التحميل، ويرجع الأبعاد/المدة الحقيقية من الملف نفسه
-            probed_w, probed_h, probed_dur = await loop.run_in_executor(
-                None, lambda: finalize_video(file_path)
-            )
+            # + تاريخ التحميل، ويرجع الأبعاد/المدة الحقيقية من الملف نفسه.
+            # نُفِّذ مبكراً لتصغير ملف تجاوز السقف؟ أعد استخدام نتيجته بدل تكراره.
+            if _finalized is not None:
+                probed_w, probed_h, probed_dur = _finalized
+            else:
+                probed_w, probed_h, probed_dur = await loop.run_in_executor(
+                    None, lambda: finalize_video(file_path)
+                )
 
             # يضمن وجود مسار صوت (يضيف صمتاً إن غاب) حتى لا يعرض تلجرام الفيديو
             # كصورة متحركة. مكتفٍ ذاتياً في bot.py ليعمل مع مزامنة bot.py وحدها،
