@@ -175,16 +175,36 @@ def deactivate_subscription(user_id: int):
 def delete_user(user_id: int):
     """حذف مستخدم نهائياً من قاعدة البيانات (عند حظره البوت أو حذف حسابه).
 
-    يحذف أيضاً صفوف الاستبيان والإجابات حتى لا تبقى إحصائيات الجنس منتفخة
-    بأعضاء غادروا."""
+    يحذف البيانات التشغيلية والخاصة المرتبطة بالعضو، لكنه يُبقي سجلات الحظر
+    والمدفوعات والإحالات. تُفصل هوية العضو عن سجل الدفع قبل حذف ملف المستخدم
+    حتى يبقى سجل التدقيق من دون كسر قيد PostgreSQL. هذه الدالة تُستدعى أيضاً
+    بعد فشل فحص العضو تلقائياً، لذلك لا يجوز أن يمحو خطأ مؤقت سجل إنفاذ أو
+    تدقيق أو رصيد إحالات دائم."""
     with db_cursor(commit=True) as cursor:
-        cursor.execute('DELETE FROM users WHERE user_id = %s', (user_id,))
-        # تنظيف بيانات الاستبيان والإجابات المرتبطة (الجداول تُنشأ عند الإقلاع)
-        # حتى لا تبقى إحصائيات الجنس منتفخة بأعضاء غادروا.
-        cursor.execute('DELETE FROM member_survey WHERE user_id = %s', (user_id,))
+        # امسح كل البيانات المرتبطة أولاً حتى لا تبقى روابط أو سجلات يتيمة.
+        cursor.execute(
+            'DELETE FROM member_answers WHERE question_id IN '
+            '(SELECT id FROM admin_questions WHERE target_user = %s)',
+            (user_id,),
+        )
         cursor.execute('DELETE FROM member_answers WHERE user_id = %s', (user_id,))
+        cursor.execute('DELETE FROM admin_questions WHERE target_user = %s', (user_id,))
+        cursor.execute('DELETE FROM member_survey WHERE user_id = %s', (user_id,))
+        cursor.execute('DELETE FROM download_history WHERE user_id = %s', (user_id,))
+        cursor.execute('DELETE FROM daily_downloads WHERE user_id = %s', (user_id,))
+        cursor.execute('DELETE FROM fsub_user_passed WHERE user_id = %s', (user_id,))
+        cursor.execute('UPDATE payments SET user_id = NULL WHERE user_id = %s', (user_id,))
+        cursor.execute('DELETE FROM users WHERE user_id = %s', (user_id,))
     with _cache_lock:
         _lang_cache.pop(user_id, None)   # لا نُبقِ لغة عضو محذوف في الذاكرة
+    try:
+        raw_exempt = get_setting('exempt_user_ids', '') or ''
+        exempt_parts = [part.strip() for part in raw_exempt.split(',') if part.strip()]
+        filtered_parts = [part for part in exempt_parts if part != str(user_id)]
+        if filtered_parts != exempt_parts:
+            set_setting('exempt_user_ids', ','.join(filtered_parts))
+    except Exception as exc:
+        logger.warning("تعذّر حذف المستخدم من قائمة الاستثناء: %s", exc)
     logger.info(f"🗑️ تم حذف المستخدم {user_id} من قاعدة البيانات")
 
 def get_recent_users(limit: int = 50):
@@ -461,6 +481,7 @@ def approve_payment(payment_id: int, admin_id: int):
             SELECT user_id, payment_method, status, COALESCE(duration_days, 30)
             FROM payments
             WHERE payment_id = %s
+            FOR UPDATE
         ''', (payment_id,))
         result = cursor.fetchone()
 
@@ -472,14 +493,8 @@ def approve_payment(payment_id: int, admin_id: int):
         if status == 'approved':
             return False, "تم قبول هذه الدفعة مسبقاً"
 
-        # تحديث حالة الدفعة
-        cursor.execute('''
-            UPDATE payments
-            SET status = 'approved',
-                approved_at = %s,
-                approved_by = %s
-            WHERE payment_id = %s
-        ''', (datetime.now().isoformat(), admin_id, payment_id))
+        if user_id is None:
+            return False, "صاحب الدفعة لم يعد موجوداً"
 
         # تفعيل الاشتراك ضمن نفس المعاملة (بمدة الدفعة)
         end_date = datetime.now() + timedelta(days=duration_days)
@@ -488,6 +503,17 @@ def approve_payment(payment_id: int, admin_id: int):
             SET is_subscribed = 1, subscription_end = %s, payment_method = %s
             WHERE user_id = %s
         ''', (end_date.isoformat(), payment_method, user_id))
+        if cursor.rowcount != 1:
+            return False, "صاحب الدفعة لم يعد موجوداً"
+
+        # لا نعلن قبول الدفعة إلا بعد التأكد من تفعيل المستخدم فعلياً.
+        cursor.execute('''
+            UPDATE payments
+            SET status = 'approved',
+                approved_at = %s,
+                approved_by = %s
+            WHERE payment_id = %s
+        ''', (datetime.now().isoformat(), admin_id, payment_id))
 
     logger.info(f"✅ تم قبول الدفعة #{payment_id} للمستخدم {user_id} وتفعيل الاشتراك حتى {end_date}")
     return True, "تم تفعيل الاشتراك بنجاح"
@@ -944,6 +970,40 @@ def get_download_stats():
         'total': total,
         'platforms': platforms,
         'top_users': top_users,
+    }
+
+
+def cleanup_expired_privacy_data(history_days=30, cache_days=30):
+    """Delete old download links/history and media-cache references.
+
+    Member profiles and survey/gender data are intentionally not touched.
+    Returns the number of deleted rows for operational verification.
+    """
+    history_days = max(1, int(history_days))
+    cache_days = max(1, int(cache_days))
+
+    with db_cursor(commit=True) as cursor:
+        cursor.execute(
+            """
+            DELETE FROM download_history
+            WHERE created_at < NOW() - (%s * INTERVAL '1 day')
+            """,
+            (history_days,),
+        )
+        deleted_history = cursor.rowcount
+
+        cursor.execute(
+            """
+            DELETE FROM media_cache
+            WHERE created_at < NOW() - (%s * INTERVAL '1 day')
+            """,
+            (cache_days,),
+        )
+        deleted_cache = cursor.rowcount
+
+    return {
+        'download_history': deleted_history,
+        'media_cache': deleted_cache,
     }
 
 
