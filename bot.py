@@ -17,6 +17,8 @@ import uuid  # مجلد مؤقت فريد لكل عملية تحميل
 import shutil  # حذف مجلد التحميل المؤقت بالكامل
 import subprocess  # توليد المصغّر وضبط تاريخ الفيديو عبر ffmpeg
 import logging
+import re
+from logging.handlers import RotatingFileHandler
 import asyncio
 import yt_dlp
 import traceback
@@ -105,20 +107,103 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════
 # Logging
 # ═══════════════════════════════════════════════════════════════
+_LOG_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+_LOG_BOT_TOKEN_RE = re.compile(r"(?<!\w)\d{6,12}:[A-Za-z0-9_-]{20,}(?!\w)")
+_LOG_TELEGRAM_ID_RE = re.compile(r"(?<!\d)-?\d{6,}(?!\d)")
+_LOG_USERNAME_RE = re.compile(r"(?<![\w.])@[A-Za-z0-9_]{5,}")
+
+
+def _redact_log_text(value):
+    """Remove download links and Telegram identifiers from persistent logs."""
+    text = str(value)
+    text = _LOG_URL_RE.sub('[private-link]', text)
+    text = _LOG_BOT_TOKEN_RE.sub('[private-token]', text)
+    text = _LOG_TELEGRAM_ID_RE.sub('[private-id]', text)
+    return _LOG_USERNAME_RE.sub('[private-username]', text)
+
+
+def _sanitize_legacy_log_files(base_path='bot_standalone.log', backup_count=2):
+    """Redact historical logs once before the rotating handler opens them."""
+    sanitized_count = 0
+    for index in range(backup_count + 1):
+        path = base_path if index == 0 else f'{base_path}.{index}'
+        if not os.path.isfile(path):
+            continue
+        temp_path = f'{path}.privacy-redact.tmp'
+        changed = False
+        try:
+            with open(path, 'r', encoding='utf-8', errors='replace') as source, \
+                    open(temp_path, 'w', encoding='utf-8') as target:
+                for line in source:
+                    safe_line = _redact_log_text(line)
+                    changed = changed or safe_line != line
+                    target.write(safe_line)
+            if changed:
+                os.replace(temp_path, path)
+                sanitized_count += 1
+            else:
+                os.remove(temp_path)
+        except OSError:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+    return sanitized_count
+
+
+class _PrivacyLogFormatter(logging.Formatter):
+    def format(self, record):
+        # Redact the final formatted value so exception tracebacks are covered too.
+        return _redact_log_text(super().format(record))
+
+
+_privacy_formatter = _PrivacyLogFormatter(
+    '%(asctime)s - %(levelname)s - %(message)s'
+)
+_sanitized_legacy_log_count = _sanitize_legacy_log_files()
+_file_log_handler = RotatingFileHandler(
+    'bot_standalone.log',
+    maxBytes=5 * 1024 * 1024,
+    backupCount=2,
+    encoding='utf-8',
+    delay=True,
+)
+_stream_log_handler = logging.StreamHandler()
+_file_log_handler.setFormatter(_privacy_formatter)
+_stream_log_handler.setFormatter(_privacy_formatter)
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('bot_standalone.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
+    handlers=[_file_log_handler, _stream_log_handler],
 )
 logger = logging.getLogger(__name__)
+if _sanitized_legacy_log_count:
+    logger.info(
+        "Redacted private values from %d historical log file(s)",
+        _sanitized_legacy_log_count,
+    )
 
 # ═══════════════════════════════════════════════════════════════
 # Configuration
 # ═══════════════════════════════════════════════════════════════
 load_dotenv()
+
+
+def _retention_days_from_env(name, default=30):
+    """Return a safe positive retention period without risking failed startup."""
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        logger.warning("Invalid privacy retention setting; using %d days", default)
+        return default
+
+
+DOWNLOAD_HISTORY_RETENTION_DAYS = _retention_days_from_env(
+    'DOWNLOAD_HISTORY_RETENTION_DAYS', 30
+)
+MEDIA_CACHE_RETENTION_DAYS = _retention_days_from_env(
+    'MEDIA_CACHE_RETENTION_DAYS', 30
+)
 
 API_ID = os.getenv("PYROGRAM_API_ID")
 API_HASH = os.getenv("PYROGRAM_API_HASH")
@@ -635,7 +720,7 @@ async def send_new_member_notification(user_id, user_name, username, join_time):
             parse_mode=enums.ParseMode.HTML
         )
         
-        logger.info(f"✅ تم إرسال إشعار عضو جديد للقناة: {user_name} ({user_id})")
+        logger.info("✅ تم إرسال إشعار عضو جديد للقناة")
         
     except Exception as e:
         logger.error(f"❌ خطأ في إرسال إشعار العضو الجديد: {str(e)}")
@@ -1229,7 +1314,7 @@ async def get_video_info(url: str):
     try:
         # حماية SSRF: ارفض الروابط غير http/https أو التي تشير لعنوان داخلي
         if not is_safe_url(url):
-            logger.warning(f"🚫 رابط غير آمن أو داخلي مرفوض: {url[:100]}")
+            logger.warning("🚫 تم رفض رابط غير آمن أو داخلي")
             return None
         # اختيار ملف cookies المطابق لمنصة الرابط (مهم للستوري الخاص)
         cookie_file = get_cookie_file_for_url(url)
@@ -2208,7 +2293,7 @@ async def process_download_from_queue(task: DownloadTask, skip_ig_highlight=Fals
 
         # 🔞 محتوى إباحي/حساب محظور بعد الاستخراج → عاقِب المستخدم (حظر + تعهّد)
         if (adult_filter_enabled() and is_adult_info(info)) or is_blocked_account(info):
-            logger.info(f"🔞 Adult/blocked content (queue) from user {user_id}: {info.get('uploader')}")
+            logger.info("🔞 Adult/blocked content rejected from queue")
             ban_text, ban_kb = await _apply_adult_ban(app, user_id, lang)
             await status.edit_text(ban_text, reply_markup=ban_kb)
             return
@@ -2556,7 +2641,7 @@ async def _try_send_from_cache(client, message, status_msg, ckey, quality,
             )
     except Exception as e:
         # المعرّف القديم لم يعد صالحاً → احذف الصف وأعد التحميل عادياً
-        logger.warning(f"⚠️ فشل الإرسال من الكاش ({ckey}/{quality})، سيُعاد التحميل: {e}")
+        logger.warning(f"⚠️ فشل الإرسال من الكاش ({quality})، سيُعاد التحميل: {e}")
         try:
             subdb.delete_cached_media(ckey, quality)
         except Exception:
@@ -2571,7 +2656,7 @@ async def _try_send_from_cache(client, message, status_msg, ckey, quality,
         subdb.bump_cache_hit(ckey, quality)
     except Exception:
         pass
-    logger.info(f"⚡ كاش: أُعيد إرسال {ckey} ({quality}) للمستخدم {user_id} بلا تحميل")
+    logger.info(f"⚡ كاش: أُعيد إرسال وسيط ({quality}) بلا تحميل")
 
     try:
         await forward_to_log_channel(
@@ -2621,7 +2706,7 @@ async def _save_media_to_cache(sent_msg, log_msg, ckey, quality, kind, title,
             width=width, height=height,
             storage_chat_id=storage_chat_id, storage_msg_id=storage_msg_id
         )
-        logger.info(f"💾 حُفظ في الكاش: {ckey} ({quality})")
+        logger.info(f"💾 حُفظ وسيط في الكاش ({quality})")
     except Exception as e:
         logger.warning(f"⚠️ تعذّر حفظ الكاش: {e}")
 
@@ -2679,7 +2764,7 @@ async def _try_send_images_from_cache(client, message, status_msg, ckey,
                 sent_messages.extend(msgs if isinstance(msgs, list) else [msgs])
     except Exception as e:
         # معرّفات قديمة لم تعد صالحة → احذف الكاش وأعد التحميل عادياً
-        logger.warning(f"⚠️ فشل إرسال صور الكاش ({ckey})، سيُعاد التحميل: {e}")
+        logger.warning(f"⚠️ فشل إرسال صور الكاش، سيُعاد التحميل: {e}")
         try:
             subdb.delete_cached_media(ckey, IMAGE_CACHE_QUALITY)
         except Exception:
@@ -2694,7 +2779,7 @@ async def _try_send_images_from_cache(client, message, status_msg, ckey,
         subdb.bump_cache_hit(ckey, IMAGE_CACHE_QUALITY)
     except Exception:
         pass
-    logger.info(f"⚡ كاش صور: أُعيد إرسال {ckey} ({len(file_ids)} صورة) بلا تحميل")
+    logger.info(f"⚡ كاش صور: أُعيد إرسال {len(file_ids)} صورة بلا تحميل")
 
     # تحويل للقناة (نسخ بمعرّف الملف) — سجل كامل مع الجنس، بلا إعادة رفع
     try:
@@ -2890,7 +2975,7 @@ async def download_and_send_images(client, message, url, status_msg,
                     file_id="\n".join(file_ids), title=title,
                     file_size_mb=0, duration=0
                 )
-                logger.info(f"💾 حُفظت صور الكاش: {ckey} ({len(file_ids)} صورة)")
+                logger.info(f"💾 حُفظت {len(file_ids)} صورة في الكاش")
         except Exception as e:
             logger.warning(f"⚠️ تعذّر حفظ كاش الصور: {e}")
 
@@ -3007,7 +3092,7 @@ async def _try_send_album_from_cache(client, message, status_msg, ckey,
             client, message.chat.id, entries, caption)
     except Exception as e:
         # معرّفات قديمة لم تعد صالحة → احذف الكاش وأعد التحميل عادياً
-        logger.warning(f"⚠️ فشل إرسال ألبوم الكاش ({ckey})، سيُعاد التحميل: {e}")
+        logger.warning(f"⚠️ فشل إرسال ألبوم الكاش، سيُعاد التحميل: {e}")
         try:
             subdb.delete_cached_media(ckey, ALBUM_CACHE_QUALITY)
         except Exception:
@@ -3022,7 +3107,7 @@ async def _try_send_album_from_cache(client, message, status_msg, ckey,
         subdb.bump_cache_hit(ckey, ALBUM_CACHE_QUALITY)
     except Exception:
         pass
-    logger.info(f"⚡ كاش ألبوم: أُعيد إرسال {ckey} ({len(entries)} وسيطاً) بلا تحميل")
+    logger.info(f"⚡ كاش ألبوم: أُعيد إرسال {len(entries)} وسيطاً بلا تحميل")
 
     try:
         await forward_images_to_log_channel(
@@ -3160,7 +3245,7 @@ async def download_and_send_tweet_media(client, message, url, status_msg,
                     file_id="\n".join(lines), title=title,
                     file_size_mb=0, duration=0
                 )
-                logger.info(f"💾 حُفظ كاش الألبوم: {ckey} ({len(lines)} وسيطاً)")
+                logger.info(f"💾 حُفظ ألبوم من {len(lines)} وسيطاً في الكاش")
         except Exception as e:
             logger.warning(f"⚠️ تعذّر حفظ كاش الألبوم: {e}")
 
@@ -3227,7 +3312,7 @@ async def _ig_highlight_fetch(url):
         title, owner, items = await loop.run_in_executor(
             None, lambda: instagram_highlight_items(hid))
     except Exception as e:
-        logger.warning(f"⚠️ تعذّر جلب «الأبرز» من {url[:70]}: {e}")
+        logger.warning(f"⚠️ تعذّر جلب «الأبرز»: {e}")
         return None
     if not items:
         return None
@@ -3379,7 +3464,7 @@ async def _ig_highlight_download(message, status_msg, url, user_id, lang,
                     file_id="\n".join(lines), title=(title or 'Highlight'),
                     file_size_mb=0, duration=0
                 )
-                logger.info(f"💾 حُفظ كاش «الأبرز»: {ckey} ({len(lines)} وسيطاً)")
+                logger.info(f"💾 حُفظ كاش «الأبرز» ({len(lines)} وسيطاً)")
         except Exception as e:
             logger.warning(f"⚠️ تعذّر حفظ كاش «الأبرز»: {e}")
 
@@ -3791,7 +3876,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         # 🔞 شبكة أمان: امنع المحتوى الحساس/المحظور قبل الرفع (يغطي القوائم وإعادة
         # التحميل وأي مسار)، حتى لو فات الفحص الأول. لا نرفعه ولا نخزّنه في الكاش.
         if (adult_filter_enabled() and is_adult_info(info)) or is_blocked_account(info):
-            logger.info(f"🚫 Blocked at download stage for user {user_id}: {info.get('uploader')}")
+            logger.info("🚫 Blocked content rejected at download stage")
             ban_text, ban_kb = await _apply_adult_ban(client, user_id, lang)
             await status_msg.edit_text(ban_text, reply_markup=ban_kb)
             return
@@ -5626,6 +5711,19 @@ async def daily_cleanup_task():
         await asyncio.sleep((target_time - now).total_seconds())
 
         try:
+            privacy_cleanup = subdb.cleanup_expired_privacy_data(
+                DOWNLOAD_HISTORY_RETENTION_DAYS,
+                MEDIA_CACHE_RETENTION_DAYS,
+            )
+            logger.info(
+                "🧹 انتهى تنظيف الخصوصية: سجل=%d، كاش=%d",
+                privacy_cleanup['download_history'],
+                privacy_cleanup['media_cache'],
+            )
+        except Exception as cleanup_error:
+            logger.error(f"❌ خطأ في تنظيف بيانات الخصوصية اليومي: {cleanup_error}")
+
+        try:
             admin_id = int(os.getenv("ADMIN_ID"))
             total_before = len(subdb.get_all_users())
             # الداخلون الجدد خلال آخر 24 ساعة (قبل حذف الغائبين)
@@ -5655,10 +5753,6 @@ async def daily_cleanup_task():
             logger.info(f"🧹 انتهى الفحص: دخل {joined}، خرج {removed}، الحقيقي {alive}")
         except Exception as e:
             logger.error(f"❌ خطأ في الفحص اليومي: {e}")
-
-        # انتظر يوماً كاملاً قبل الفحص التالي
-        await asyncio.sleep(86400)
-
 
 async def send_database_backup(client, message):
     """إرسال نسخة احتياطية من قاعدة البيانات PostgreSQL"""
@@ -6327,14 +6421,14 @@ async def handle_url(client, message):
 
     # 🔞 محتوى إباحي/حساب محظور → عاقِب المستخدم (حظر + تعهّد)
     if (adult_filter_enabled() and is_adult_url(url)) or is_blocked_url(url):
-        logger.info(f"🔞 Adult/blocked URL from user {user_id}: {_url_host(url)}")
+        logger.info("🔞 Adult/blocked URL rejected")
         ban_text, ban_kb = await _apply_adult_ban(client, user_id, lang)
         await message.reply_text(ban_text, reply_markup=ban_kb)
         return
 
     # 🚫 حماية SSRF: ارفض الروابط الداخلية/غير http(s) قبل تمريرها لـ yt-dlp
     if not is_safe_url(url):
-        logger.warning(f"🚫 Blocked unsafe/internal URL from user {user_id}: {url[:100]}")
+        logger.warning("🚫 Blocked unsafe/internal URL rejected")
         await message.reply_text(t('invalid_url', lang))
         return
 
@@ -6391,7 +6485,7 @@ async def handle_url(client, message):
         if not _yt:
             await _mmsg.edit_text(t('music_not_found', lang))
             return
-        logger.info(f"🎵 رابط أغنية ({_url_host(url)}) → {_yt}")
+        logger.info("🎵 تم تحويل رابط أغنية إلى مصدر التنزيل")
         await _mmsg.delete()
         url = _yt
 
@@ -6523,7 +6617,7 @@ async def handle_url(client, message):
 
     # 🔞 حظر المحتوى الإباحي بعد الاستخراج (فحص العنوان/الوصف/الفئات/الفئة العمرية)
     if adult_filter_enabled() and is_adult_info(info):
-        logger.info(f"🔞 Blocked adult content from user {user_id}: {info.get('title')}")
+        logger.info("🔞 Blocked adult content rejected")
         await status.edit_text(t('adult_blocked', lang))
         return
 
@@ -9601,6 +9695,18 @@ def main():
     
     # إنشاء قاعدة البيانات
     subdb.init_db()
+    try:
+        privacy_cleanup = subdb.cleanup_expired_privacy_data(
+            DOWNLOAD_HISTORY_RETENTION_DAYS,
+            MEDIA_CACHE_RETENTION_DAYS,
+        )
+        logger.info(
+            "🧹 طُبّقت مهلة الاحتفاظ: سجل=%d، كاش=%d",
+            privacy_cleanup['download_history'],
+            privacy_cleanup['media_cache'],
+        )
+    except Exception as cleanup_error:
+        logger.error(f"❌ تعذّر تنظيف بيانات الخصوصية عند الإقلاع: {cleanup_error}")
     print("✅ تم إنشاء قاعدة بيانات الاشتراكات")
     
     # بدء مهمة التقرير اليومي والفحص اليومي للأعضاء (3 فجراً)
@@ -9620,4 +9726,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
