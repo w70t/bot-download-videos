@@ -27,6 +27,7 @@ TRANSLATIONS = {
         'btn_change_language': '🌐 تغيير اللغة',
         'btn_my_subscription': '💎 اشتراكي',
         'btn_update_ytdlp': '🔄 تحديث yt-dlp',
+        'btn_admin_webapp': '🎛 مركز التحكم',
 
         # Download
         'processing': '⏳ **جاري المعالجة…**',
@@ -226,6 +227,7 @@ TRANSLATIONS = {
         'btn_change_language': '🌐 Change Language',
         'btn_my_subscription': '💎 My Subscription',
         'btn_update_ytdlp': '🔄 Update yt-dlp',
+        'btn_admin_webapp': '🎛 Control Center',
 
         # Download
         'processing': '⏳ **Processing…**',
