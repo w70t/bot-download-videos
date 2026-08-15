@@ -3,7 +3,7 @@ pyrogram==2.0.106
 tgcrypto==1.2.5
 # ملاحظة: yt-dlp يحتاج تحديثاً دورياً لمواكبة تغييرات المنصات:
 #   pip install -U yt-dlp  ثم حدّث الإصدار هنا بعد التأكد أن البوت يعمل
-yt-dlp[default]==2026.7.4
+yt-dlp[default]==2026.8.4.234419.dev0
 curl_cffi==0.15.0
 gallery-dl==1.32.5
 python-dotenv==1.2.2

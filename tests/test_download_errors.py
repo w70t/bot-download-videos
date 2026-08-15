@@ -4,7 +4,8 @@
 from download_errors import (
     _is_drm_error, _is_geo_restricted_error, _is_youtube_cookie_issue,
     _is_facebook_cookie_issue, _is_cookie_file_issue, _is_restricted_content_error,
-    _is_http_403_error,
+    _is_http_403_error, _is_youtube_transport_error,
+    _is_youtube_rescueable_error,
 )
 
 
@@ -47,6 +48,28 @@ def test_http_403_error():
     assert _is_http_403_error('HTTP Error 403: Forbidden')
     assert not _is_http_403_error('HTTP Error 404: Not Found')
     assert not _is_http_403_error('Network timeout')
+
+
+def test_youtube_transport_error_only_matches_network_failures():
+    assert _is_youtube_transport_error('The read operation timed out')
+    assert _is_youtube_transport_error(
+        'Remote end closed connection without response')
+    assert _is_youtube_transport_error('Incomplete Read (42 bytes read)')
+    assert _is_youtube_transport_error(
+        'IncompleteRead(42 bytes read, 100 more expected)')
+    assert not _is_youtube_transport_error('FFmpeg postprocessing failed')
+    assert not _is_youtube_transport_error('No space left on device')
+    assert not _is_youtube_transport_error('HTTP Error 404: Not Found')
+    assert not _is_youtube_transport_error('Video unavailable')
+
+
+def test_youtube_rescueable_error_covers_client_limitations_not_local_errors():
+    assert _is_youtube_rescueable_error('Video unavailable')
+    assert _is_youtube_rescueable_error('Not available on this app')
+    assert _is_youtube_rescueable_error('Sign in to confirm your age')
+    assert not _is_youtube_rescueable_error('FFmpeg postprocessing failed')
+    assert not _is_youtube_rescueable_error('No space left on device')
+    assert not _is_youtube_rescueable_error('Permission denied')
 
 
 def test_restricted_content():

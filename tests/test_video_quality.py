@@ -63,6 +63,20 @@ class TestFormatSelector:
     def test_unknown_quality_uses_default_selector(self):
         assert vq.format_selector('nope') == vq.format_selector(vq.DEFAULT_QUALITY)
 
+    @pytest.mark.parametrize('quality,cap', [
+        ('best', 1080), ('medium', 720), ('480', 480), ('360', 360),
+    ])
+    def test_youtube_retry_relaxes_codec_but_keeps_height_cap(
+            self, quality, cap):
+        fmt = vq.youtube_retry_format_selector(quality)
+        assert f'height<={cap}' in fmt
+        assert 'avc1' not in fmt and 'h264' not in fmt
+        assert fmt.count('height<=') == fmt.count(f'height<={cap}')
+
+    def test_youtube_retry_audio_and_admin_max_remain_uncapped(self):
+        assert vq.youtube_retry_format_selector('audio') == 'bestaudio/best'
+        assert 'height<=' not in vq.youtube_retry_format_selector('max')
+
 
 class TestFormatSort:
     """ترتيب المفاضلة: الدقّة أولاً لأعلى جودة، وبلا ترتيب مخصّص لغيرها."""

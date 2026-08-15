@@ -92,19 +92,23 @@ from upload_limits import (
 from video_quality import (
     DEFAULT_QUALITY, ADMIN_QUALITY_ROWS, QUALITY_LABEL_KEYS,
     normalize_quality, format_selector, format_sort as quality_format_sort,
-    quality_display, all_cache_qualities,
+    youtube_retry_format_selector, quality_display, all_cache_qualities,
 )
 from download_errors import (
     _is_drm_error, _is_geo_restricted_error, _is_youtube_cookie_issue,
     _is_cookie_file_issue, _is_restricted_content_error, _is_http_403_error,
-    _is_format_unavailable_error,
+    _is_format_unavailable_error, _is_youtube_transport_error,
 )
 from download_retries import (
     ensure_facebook_identity, facebook_identity_match_filter,
-    run_facebook_retries, run_youtube_retries as execute_youtube_retries,
+    run_facebook_retries,
+    run_youtube_retries_with_rescue as execute_youtube_retries,
     youtube_extractor_args,
 )
-from ytdlp_compat import chrome_impersonation_target, youtube_js_runtime_options
+from ytdlp_compat import (
+    chrome_impersonation_target, youtube_download_network_options,
+    youtube_js_runtime_options,
+)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -768,7 +772,7 @@ cookies_expiry = {}  # {platform: {'uploaded': timestamp, 'expires': timestamp, 
 
 
 # اترك yt-dlp يختار عميله الافتراضي للصيغ العادية. جمع عدة عملاء يخلط الصيغ
-# وقد يختار رابطاً يحتاج PO Token؛ عند الفشل توجد محاولة android_vr منفردة.
+# وقد يختار رابطاً يحتاج PO Token؛ عند الفشل توجد محاولة visionos منفردة.
 # يبقى الضبط عبر .env متاحاً لحالة تشغيلية مدروسة.
 _yt_clients_env = os.getenv("YT_PLAYER_CLIENTS", "").strip()
 YT_PLAYER_CLIENTS = [c.strip() for c in _yt_clients_env.split(',') if c.strip()] \
@@ -3816,6 +3820,9 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         if is_youtube_url:
             ydl_opts['extractor_args'] = _youtube_extractor_args()
             ydl_opts.update(youtube_js_runtime_options())
+            # لا تُبقِ رابط CDN المتعثر في 15 إعادة داخلية قبل أن يصل الخطأ
+            # لمسار visionos البديل. لا نمس fragment_retries ولا المنصات الأخرى.
+            ydl_opts.update(youtube_download_network_options())
         if facebook_expected_id:
             ydl_opts['match_filter'] = facebook_identity_match_filter(
                 facebook_expected_id)
@@ -3845,7 +3852,8 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         _threads_meta = {}
 
         def download(use_cookies=True, fmt=None, url_override=None, yt_clients=None,
-                     impersonate=None):
+                     impersonate=None, network_retries=None,
+                     socket_timeout=None, continuedl=None):
             o = dict(ydl_opts)
             if fmt:
                 o['format'] = fmt
@@ -3857,6 +3865,12 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             if impersonate is not None:
                 o['impersonate'] = impersonate
                 o.pop('http_headers', None)
+            if is_youtube_url and network_retries is not None:
+                o['retries'] = network_retries
+            if is_youtube_url and socket_timeout is not None:
+                o['socket_timeout'] = socket_timeout
+            if is_youtube_url and continuedl is not None:
+                o['continuedl'] = continuedl
             with yt_dlp.YoutubeDL(o) as ydl:
                 info = ydl.extract_info(url_override or url, download=True)
                 if is_facebook_url:
@@ -3865,6 +3879,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
 
         # صيغة متساهلة احتياطية عند فشل المُحدّد الصارم (بلا فلترة ترميز/امتداد)
         fallback_fmt = 'bestaudio/best' if is_audio else 'bv*+ba/b/best'
+        youtube_fallback_fmt = youtube_retry_format_selector(quality)
 
         async def download_async(**options):
             return await loop.run_in_executor(
@@ -3882,6 +3897,30 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                 logger.warning(
                     "⚠️ الصيغة غير متوفرة، إعادة المحاولة بأفضل "
                     "صيغة متاحة (بلا كوكيز)")
+
+        def log_youtube_rescue(_options):
+            logger.warning(
+                "⚠️ تعذر عميل YouTube السريع، محاولة أخيرة بالعميل الأصلي...")
+
+        async def youtube_failover(error):
+            return await execute_youtube_retries(
+                download_async,
+                error,
+                youtube_fallback_fmt,
+                rescue_options={
+                    'use_cookies': bool(ydl_opts.get('cookiefile')),
+                    'fmt': youtube_fallback_fmt,
+                    'yt_clients': ('default',),
+                    # استعادة ميزانية السلوك القديم للحالات التي لا يدعمها
+                    # visionos فقط؛ المسار العادي يبقى سريعاً.
+                    'network_retries': 15,
+                    'socket_timeout': 20,
+                    # عميل جديد قد يختار stream مختلفاً بالاسم نفسه.
+                    'continuedl': False,
+                },
+                on_attempt=log_youtube_attempt,
+                on_rescue=log_youtube_rescue,
+            )
 
         def log_facebook_download_attempt(options):
             if options.get('impersonate') is not None:
@@ -3911,17 +3950,14 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                     info, file_path = await loop.run_in_executor(None, lambda: download(False))
                 except Exception as e2:
                     # يشمل 403 الذي قد لا يظهر إلا في المحاولة الثانية بلا كوكيز.
-                    info, file_path = await execute_youtube_retries(
-                        download_async, e2, fallback_fmt,
-                        on_attempt=log_youtube_attempt)
+                    info, file_path = await youtube_failover(e2)
             # يوتيوب: خطأ 403 عند تنزيل بيانات الفيديو = روابط صيغ محظورة/منتهية
             # لعميل المشغّل الحالي → أعد الاستخراج بعملاء بدلاء (روابط جديدة) وبلا كوكيز
             elif is_youtube_url and (
                     _is_http_403_error(dl_err)
-                    or _is_format_unavailable_error(dl_err)):
-                info, file_path = await execute_youtube_retries(
-                    download_async, dl_err, fallback_fmt,
-                    on_attempt=log_youtube_attempt)
+                    or _is_format_unavailable_error(dl_err)
+                    or _is_youtube_transport_error(dl_err)):
+                info, file_path = await youtube_failover(dl_err)
             # ملف كوكيز تالف (صيغة غير صحيحة) يفشل لأي منصة → أعد المحاولة بدون كوكيز
             elif ydl_opts.get('cookiefile') and _is_cookie_file_issue(dl_err):
                 logger.warning(f"⚠️ ملف الكوكيز تالف/غير صالح ({ydl_opts.get('cookiefile')})، إعادة المحاولة بدون كوكيز...")

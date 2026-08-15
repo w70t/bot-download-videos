@@ -3,7 +3,7 @@
 
 from download_errors import (
     _facebook_retry_options, _is_facebook_retryable_error,
-    _youtube_retry_options,
+    _is_youtube_rescueable_error, _youtube_retry_options,
 )
 
 
@@ -85,6 +85,28 @@ async def run_youtube_retries(
                         _attempt_key(item) != new_key for item in pending):
                     pending.append(new_options)
     raise last_error
+
+
+async def run_youtube_retries_with_rescue(
+        run_download, initial_error, fallback_format, *, rescue_options,
+        on_attempt=None, on_rescue=None):
+    """جرّب visionos سريعاً ثم العميل الأصلي مرة أخيرة عند الحاجة فقط.
+
+    بعض المحتوى (خصوصاً Made for Kids أو المحتوى الذي يحتاج Cookies) غير
+    متاح لعميل visionos. محاولة الإنقاذ ليست loop ولا تعمل بعد أخطاء محلية؛
+    إنها تعيد سلوك الصبر القديم فقط عندما يفشل البديل نفسه بسبب YouTube.
+    """
+    try:
+        return await run_youtube_retries(
+            run_download, initial_error, fallback_format,
+            on_attempt=on_attempt,
+        )
+    except Exception as fallback_error:
+        if not _is_youtube_rescueable_error(fallback_error):
+            raise
+        if on_rescue:
+            on_rescue(rescue_options)
+        return await run_download(**rescue_options)
 
 
 async def run_facebook_retries(

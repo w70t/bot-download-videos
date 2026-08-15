@@ -3,7 +3,10 @@
 
 from types import SimpleNamespace
 
-from ytdlp_compat import _probe_chrome_impersonation, _probe_node_runtime
+from ytdlp_compat import (
+    _probe_chrome_impersonation, _probe_node_runtime,
+    youtube_download_network_options,
+)
 
 
 class _FakeYDL:
@@ -63,3 +66,30 @@ def test_node_runtime_probe_fails_closed():
         raise OSError('probe failed')
 
     assert _probe_node_runtime(lambda name: '/usr/bin/node', broken) == {}
+
+
+def test_youtube_download_network_options_fail_fast_by_default():
+    assert youtube_download_network_options({}) == {
+        'retries': 2,
+        'socket_timeout': 10,
+    }
+
+
+def test_youtube_download_network_options_are_tunable_and_bounded():
+    assert youtube_download_network_options({
+        'YTDLP_YOUTUBE_RETRIES': '99',
+        'YTDLP_YOUTUBE_SOCKET_TIMEOUT_SECONDS': '1',
+    }) == {
+        'retries': 15,
+        'socket_timeout': 5,
+    }
+
+
+def test_youtube_download_network_options_ignore_invalid_values():
+    assert youtube_download_network_options({
+        'YTDLP_YOUTUBE_RETRIES': 'not-a-number',
+        'YTDLP_YOUTUBE_SOCKET_TIMEOUT_SECONDS': '',
+    }) == {
+        'retries': 2,
+        'socket_timeout': 10,
+    }

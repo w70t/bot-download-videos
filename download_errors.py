@@ -10,10 +10,10 @@
 from url_utils import PLATFORM_URL_MARKERS
 
 
-# عميل يوتيوب النظيف عند 403. تمرير عدة عملاء معاً يجمع صيغهم ثم قد يختار
-# yt-dlp رابطاً من عميل يحتاج PO Token؛ android_vr منفرداً يتفادى ذلك في
-# النسخة المستقرة الحالية ويجعل المحاولة قابلة للتشخيص.
-YOUTUBE_403_FALLBACK_CLIENTS = ('android_vr',)
+# عميل يوتيوب النظيف عند 403/timeout. تمرير عدة عملاء معاً يجمع صيغهم ثم قد
+# يختار رابطاً متعثراً من عميل آخر. visionos منفرداً متاح في nightly المثبّت،
+# وقد اجتاز تنزيل الحالة الحقيقية التي تعثرت مع default وandroid_vr.
+YOUTUBE_403_FALLBACK_CLIENTS = ('visionos',)
 
 
 def _is_drm_error(err):
@@ -53,6 +53,24 @@ def _is_http_403_error(err):
     return '403' in msg and ('forbidden' in msg or 'download video data' in msg)
 
 
+def _is_youtube_transport_error(err):
+    """هل تعطل اتصال الوسائط ويمكن إعادة استخراجه من عميل آخر؟
+
+    العلامات شبكية فقط ولا تشمل أخطاء القرص أو FFmpeg. بعد استنفاد
+    المحاولات القصيرة لنفس رابط CDN، يعيد ``visionos`` استخراج رابط مستقل.
+    """
+    msg = str(err).lower()
+    return any(marker in msg for marker in (
+        'timed out',
+        'timeout',
+        'connection reset by peer',
+        'connection aborted',
+        'remote end closed connection',
+        'incomplete read',
+        'incompleteread',
+    ))
+
+
 def _is_format_unavailable_error(err):
     """هل أخفق محدد الصيغة الصارم لأن الصيغة المطلوبة غير متاحة؟"""
     msg = str(err).lower()
@@ -62,21 +80,25 @@ def _is_format_unavailable_error(err):
 def _youtube_retry_options(err, fallback_format):
     """يعيد محاولات يوتيوب التالية كخيارات ``download`` مرتبة.
 
-    خطأ 403 أو غياب الصيغة يعيدان الاستخراج مرة واحدة عبر android_vr منفرداً
+    خطأ 403 أو غياب الصيغة يعيدان الاستخراج مرة واحدة عبر visionos منفرداً
     وبصيغة متساهلة. لا نفعّل ``formats=missing_pot``: هذه الصيغ يستبعدها
     yt-dlp افتراضياً تحديداً لأنها قد تعيد 403 بلا PO Token.
     """
-    if _is_http_403_error(err):
+    if _is_http_403_error(err) or _is_youtube_transport_error(err):
         return ({
             'use_cookies': False,
             'fmt': fallback_format,
             'yt_clients': YOUTUBE_403_FALLBACK_CLIENTS,
+            # لا تستأنف ملفاً جزئياً أنشأه عميل YouTube مختلف؛ قد تشير
+            # الصيغة ذات الاسم نفسه إلى stream آخر وتنتج ملفاً هجيناً.
+            'continuedl': False,
         },)
     if _is_format_unavailable_error(err):
         return ({
             'use_cookies': False,
             'fmt': fallback_format,
             'yt_clients': YOUTUBE_403_FALLBACK_CLIENTS,
+            'continuedl': False,
         },)
     return ()
 
@@ -93,6 +115,25 @@ def _is_youtube_cookie_issue(err):
         'no video formats',
     ]
     return any(s in msg for s in signs)
+
+
+def _is_youtube_rescueable_error(err):
+    """هل يجوز بعد فشل visionos تنفيذ محاولة أخيرة بالعميل الأصلي؟
+
+    ``visionos`` سريع ولا يحتاج JavaScript، لكنه لا يعرض فيديوهات الأطفال ولا
+    يدعم Cookies. لذلك نحافظ على مسار إنقاذ أخير للحالات الشبكية/الحسابية فقط،
+    ولا نكرر إطلاقاً أخطاء القرص أو FFmpeg أو الصلاحيات المحلية.
+    """
+    msg = str(err).lower()
+    return (
+        _is_http_403_error(err)
+        or _is_format_unavailable_error(err)
+        or _is_youtube_transport_error(err)
+        or _is_youtube_cookie_issue(err)
+        or 'video unavailable' in msg
+        or 'video is not available' in msg
+        or 'not available on this app' in msg
+    )
 
 
 def _is_facebook_cookie_issue(err):
