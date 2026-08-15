@@ -2,6 +2,7 @@
 """فحوص توافق اختيارية لميزات yt-dlp الإضافية."""
 
 from functools import lru_cache
+import os
 import re
 import shutil
 import subprocess
@@ -62,3 +63,31 @@ def _probe_node_runtime(which=shutil.which, run=subprocess.run):
 def youtube_js_runtime_options():
     """خيارات yt-dlp المخزنة لتفعيل Node 22+ من دون كلفة فحص لكل طلب."""
     return _probe_node_runtime()
+
+
+def _bounded_env_int(environ, name, default, minimum, maximum):
+    """اقرأ عدداً صحيحاً مضبوط الحدود دون جعل خطأ الإعداد يمنع إقلاع البوت."""
+    try:
+        value = int(str(environ.get(name, default)).strip())
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(value, maximum))
+
+
+def youtube_download_network_options(environ=None):
+    """مهلة ومحاولات قصيرة لروابط وسائط YouTube المتعثرة.
+
+    ``yt-dlp`` يعيد رابط CDN نفسه داخلياً قبل أن يعيد الخطأ للكود الخارجي.
+    إبقاء القيمة العامة (15) قد يؤخر الانتقال إلى عميل YouTube البديل نحو
+    دقيقة رغم أن الجهاز والاتصال سليمان. هذه الخيارات تخص YouTube وحده؛
+    محاولات الأجزاء تبقى كما هي لحماية تنزيلات DASH/HLS الطويلة.
+    """
+    env = os.environ if environ is None else environ
+    return {
+        # initial request + محاولتان إضافيتان قبل إعادة تصنيف الخطأ
+        'retries': _bounded_env_int(
+            env, 'YTDLP_YOUTUBE_RETRIES', 2, 0, 15),
+        # لا تترك اتصالاً بلا بيانات معلقاً إلى أجل غير محدود
+        'socket_timeout': _bounded_env_int(
+            env, 'YTDLP_YOUTUBE_SOCKET_TIMEOUT_SECONDS', 10, 5, 60),
+    }

@@ -108,6 +108,30 @@ def format_selector(quality):
     return QUALITY_FORMATS.get(quality, QUALITY_FORMATS[DEFAULT_QUALITY])
 
 
+def youtube_retry_format_selector(quality):
+    """صيغة YouTube متساهلة للبديل مع إبقاء سقف الجودة المطلوب.
+
+    المحاولة الأساسية تفضّل H.264/MP4. عند تعذر الصيغة نزيل قيد الترميز،
+    لكن لا يجوز أن يحول retry طلب 360p أو 1080p إلى 4K ويحمّل Raspberry
+    معالجةً وحجماً غير متوقعين. ``max`` وحدها تبقى بلا سقف لأنها للأدمن.
+    """
+    if quality == AUDIO_QUALITY:
+        return 'bestaudio/best'
+    if quality == MAX_QUALITY:
+        return 'bv*+ba/b/best'
+    caps = {
+        DEFAULT_QUALITY: 1080,
+        'medium': 720,
+        '480': 480,
+        '360': 360,
+    }
+    height = caps.get(quality, caps[DEFAULT_QUALITY])
+    return (
+        f'bv*[height<={height}]+ba/'
+        f'b[height<={height}]'
+    )
+
+
 def format_sort(quality):
     """قائمة format_sort لـ yt-dlp، أو None حين لا حاجة لترتيب مخصّص."""
     return list(MAX_FORMAT_SORT) if quality == MAX_QUALITY else None
