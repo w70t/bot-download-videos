@@ -28,6 +28,8 @@ TRANSLATIONS = {
         'btn_my_subscription': '💎 اشتراكي',
         'btn_update_ytdlp': '🔄 تحديث yt-dlp',
         'btn_admin_webapp': '🎛 مركز التحكم',
+        'btn_admin_webapp_open': 'فتح مركز التحكم',
+        'admin_webapp_prompt': '🎛 **مركز التحكم**\n\nافتح اللوحة من الزر أدناه لعرض البيانات الحقيقية بأمان.',
 
         # Download
         'processing': '⏳ **جاري المعالجة…**',
@@ -228,6 +230,8 @@ TRANSLATIONS = {
         'btn_my_subscription': '💎 My Subscription',
         'btn_update_ytdlp': '🔄 Update yt-dlp',
         'btn_admin_webapp': '🎛 Control Center',
+        'btn_admin_webapp_open': 'Open Control Center',
+        'admin_webapp_prompt': '🎛 **Control Center**\n\nOpen the dashboard below to view authenticated live data.',
 
         # Download
         'processing': '⏳ **Processing…**',
