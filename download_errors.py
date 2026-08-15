@@ -10,10 +10,10 @@
 from url_utils import PLATFORM_URL_MARKERS
 
 
-# عملاء يوتيوب البدلاء عند انتهاء/حجب رابط الصيغة بخطأ 403. نبقي القائمة
-# هنا مع خطة إعادة المحاولة حتى تستخدمها كل نقاط الفشل (بما فيها المحاولة
-# الثانية بلا كوكيز) بنفس الترتيب.
-YOUTUBE_403_FALLBACK_CLIENTS = ('tv', 'ios', 'web_safari', 'mweb', 'android')
+# عميل يوتيوب النظيف عند 403. تمرير عدة عملاء معاً يجمع صيغهم ثم قد يختار
+# yt-dlp رابطاً من عميل يحتاج PO Token؛ android_vr منفرداً يتفادى ذلك في
+# النسخة المستقرة الحالية ويجعل المحاولة قابلة للتشخيص.
+YOUTUBE_403_FALLBACK_CLIENTS = ('android_vr',)
 
 
 def _is_drm_error(err):
@@ -62,25 +62,22 @@ def _is_format_unavailable_error(err):
 def _youtube_retry_options(err, fallback_format):
     """يعيد محاولات يوتيوب التالية كخيارات ``download`` مرتبة.
 
-    خطأ 403 يحتاج أولاً إعادة استخراج بعملاء مشغّل آخرين للحصول على روابط
-    جديدة، ثم نفس العملاء مع صيغة متساهلة. أما غياب الصيغة وحده فيحتاج
-    المحاولة المتساهلة بلا كوكيز. إرجاع الخطة كبيانات نقية يجعل المسار قابلاً
-    للاختبار ويمنع اختلاف معالجة الخطأ بين المحاولة الأولى والثانية.
+    خطأ 403 أو غياب الصيغة يعيدان الاستخراج مرة واحدة عبر android_vr منفرداً
+    وبصيغة متساهلة. لا نفعّل ``formats=missing_pot``: هذه الصيغ يستبعدها
+    yt-dlp افتراضياً تحديداً لأنها قد تعيد 403 بلا PO Token.
     """
     if _is_http_403_error(err):
-        return (
-            {
-                'use_cookies': False,
-                'yt_clients': YOUTUBE_403_FALLBACK_CLIENTS,
-            },
-            {
-                'use_cookies': False,
-                'fmt': fallback_format,
-                'yt_clients': YOUTUBE_403_FALLBACK_CLIENTS,
-            },
-        )
+        return ({
+            'use_cookies': False,
+            'fmt': fallback_format,
+            'yt_clients': YOUTUBE_403_FALLBACK_CLIENTS,
+        },)
     if _is_format_unavailable_error(err):
-        return ({'use_cookies': False, 'fmt': fallback_format},)
+        return ({
+            'use_cookies': False,
+            'fmt': fallback_format,
+            'yt_clients': YOUTUBE_403_FALLBACK_CLIENTS,
+        },)
     return ()
 
 

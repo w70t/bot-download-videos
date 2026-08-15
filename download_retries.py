@@ -11,6 +11,11 @@ FACEBOOK_IDENTITY_MISMATCH = 'Facebook media identity mismatch'
 FACEBOOK_IDENTITY_UNAVAILABLE = 'Facebook target identity unavailable'
 
 
+def youtube_extractor_args(clients):
+    """خيارات عملاء YouTube دون إظهار صيغ ناقصة PO Token."""
+    return {'youtube': {'player_client': list(clients)}}
+
+
 def ensure_facebook_identity(info, expected_id):
     """ارفض نتيجة Facebook التي لا تثبت تطابقها مع معرّف الرابط."""
     if not expected_id:

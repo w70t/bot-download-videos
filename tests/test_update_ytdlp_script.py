@@ -10,6 +10,7 @@ SCRIPT = (Path(__file__).resolve().parents[1] / 'update_ytdlp.sh').read_text(
 
 def test_updater_caps_curl_cffi_without_polluting_version_package_names():
     assert 'CURL_CFFI_REQUIREMENT="curl_cffi<0.16"' in SCRIPT
+    assert 'INSTALL_ARGS+=("yt-dlp[default]")' in SCRIPT
     assert 'INSTALL_ARGS+=("$CURL_CFFI_REQUIREMENT")' in SCRIPT
     assert 'pip install -U "${INSTALL_ARGS[@]}"' in SCRIPT
     assert 'PKG_ARGS+=("curl_cffi")' in SCRIPT
