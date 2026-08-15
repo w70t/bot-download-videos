@@ -25,7 +25,10 @@ import traceback
 import contextvars  # نقل سبب فشل الاستخراج (محتوى مقيّد) للمستدعي بأمان مع التزامن
 from datetime import datetime
 from pyrogram import Client, filters, enums, StopPropagation
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from pyrogram.types import (
+    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery,
+    ReplyKeyboardMarkup, KeyboardButton, WebAppInfo,
+)
 from pyrogram.errors import (
     UserIsBlocked, InputUserDeactivated, PeerIdInvalid,
     UserDeactivated, UserDeactivatedBan, FloodWait, UserNotParticipant
@@ -41,6 +44,7 @@ import subscription_db as subdb
 from translations import t
 from queue_manager import DownloadQueueManager, DownloadTask
 import pg_backup
+from admin_webapp import admin_webapp_url
 
 from url_utils import (
     PLATFORM_URL_MARKERS, is_safe_url, cache_key_for_url,
@@ -250,6 +254,21 @@ def is_admin(user_id) -> bool:
     """نقطة تحقق واحدة من صلاحية الأدمن. تفشل بأمان إذا لم يُضبط ADMIN_ID."""
     admin_id = os.getenv("ADMIN_ID")
     return bool(admin_id) and str(user_id) == str(admin_id)
+
+
+def _admin_webapp_row(user_id, lang, *, private_chat):
+    """Build the optional admin-only Mini App row, failing closed.
+
+    Telegram Web App keyboard buttons are supported only in private chats.
+    An empty or invalid ADMIN_WEBAPP_URL leaves the current menu unchanged.
+    """
+    url = admin_webapp_url()
+    if not private_chat or not is_admin(user_id) or not url:
+        return []
+    return [[KeyboardButton(
+        t('btn_admin_webapp', lang),
+        web_app=WebAppInfo(url=url),
+    )]]
 
 
 def download_type_keyboard(user_id, lang):
@@ -5245,19 +5264,21 @@ async def start(client, message):
     
     # مستخدم موجود - عرض الرسالة الترحيبية
     keyboard = None
-    admin_id = os.getenv("ADMIN_ID")
     
-    if admin_id and str(user_id) == admin_id:
-        from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton
-        keyboard = ReplyKeyboardMarkup([
+    if is_admin(user_id):
+        admin_rows = _admin_webapp_row(
+            user_id,
+            lang,
+            private_chat=message.chat.type == enums.ChatType.PRIVATE,
+        )
+        admin_rows.extend([
             [KeyboardButton(t('btn_cookies', lang)), KeyboardButton(t('btn_daily_report', lang))],
             [KeyboardButton(t('btn_health', lang)), KeyboardButton(t('btn_subscription', lang))],
             [KeyboardButton(t('btn_change_language', lang)), KeyboardButton(t('btn_update_ytdlp', lang))]
-        ], resize_keyboard=True)
+        ])
+        keyboard = ReplyKeyboardMarkup(admin_rows, resize_keyboard=True)
     else:
         # للمستخدمين العاديين - التحقق من الاشتراك
-        from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton
-        
         # التحقق من حالة الاشتراك
         is_subscribed = subdb.is_user_subscribed(user_id)
         
@@ -9563,19 +9584,22 @@ async def handle_language_selection(client, callback_query):
     )
     
     # إرسال رسالة الترحيب
-    admin_id = os.getenv("ADMIN_ID")
     keyboard = None
     
-    if admin_id and str(user_id) == admin_id:
-        from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton
-        keyboard = ReplyKeyboardMarkup([
+    if is_admin(user_id):
+        admin_rows = _admin_webapp_row(
+            user_id,
+            lang,
+            private_chat=callback_query.message.chat.type == enums.ChatType.PRIVATE,
+        )
+        admin_rows.extend([
             [KeyboardButton(t('btn_cookies', lang)), KeyboardButton(t('btn_daily_report', lang))],
             [KeyboardButton(t('btn_health', lang)), KeyboardButton(t('btn_subscription', lang))],
             [KeyboardButton("📁 نسخ احتياطي"), KeyboardButton(t('btn_change_language', lang))],
             [KeyboardButton(t('btn_update_ytdlp', lang))]
-        ], resize_keyboard=True)
+        ])
+        keyboard = ReplyKeyboardMarkup(admin_rows, resize_keyboard=True)
     else:
-        from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton
         keyboard = ReplyKeyboardMarkup([
             [KeyboardButton(t('btn_my_downloads', lang)), KeyboardButton(t('btn_invite', lang))],
             [KeyboardButton(t('btn_change_language', lang))]

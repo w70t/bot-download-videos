@@ -229,6 +229,9 @@ PYROGRAM_API_HASH=YOUR_API_HASH
 # من @userinfobot
 ADMIN_ID=YOUR_TELEGRAM_ID
 
+# اختياري: رابط HTTPS لمركز تحكم الأدمن (اتركه فارغاً لإخفاء الزر)
+ADMIN_WEBAPP_URL=
+
 # PostgreSQL (نفس كلمة المرور من الخطوة 4!)
 POSTGRES_HOST=localhost
 POSTGRES_PORT=5432
@@ -327,6 +330,16 @@ python3 -m pytest tests/ -q
 1. افتح Telegram → ابحث عن `@userinfobot`
 2. أرسل: `/start`
 3. انسخ رقمك التعريفي
+
+### `ADMIN_WEBAPP_URL` (اختياري)
+
+ضع رابط HTTPS المنشور لمركز التحكم. عند ضبطه يظهر زر **🎛 مركز التحكم**
+للأدمن وحده في المحادثة الخاصة. تركه فارغاً أو وضع رابط غير صالح يبقي
+القائمة الحالية كما هي تماماً.
+
+> إخفاء الزر عن الأعضاء ليس حماية للرابط. قبل عرض بيانات حقيقية أو تنفيذ
+> أوامر، يجب أن يتحقق خادم الـMini App من توقيع `Telegram.WebApp.initData`
+> وحداثة `auth_date` وأن معرّف المستخدم يطابق `ADMIN_ID`.
 
 ---
 
