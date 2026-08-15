@@ -38,5 +38,8 @@ jobs:
         # بوابة صياغة سريعة لكل وحدات المشروع (لا تتطلّب استيراد المكتبات الثقيلة)
         run: python -m py_compile *.py
 
+      - name: Shell syntax check
+        run: bash -n update_ytdlp.sh
+
       - name: Run tests
         run: python -m pytest -q

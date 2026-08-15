@@ -784,19 +784,17 @@ def test_instagram_lookup_expired_or_private_story_flagged():
 
 # ── فيسبوك: توسيع روابط المشاركة وكشف الستوري ───────────────────
 
-class _FakeFinal:
-    """محاكاة استجابة urlopen تُرجع الرابط النهائي بعد التحويل."""
-    def __init__(self, final):
-        self._f = final
+class _FakeCurlRedirect:
+    """استجابة curl_cffi وهمية لاختبار التحويل اليدوي بلا شبكة."""
+    def __init__(self, status, location=None):
+        self.status_code = status
+        self.status = status
+        self.code = status
+        self.headers = {'Location': location} if location else {}
+        self.closed = False
 
-    def geturl(self):
-        return self._f
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
+    def close(self):
+        self.closed = True
 
 
 def test_facebook_unwraps_login_wrapper():
@@ -810,13 +808,192 @@ def test_facebook_unwraps_login_wrapper():
     assert link_resolvers._fb_unwrap_login(real) == real
 
 
+def test_facebook_video_id_covers_supported_numeric_urls():
+    assert link_resolvers.facebook_video_id(
+        'https://www.facebook.com/reel/123456/') == '123456'
+    assert link_resolvers.facebook_video_id(
+        'https://www.facebook.com/watch/?v=234567') == '234567'
+    assert link_resolvers.facebook_video_id(
+        'https://www.facebook.com/video/video.php?v=345678') == '345678'
+    assert link_resolvers.facebook_video_id(
+        'https://www.facebook.com/user/videos/456789/') == '456789'
+
+
+def test_facebook_video_id_rejects_unproven_or_off_platform_targets():
+    assert link_resolvers.facebook_video_id(
+        'https://www.facebook.com/share/v/ABC123/') is None
+    assert link_resolvers.facebook_video_id(
+        'https://example.com/reel/123456/') is None
+    assert link_resolvers.facebook_video_id(
+        'https://www.facebook.com/watch/?v=not-numeric') is None
+
+
 def test_facebook_share_link_expanded():
     real = 'https://www.facebook.com/watch/?v=123456'
-    with patch('urllib.request.urlopen', return_value=_FakeFinal(real)), \
+    with patch.object(link_resolvers, '_fb_expand_with_urllib',
+                      return_value=real) as traditional, \
             patch.object(link_resolvers, 'is_safe_url', return_value=True):
-        out = link_resolvers.resolve_facebook_share(
-            'https://www.facebook.com/share/1ETgKZXJXD/?mibextid=wwXIfr')
+        start = 'https://www.facebook.com/share/1ETgKZXJXD/?mibextid=wwXIfr'
+        out = link_resolvers.resolve_facebook_share(start)
     assert out == real
+    traditional.assert_called_once_with(start, 20)
+
+
+def test_facebook_urllib_follows_only_checked_redirects():
+    start = 'https://www.facebook.com/share/v/ABC123/'
+    real = 'https://www.facebook.com/reel/123456/'
+    responses = [_FakeCurlRedirect(302, '/reel/123456/'),
+                 _FakeCurlRedirect(200)]
+    calls = []
+
+    def fake_open(req, timeout):
+        calls.append((req.full_url, timeout))
+        return responses[len(calls) - 1]
+
+    with patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        out = link_resolvers._fb_expand_with_urllib(
+            start, timeout=7, request_open=fake_open)
+
+    assert out == real
+    assert calls == [(start, 7), (real, 7)]
+    assert all(r.closed for r in responses)
+
+
+def test_facebook_urllib_never_requests_unsafe_redirect_target():
+    start = 'https://www.facebook.com/share/v/ABC123/'
+    response = _FakeCurlRedirect(302, 'http://127.0.0.1/private')
+    calls = []
+
+    def fake_open(req, timeout):
+        calls.append(req.full_url)
+        return response
+
+    with patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        out = link_resolvers._fb_expand_with_urllib(
+            start, request_open=fake_open)
+
+    assert out is None
+    assert calls == [start]
+    assert response.closed
+
+
+def test_facebook_share_resolver_uses_chrome_fallback_after_urllib_failure():
+    start = 'https://www.facebook.com/share/v/ABC123/'
+    real = 'https://www.facebook.com/reel/123456/'
+    with patch.object(link_resolvers, '_fb_expand_with_urllib',
+                      return_value=None), \
+            patch.object(link_resolvers, '_fb_expand_with_impersonation',
+                         return_value=real) as fallback, \
+            patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        out = link_resolvers.resolve_facebook_share(start, timeout=9)
+
+    assert out == real
+    fallback.assert_called_once_with(start, 9)
+
+
+def test_facebook_share_falls_back_to_chrome99_without_cookies():
+    """إذا رفض urllib الرابط، يتبع fallback التحويلات يدوياً بلا كوكيز."""
+    start = 'https://www.facebook.com/share/v/ABC123/'
+    real = 'https://www.facebook.com/reel/123456/'
+    responses = [_FakeCurlRedirect(302, '/reel/123456/'),
+                 _FakeCurlRedirect(200)]
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs))
+        return responses[len(calls) - 1]
+
+    with patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        out = link_resolvers._fb_expand_with_impersonation(
+            start, timeout=7, request_get=fake_get)
+
+    assert out == real
+    assert [u for u, _ in calls] == [start, real]
+    assert all(k['impersonate'] == 'chrome99' for _, k in calls)
+    assert all(k['allow_redirects'] is False for _, k in calls)
+    assert all(k['cookies'] == {} for _, k in calls)
+    assert all(k['timeout'] == 7 for _, k in calls)
+    assert all(r.closed for r in responses)
+
+
+def test_facebook_redirect_domains_are_strictly_limited():
+    assert link_resolvers._is_facebook_platform_url(
+        'https://facebook.com/share/v/ABC/')
+    assert link_resolvers._is_facebook_platform_url(
+        'https://m.facebook.com/reel/123/')
+    assert link_resolvers._is_facebook_platform_url('https://fb.watch/ABC/')
+    assert not link_resolvers._is_facebook_platform_url(
+        'https://facebook.com.example.org/share/v/ABC/')
+    assert not link_resolvers._is_facebook_platform_url(
+        'https://evilfacebook.com/share/v/ABC/')
+    assert not link_resolvers._is_facebook_platform_url(
+        'ftp://www.facebook.com/share/v/ABC/')
+
+
+def test_facebook_chrome_fallback_rejects_off_platform_redirect():
+    response = _FakeCurlRedirect(302, 'https://example.com/private')
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        return response
+
+    with patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        out = link_resolvers._fb_expand_with_impersonation(
+            'https://fb.watch/ABC123/', request_get=fake_get)
+
+    assert out is None
+    assert calls == ['https://fb.watch/ABC123/']
+    assert response.closed
+
+
+def test_facebook_chrome_fallback_rejects_unsafe_facebook_redirect():
+    response = _FakeCurlRedirect(
+        302, 'https://www.facebook.com/reel/123456/')
+    safe_results = iter((True, False))
+
+    with patch.object(link_resolvers, 'is_safe_url',
+                      side_effect=lambda _url: next(safe_results)):
+        out = link_resolvers._fb_expand_with_impersonation(
+            'https://www.facebook.com/share/v/ABC123/',
+            request_get=lambda *_a, **_k: response)
+
+    assert out is None
+    assert response.closed
+
+
+def test_facebook_chrome_fallback_has_bounded_redirects():
+    calls = []
+    responses = []
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        response = _FakeCurlRedirect(302, f'/share/v/NEXT{len(calls)}/')
+        responses.append(response)
+        return response
+
+    with patch.object(link_resolvers, 'is_safe_url', return_value=True):
+        out = link_resolvers._fb_expand_with_impersonation(
+            'https://www.facebook.com/share/v/START/', request_get=fake_get)
+
+    assert out is None
+    assert len(calls) == link_resolvers._FB_MAX_REDIRECT_REQUESTS
+    assert all(r.closed for r in responses)
+
+
+def test_facebook_chrome_fallback_never_logs_raw_url(caplog):
+    secret = 'https://www.facebook.com/share/v/PRIVATE_TOKEN/'
+
+    def failing_get(*_args, **_kwargs):
+        raise OSError(f'failed while requesting {secret}')
+
+    with patch.object(link_resolvers, 'is_safe_url', return_value=True), \
+            caplog.at_level('INFO', logger='link_resolvers'):
+        out = link_resolvers._fb_expand_with_impersonation(
+            secret, request_get=failing_get)
+
+    assert out is None
+    assert secret not in caplog.text
 
 
 def test_facebook_non_share_links_untouched():
@@ -842,7 +1019,10 @@ def test_facebook_story_detected_even_behind_login():
 
 
 def test_facebook_share_survives_network_failure():
-    with patch('urllib.request.urlopen', side_effect=OSError('400')):
+    with patch.object(link_resolvers, '_fb_expand_with_urllib',
+                      return_value=None), \
+            patch.object(link_resolvers, '_fb_expand_with_impersonation',
+                         return_value=None):
         u = 'https://www.facebook.com/share/ABC/'
         assert link_resolvers.resolve_facebook_share(u) == u
 

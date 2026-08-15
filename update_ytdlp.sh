@@ -75,27 +75,50 @@ run_py() {
 }
 
 PKGS="${PKGS:-yt-dlp gallery-dl curl_cffi}"
+# yt-dlp 2026.07.04 يدعم curl_cffi حتى سلسلة 0.15.x. إبقاء القيد منفصلاً
+# عن PKGS مهم: عناصر PKGS أسماء حزم صافية تُستخدم في pip show وتقارير الإصدارات،
+# بينما هذا المتطلب خاص بعملية التثبيت ويمنع المحدث من جلب 0.16 غير المتوافق.
+CURL_CFFI_REQUIREMENT="curl_cffi<0.16"
+read -r -a PKG_ARGS <<< "$PKGS"
+# القيد قد يخفّض إصدار curl_cffi حتى لو استُبعد اسمه من PKGS المخصّصة؛ أضفه
+# لقائمة القياس أيضاً كي يُكتشف التغيير وتتم إعادة التشغيل ويظهر في الإشعار.
+CURL_CFFI_REPORTED=0
+for package in "${PKG_ARGS[@]}"; do
+    if [ "$package" = "curl_cffi" ] || [ "$package" = "curl-cffi" ]; then
+        CURL_CFFI_REPORTED=1
+        break
+    fi
+done
+if [ "$CURL_CFFI_REPORTED" = "0" ]; then
+    PKG_ARGS+=("curl_cffi")
+fi
+INSTALL_ARGS=()
+for package in "${PKG_ARGS[@]}"; do
+    if [ "$package" = "curl_cffi" ] || [ "$package" = "curl-cffi" ]; then
+        INSTALL_ARGS+=("$CURL_CFFI_REQUIREMENT")
+    else
+        INSTALL_ARGS+=("$package")
+    fi
+done
 
 ver() { run_py -m pip show "$1" 2>/dev/null | awk '/^Version:/{print $2}'; }
 
 pip_upgrade() {
-    # shellcheck disable=SC2086
-    OUT="$(run_py -m pip install -U $PKGS 2>&1)" && return 0
+    OUT="$(run_py -m pip install -U "${INSTALL_ARGS[@]}" 2>&1)" && return 0
     # بايثون النظام في Debian يمنع pip افتراضياً (PEP 668) — تجاوز المنع
     if echo "$OUT" | grep -q 'externally-managed-environment'; then
-        # shellcheck disable=SC2086
-        OUT="$(run_py -m pip install -U $PKGS --break-system-packages 2>&1)" && return 0
+        OUT="$(run_py -m pip install -U "${INSTALL_ARGS[@]}" --break-system-packages 2>&1)" && return 0
     fi
     return 1
 }
 
 echo "===== $(date '+%F %T') فحص تحديث المكتبات [$PKGS] (python: $PY, user: $RUN_USER) ====="
 declare -A OLDV
-for p in $PKGS; do OLDV[$p]="$(ver "$p")"; done
+for p in "${PKG_ARGS[@]}"; do OLDV[$p]="$(ver "$p")"; done
 
 if pip_upgrade; then
     CHANGES=""
-    for p in $PKGS; do
+    for p in "${PKG_ARGS[@]}"; do
         NEWP="$(ver "$p")"
         if [ -n "$NEWP" ] && [ "${OLDV[$p]}" != "$NEWP" ]; then
             CHANGES="${CHANGES}${p}: ${OLDV[$p]:-?} ← ${NEWP}

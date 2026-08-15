@@ -729,6 +729,22 @@ def resolve_instagram_media(url: str, timeout: int = 20):
 # ═══════════════════════════════════════════════════════════════
 _FB_SHARE_RE = re.compile(r'/share(?:/[a-z])?/[A-Za-z0-9_-]+', re.I)
 _FB_STORY_RE = re.compile(r'/stories/\d+', re.I)
+_FB_REEL_ID_RE = re.compile(r'/reel/(\d+)(?:/|$)', re.I)
+_FB_VIDEO_ID_RE = re.compile(r'/videos/(\d+)(?:/|$)', re.I)
+_FB_REDIRECT_STATUSES = frozenset((301, 302, 303, 307, 308))
+_FB_MAX_REDIRECT_REQUESTS = 5
+
+
+def _is_facebook_platform_url(url: str) -> bool:
+    """هل الرابط على نطاق فيسبوك المسموح لتوسيع روابط المشاركة؟"""
+    try:
+        p = urlparse(url or '')
+    except Exception:
+        return False
+    host = (p.hostname or '').lower()
+    return (p.scheme in ('http', 'https')
+            and (host == 'facebook.com' or host.endswith('.facebook.com')
+                 or host == 'fb.watch'))
 
 
 def _fb_unwrap_login(url: str) -> str:
@@ -746,6 +762,160 @@ def _fb_unwrap_login(url: str) -> str:
     return url
 
 
+def facebook_video_id(url: str):
+    """يعيد معرّف فيديو Facebook الصريح من الرابط، أو ``None``.
+
+    نستخدمه لمطابقة نتيجة المستخرج مع الهدف قبل تنزيل أي ملف، لأن صفحة جلسة
+    Facebook قد تحقن فيديوًا مقترحًا لا علاقة له بالرابط المطلوب.
+    """
+    from urllib.parse import parse_qs
+    try:
+        parsed = urlparse(_fb_unwrap_login(url or ''))
+    except Exception:
+        return None
+    if not _is_facebook_platform_url(parsed.geturl()):
+        return None
+    match = _FB_REEL_ID_RE.search(parsed.path or '')
+    if not match:
+        match = _FB_VIDEO_ID_RE.search(parsed.path or '')
+    if match:
+        return match.group(1)
+    video_id = (parse_qs(parsed.query or '').get('v') or [None])[0]
+    return video_id if video_id and str(video_id).isdigit() else None
+
+
+def _fb_expand_with_impersonation(url: str, timeout: int = 20,
+                                  request_get=None):
+    """يوسّع رابط المشاركة بطلبات تحويل يدوية ومحاكاة Chrome 99.
+
+    هذا مسار احتياطي حين يرفض فيسبوك ``urllib``. لا تُنشأ جلسة ولا تُمرّر
+    كوكيز، وكل وجهة قبل طلبها يجب أن تبقى على نطاق فيسبوك المسموح وأن تنجح
+    في فحص SSRF. ``request_get`` مخصّص لحقن عميل وهمي في الاختبارات.
+    """
+    from urllib.parse import urljoin
+
+    if not _is_facebook_platform_url(url) or not is_safe_url(url):
+        return None
+    if request_get is None:
+        try:
+            from curl_cffi import requests as curl_requests
+        except (ImportError, ModuleNotFoundError):
+            return None
+        request_get = curl_requests.get
+
+    current = url
+    redirected = False
+    for _ in range(_FB_MAX_REDIRECT_REQUESTS):
+        try:
+            response = request_get(
+                current,
+                impersonate='chrome99',
+                allow_redirects=False,
+                cookies={},
+                timeout=timeout,
+            )
+        except Exception as e:
+            logger.info("ℹ️ تعذّر توسيع رابط فيسبوك عبر Chrome 99 (%s)",
+                        type(e).__name__)
+            return None
+
+        try:
+            status = int(getattr(response, 'status_code', 0) or 0)
+            headers = getattr(response, 'headers', {}) or {}
+            location = headers.get('Location') or headers.get('location')
+        finally:
+            close = getattr(response, 'close', None)
+            if close:
+                close()
+
+        if status not in _FB_REDIRECT_STATUSES:
+            return current if redirected else None
+        if not location:
+            return None
+
+        candidate = _fb_unwrap_login(urljoin(current, location))
+        if (candidate == current
+                or not _is_facebook_platform_url(candidate)
+                or not is_safe_url(candidate)):
+            logger.info("ℹ️ رُفضت وجهة تحويل غير آمنة لرابط فيسبوك")
+            return None
+        current = candidate
+        redirected = True
+
+    logger.info("ℹ️ تجاوز رابط فيسبوك الحد الآمن لعدد التحويلات")
+    return None
+
+
+def _fb_expand_with_urllib(url: str, timeout: int = 20, request_open=None):
+    """يوسّع التحويلات التقليدية دون السماح لـurllib باتباعها تلقائيًا.
+
+    فحص الوجهة بعد ``urlopen`` الافتراضي متأخر، لأن المكتبة تكون قد طلبت
+    Location بالفعل. لذلك نعطّل المتابعة، ونفحص النطاق وSSRF قبل كل طلب.
+    ``request_open`` مخصّص للاختبارات فقط ويعيد استجابة HTTP بلا متابعة.
+    """
+    import urllib.error
+    import urllib.request
+    from urllib.parse import urljoin
+
+    if not _is_facebook_platform_url(url) or not is_safe_url(url):
+        return None
+
+    if request_open is None:
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        opener = urllib.request.build_opener(_NoRedirect())
+
+        def request_open(req, timeout):
+            try:
+                return opener.open(req, timeout=timeout)
+            except urllib.error.HTTPError as error:
+                # عند تعطيل المتابعة، تمثل HTTPError نفسها استجابة 30x وتحمل
+                # الرؤوس المطلوبة. غير ذلك سيُنهي المحاولة بأمان أدناه.
+                return error
+
+    for ua in (_BOT_UA, _BROWSER_UA):
+        current = url
+        redirected = False
+        for _ in range(_FB_MAX_REDIRECT_REQUESTS):
+            try:
+                req = urllib.request.Request(current, headers={'User-Agent': ua})
+                response = request_open(req, timeout)
+            except Exception as e:
+                logger.info(
+                    "ℹ️ تعذّر توسيع رابط فيسبوك بالطريقة التقليدية (%s)",
+                    type(e).__name__)
+                break
+
+            try:
+                status = int(getattr(response, 'status', None)
+                             or getattr(response, 'code', 0) or 0)
+                headers = getattr(response, 'headers', {}) or {}
+                location = headers.get('Location') or headers.get('location')
+            finally:
+                close = getattr(response, 'close', None)
+                if close:
+                    close()
+
+            if status not in _FB_REDIRECT_STATUSES:
+                if redirected:
+                    return current
+                break
+            if not location:
+                break
+
+            candidate = _fb_unwrap_login(urljoin(current, location))
+            if (candidate == current
+                    or not _is_facebook_platform_url(candidate)
+                    or not is_safe_url(candidate)):
+                logger.info("ℹ️ رُفضت وجهة تحويل غير آمنة لرابط فيسبوك")
+                return None
+            current = candidate
+            redirected = True
+    return None
+
+
 def is_facebook_story(url: str) -> bool:
     """هل الرابط ستوري فيسبوك؟ (يتطلّب تسجيل دخول — لا يعمل بلا كوكيز)."""
     low = (url or '').lower()
@@ -759,29 +929,24 @@ def resolve_facebook_share(url: str, timeout: int = 20) -> str:
 
     يتبع التحويل ثم يفكّ غلاف صفحة الدخول إن وُجد. يعيد الرابط الأصلي كما هو
     لغير روابط فيسبوك أو للروابط الأساسية أصلاً أو عند أي فشل."""
-    import urllib.request
     low = (url or '').lower()
     if not any(m in low for m in PLATFORM_URL_MARKERS['facebook']):
+        return url
+    if not _is_facebook_platform_url(url):
         return url
     # الروابط الأساسية لا تحتاج توسيعاً (نتفادى طلباً شبكياً بلا فائدة)
     if not (_FB_SHARE_RE.search(url or '') or 'fb.watch' in low):
         return url
-    # وكيل البوت أولاً: فيسبوك يردّ 400 لوكيل المتصفح على روابط المشاركة،
-    # بينما يعطي التحويل الصحيح لوكلاء معاينة الروابط (محقَّق ميدانياً)
-    final = None
-    for ua in (_BOT_UA, _BROWSER_UA):
-        try:
-            req = urllib.request.Request(url, headers={'User-Agent': ua})
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                final = r.geturl() or url
-            break
-        except Exception as e:
-            logger.info(f"ℹ️ توسيع رابط فيسبوك تعذّر بـ{ua[:24]}: {e}")
-    if not final:
-        return url
-    final = _fb_unwrap_login(final)
-    if final and final != url and is_safe_url(final):
-        logger.info(f"🎯 فيسبوك: رابط المشاركة وُسّع إلى {final[:100]}")
+    # وكيل البوت أولاً، لكن بمتابعة يدوية: لا نطلب أي Location قبل التحقق
+    # أنه ما زال نطاق Facebook عاماً وآمناً.
+    final = _fb_expand_with_urllib(url, timeout)
+    if (final and final != url and _is_facebook_platform_url(final)
+            and is_safe_url(final)):
+        logger.info("🎯 فيسبوك: وُسّع رابط المشاركة بنجاح")
+        return final
+    final = _fb_expand_with_impersonation(url, timeout)
+    if (final and _is_facebook_platform_url(final) and is_safe_url(final)):
+        logger.info("🎯 فيسبوك: وُسّع رابط المشاركة عبر Chrome 99")
         return final
     return url
 

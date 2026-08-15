@@ -10,6 +10,12 @@
 from url_utils import PLATFORM_URL_MARKERS
 
 
+# عملاء يوتيوب البدلاء عند انتهاء/حجب رابط الصيغة بخطأ 403. نبقي القائمة
+# هنا مع خطة إعادة المحاولة حتى تستخدمها كل نقاط الفشل (بما فيها المحاولة
+# الثانية بلا كوكيز) بنفس الترتيب.
+YOUTUBE_403_FALLBACK_CLIENTS = ('tv', 'ios', 'web_safari', 'mweb', 'android')
+
+
 def _is_drm_error(err):
     """هل الفيديو محمي بـ DRM (لا يمكن تحميله إطلاقاً)؟"""
     return 'drm' in str(err).lower()
@@ -47,6 +53,37 @@ def _is_http_403_error(err):
     return '403' in msg and ('forbidden' in msg or 'download video data' in msg)
 
 
+def _is_format_unavailable_error(err):
+    """هل أخفق محدد الصيغة الصارم لأن الصيغة المطلوبة غير متاحة؟"""
+    msg = str(err).lower()
+    return 'requested format is not available' in msg or 'no video formats' in msg
+
+
+def _youtube_retry_options(err, fallback_format):
+    """يعيد محاولات يوتيوب التالية كخيارات ``download`` مرتبة.
+
+    خطأ 403 يحتاج أولاً إعادة استخراج بعملاء مشغّل آخرين للحصول على روابط
+    جديدة، ثم نفس العملاء مع صيغة متساهلة. أما غياب الصيغة وحده فيحتاج
+    المحاولة المتساهلة بلا كوكيز. إرجاع الخطة كبيانات نقية يجعل المسار قابلاً
+    للاختبار ويمنع اختلاف معالجة الخطأ بين المحاولة الأولى والثانية.
+    """
+    if _is_http_403_error(err):
+        return (
+            {
+                'use_cookies': False,
+                'yt_clients': YOUTUBE_403_FALLBACK_CLIENTS,
+            },
+            {
+                'use_cookies': False,
+                'fmt': fallback_format,
+                'yt_clients': YOUTUBE_403_FALLBACK_CLIENTS,
+            },
+        )
+    if _is_format_unavailable_error(err):
+        return ({'use_cookies': False, 'fmt': fallback_format},)
+    return ()
+
+
 def _is_youtube_cookie_issue(err):
     """هل خطأ يوتيوب ناتج عن حجب الصيغ بسبب الكوكيز/الحماية؟"""
     msg = str(err).lower()
@@ -70,6 +107,56 @@ def _is_facebook_cookie_issue(err):
     """
     msg = str(err).lower()
     return 'cannot parse data' in msg
+
+
+def _is_facebook_retryable_error(err):
+    """هل الفشل حدث أثناء استخراج Facebook قبل بدء تنزيل الوسائط؟
+
+    لا نبدّل الجلسة بعد أخطاء القرص/FFmpeg/الكتابة أو تنزيل بيانات الفيديو؛
+    إعادة تلك الحالات بأربع بصمات قد تكرر ملفًا كبيرًا ولا تعالج السبب المحلي.
+    """
+    msg = str(err).lower()
+    local_or_media_failures = (
+        'no space left', 'disk full', 'permission denied', 'read-only file',
+        'ffmpeg', 'ffprobe', 'postprocessing', 'post-processing',
+        'unable to download video data', 'unable to download audio data',
+        'broken pipe',
+    )
+    if any(marker in msg for marker in local_or_media_failures):
+        return False
+    extraction_failures = (
+        'cannot parse data',
+        'facebook media identity mismatch',
+        'facebook target identity unavailable',
+        'login required',
+        'log in to',
+        'sign in to',
+        'cookies are needed',
+        'only available for registered users',
+        'unable to extract',
+        'unable to download webpage',
+        'requested format is not available',
+        'no video formats',
+    )
+    return any(marker in msg for marker in extraction_failures)
+
+
+def _facebook_retry_options(has_cookiefile, impersonation_target=None):
+    """يعيد أوضاع فيسبوك الفريدة بالترتيب من الأقل تدخلاً للأخير.
+
+    نعطّل جلسة Facebook عمدًا: extractor القديم قد يربط معرّف URL ببيانات
+    فيديو feed/إعلان محقونة داخل الصفحة المسجّلة، فلا تكفي مطابقة ``info.id``
+    لإثبات الهوية. البوت يرفض الستوري قبل هذا المسار أصلًا، لذا تبقى محاولتا
+    المحتوى العام فقط: عادية ثم ببصمة Chrome.
+    """
+    del has_cookiefile  # محفوظ في التوقيع للتوافق، لكنه غير مستخدم أمنيًا.
+    attempts = [{'use_cookies': False}]
+    if impersonation_target is not None:
+        attempts.append({
+            'use_cookies': False,
+            'impersonate': impersonation_target,
+        })
+    return tuple(attempts)
 
 
 def _is_cookie_file_issue(err):

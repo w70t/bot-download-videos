@@ -68,7 +68,8 @@ from link_resolvers import (
     _is_music_link, resolve_music_link,
     resolve_instagram_media, instagram_mirror_lookup, resolve_tiktok_media,
     resolve_threads_media, threads_mirror_lookup,
-    resolve_facebook_share, is_facebook_story, is_instagram_story,
+    resolve_facebook_share, facebook_video_id, is_facebook_story,
+    is_instagram_story,
     _instagram_story_path, instagram_highlight_id, instagram_highlight_items,
     twitter_mirror_lookup, twitter_mirror_media,
     resolve_tiktok_images, tiktok_source_analysis,
@@ -95,18 +96,14 @@ from video_quality import (
 )
 from download_errors import (
     _is_drm_error, _is_geo_restricted_error, _is_youtube_cookie_issue,
-    _is_facebook_cookie_issue, _is_cookie_file_issue, _is_restricted_content_error,
+    _is_cookie_file_issue, _is_restricted_content_error, _is_http_403_error,
+    _is_format_unavailable_error,
 )
-# ملاحظة نشر: بعض عمليات التحديث تزامن bot.py فقط دون download_errors.py،
-# لذا نستورد المصنّفات الأحدث دفاعياً مع بديل محلي إن كان الملف قديماً — حتى
-# لا يفشل إقلاع البوت باستيراد دالة غير موجودة.
-try:
-    from download_errors import _is_http_403_error
-except ImportError:
-    def _is_http_403_error(err):
-        """بديل محلي: خطأ HTTP 403 Forbidden أثناء تنزيل بيانات الفيديو."""
-        msg = str(err).lower()
-        return '403' in msg and ('forbidden' in msg or 'download video data' in msg)
+from download_retries import (
+    ensure_facebook_identity, facebook_identity_match_filter,
+    run_facebook_retries, run_youtube_retries as execute_youtube_retries,
+)
+from ytdlp_compat import chrome_impersonation_target
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1353,6 +1350,7 @@ async def get_video_info(url: str):
         is_youtube = any(m in url.lower() for m in PLATFORM_URL_MARKERS['youtube'])
         is_facebook = any(m in url.lower() for m in PLATFORM_URL_MARKERS['facebook'])
         is_instagram = any(m in url.lower() for m in PLATFORM_URL_MARKERS['instagram'])
+        facebook_expected_id = facebook_video_id(url) if is_facebook else None
 
         ydl_opts = {
             'quiet': True,
@@ -1373,46 +1371,62 @@ async def get_video_info(url: str):
         }
 
         # استخدام cookies المنصة للتعرف على الفيديو (يشمل الستوري الذي يتطلب تسجيل دخول)
-        if cookie_file:
+        if cookie_file and not is_facebook:
             ydl_opts['cookiefile'] = cookie_file
             logger.info(f"🍪 Using cookies for video info extraction: {cookie_file}")
 
         # ليوتيوب: جرّب عملاء متعددين + السماح بالصيغ المحجوبة لتفادي حجب الصيغ (PO token)
         if is_youtube:
             ydl_opts['extractor_args'] = _youtube_extractor_args()
+        if facebook_expected_id:
+            # yt-dlp يطبق المرشح قبل تنزيل الوسائط؛ هنا يفيد أيضاً في مسار
+            # المعاينة ويمنع قبول فيديو feed/إعلان حقنته جلسة Facebook.
+            ydl_opts['match_filter'] = facebook_identity_match_filter(
+                facebook_expected_id)
 
         loop = asyncio.get_event_loop()
 
-        def extract(use_cookies=True):
+        def extract(use_cookies=True, impersonate=None):
             o = dict(ydl_opts)
             if not use_cookies:
                 o.pop('cookiefile', None)
+            if impersonate is not None:
+                o['impersonate'] = impersonate
+                # دع backend المحاكاة يختار رؤوساً متناسقة مع بصمة Chrome.
+                o.pop('http_headers', None)
             with yt_dlp.YoutubeDL(o) as ydl:
-                return ydl.extract_info(url, download=False)
+                info = ydl.extract_info(url, download=False)
+                if is_facebook:
+                    ensure_facebook_identity(info, facebook_expected_id)
+                return info
+
+        async def extract_async(**options):
+            return await loop.run_in_executor(
+                None, lambda opts=options: extract(**opts))
+
+        def log_facebook_attempt(options):
+            if options.get('impersonate') is not None:
+                logger.warning(
+                    "⚠️ فشل فيسبوك العام، إعادة المحاولة بمحاكاة Chrome...")
 
         try:
-            if is_facebook and cookie_file:
-                # كوكيز تسجيل الدخول تجعل فيسبوك يحقن فيديو إعلان بدل الفيديو
-                # المطلوب أحياناً → جرّب بدون كوكيز أولاً (يكفي للمحتوى العام
-                # وبدون دخول لا إعلانات)، وعند الفشل (ستوري/محتوى يتطلب
-                # تسجيل دخول) أعد المحاولة بالكوكيز.
-                try:
-                    return await loop.run_in_executor(None, lambda: extract(False))
-                except Exception:
-                    logger.warning("⚠️ فشل فيسبوك بدون كوكيز، إعادة المحاولة بالكوكيز...")
-                    return await loop.run_in_executor(None, lambda: extract(True))
+            if is_facebook:
+                # Facebook العام فقط: بلا جلسة، ثم ببصمة Chrome. لا نستخدم
+                # الكوكيز كي لا نقبل فيديو feed/إعلانًا محقونًا في الصفحة.
+                return await run_facebook_retries(
+                    extract_async,
+                    has_cookiefile=False,
+                    impersonation_target=chrome_impersonation_target(),
+                    on_attempt=log_facebook_attempt,
+                )
             return await loop.run_in_executor(None, lambda: extract(True))
         except Exception as e:
             # يوتيوب مع الكوكيز قد يفشل بسبب حجب الصيغ → أعد المحاولة بدون كوكيز
             if cookie_file and is_youtube and _is_youtube_cookie_issue(e):
                 logger.warning("⚠️ فشل يوتيوب مع الكوكيز، إعادة المحاولة بدون كوكيز...")
                 return await loop.run_in_executor(None, lambda: extract(False))
-            # فيسبوك بكوكيز فاسدة قد يكسر استخراج المحتوى العام → أعد المحاولة بدون كوكيز
-            if cookie_file and is_facebook and _is_facebook_cookie_issue(e):
-                logger.warning("⚠️ فشل فيسبوك مع الكوكيز (Cannot parse data)، إعادة المحاولة بدون كوكيز...")
-                return await loop.run_in_executor(None, lambda: extract(False))
             # ملف كوكيز تالف (صيغة غير صحيحة) يفشل لأي منصة → أعد المحاولة بدون كوكيز
-            if cookie_file and _is_cookie_file_issue(e):
+            if cookie_file and not is_facebook and _is_cookie_file_issue(e):
                 logger.warning(f"⚠️ ملف الكوكيز تالف/غير صالح ({cookie_file})، إعادة المحاولة بدون كوكيز...")
                 return await loop.run_in_executor(None, lambda: extract(False))
             # إنستغرام: كوكيز منتهية/خارج الحساب تُرجع 404 لمنشور عام يعمل بلا كوكيز
@@ -3746,6 +3760,10 @@ async def download_and_upload(client, message, url, quality, callback_query=None
 
         # تحسين إعدادات التحميل للسرعة والاستقرار
         logger.info("🚀 Using optimized download settings for better performance")
+        is_facebook_url = any(
+            marker in url.lower() for marker in PLATFORM_URL_MARKERS['facebook'])
+        facebook_expected_id = (
+            facebook_video_id(url) if is_facebook_url else None)
         
         ydl_opts = {
             'format': format_selector(quality),
@@ -3784,15 +3802,19 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             ydl_opts['format_sort'] = _fsort
             logger.info(f"🏆 أعلى جودة متاحة (بلا سقف دقة) للمستخدم {user_id}")
 
-        # اختيار ملف cookies المطابق لمنصة الرابط (ضروري لستوري فيسبوك/إنستغرام)
+        # اختيار ملف cookies المطابق للمنصة. Facebook مستثنى أدناه عمدًا:
+        # الستوري مرفوض مبكرًا والصفحات المسجّلة قد تحقن فيديو feed مختلفًا.
         cookie_file = get_cookie_file_for_url(url)
-        if cookie_file:
+        if cookie_file and not is_facebook_url:
             ydl_opts['cookiefile'] = cookie_file
             logger.info(f"🍪 استخدام cookies للتحميل: {cookie_file}")
 
         # ليوتيوب: جرّب عملاء متعددين + السماح بالصيغ المحجوبة لتفادي حجب الصيغ (PO token)
         if any(m in url.lower() for m in PLATFORM_URL_MARKERS['youtube']):
             ydl_opts['extractor_args'] = _youtube_extractor_args()
+        if facebook_expected_id:
+            ydl_opts['match_filter'] = facebook_identity_match_filter(
+                facebook_expected_id)
 
         # للملفات الصوتية: تحويل إلى MP3 فقط إذا لم يكن MP3 بالفعل
         if is_audio:
@@ -3812,7 +3834,6 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         await status_msg.edit_text(t('start_downloading', lang))
         
         is_youtube_url = any(m in url.lower() for m in PLATFORM_URL_MARKERS['youtube'])
-        is_facebook_url = any(m in url.lower() for m in PLATFORM_URL_MARKERS['facebook'])
         is_instagram_url = _platform_of(url) == 'instagram'
         is_tiktok_url = _platform_of(url) == 'tiktok'
         is_pinterest_url = _platform_of(url) == 'pinterest'
@@ -3820,7 +3841,8 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         # بيانات ثريدز من المرآة (عنوان/تفاعلات/مدّة) تُملأ عند التحميل منها
         _threads_meta = {}
 
-        def download(use_cookies=True, fmt=None, url_override=None, yt_clients=None):
+        def download(use_cookies=True, fmt=None, url_override=None, yt_clients=None,
+                     impersonate=None):
             o = dict(ydl_opts)
             if fmt:
                 o['format'] = fmt
@@ -3832,57 +3854,74 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                     'youtube': {'player_client': list(yt_clients),
                                 'formats': ['missing_pot']}
                 }
+            if impersonate is not None:
+                o['impersonate'] = impersonate
+                o.pop('http_headers', None)
             with yt_dlp.YoutubeDL(o) as ydl:
                 info = ydl.extract_info(url_override or url, download=True)
+                if is_facebook_url:
+                    ensure_facebook_identity(info, facebook_expected_id)
                 return info, ydl.prepare_filename(info)
-
-        # عملاء مشغّل بديلون ليوتيوب عند خطأ 403 (روابط صيغ محظورة/منتهية):
-        # إعادة الاستخراج بهؤلاء تعطي روابط تنزيل جديدة غير محظورة.
-        YT_403_FALLBACK_CLIENTS = ['tv', 'ios', 'web_safari', 'mweb', 'android']
 
         # صيغة متساهلة احتياطية عند فشل المُحدّد الصارم (بلا فلترة ترميز/امتداد)
         fallback_fmt = 'bestaudio/best' if is_audio else 'bv*+ba/b/best'
 
+        async def download_async(**options):
+            return await loop.run_in_executor(
+                None, lambda opts=options: download(**opts))
+
+        def log_youtube_attempt(options):
+            if options.get('yt_clients') and options.get('fmt'):
+                logger.warning(
+                    "⚠️ استمرار فشل يوتيوب 403، إعادة المحاولة بأفضل صيغة متاحة")
+            elif options.get('yt_clients'):
+                logger.warning(
+                    "⚠️ فشل تحميل يوتيوب بخطأ 403، إعادة المحاولة "
+                    "بعملاء مشغّل بدلاء...")
+            else:
+                logger.warning(
+                    "⚠️ الصيغة غير متوفرة، إعادة المحاولة بأفضل "
+                    "صيغة متاحة (بلا كوكيز)")
+
+        def log_facebook_download_attempt(options):
+            if options.get('impersonate') is not None:
+                logger.warning(
+                    "⚠️ فشل تحميل فيسبوك العام، إعادة المحاولة بمحاكاة Chrome...")
+
         try:
-            if ydl_opts.get('cookiefile') and is_facebook_url:
-                # فيسبوك مع كوكيز الدخول قد يحمّل فيديو إعلان محقون بدل
-                # المطلوب → بدون كوكيز أولاً، وبالكوكيز عند الفشل (ستوري/خاص)
-                try:
-                    info, file_path = await loop.run_in_executor(None, lambda: download(False))
-                except Exception:
-                    logger.warning("⚠️ فشل تحميل فيسبوك بدون كوكيز، إعادة المحاولة بالكوكيز...")
-                    info, file_path = await loop.run_in_executor(None, lambda: download(True))
+            if is_facebook_url:
+                info, file_path = await run_facebook_retries(
+                    download_async,
+                    has_cookiefile=False,
+                    impersonation_target=chrome_impersonation_target(),
+                    on_attempt=log_facebook_download_attempt,
+                )
             else:
                 info, file_path = await loop.run_in_executor(None, lambda: download(True))
         except Exception as dl_err:
             msg = str(dl_err).lower()
+            # كل أوضاع فيسبوك الفريدة نُفذت أعلاه، وآخرها محاكاة Chrome إن
+            # كانت متاحة. لا تعِد محاولة بلا كوكيز بعد ذلك.
+            if is_facebook_url:
+                raise
             # يوتيوب مع الكوكيز قد يفشل بسبب حجب الصيغ → أعد المحاولة بدون كوكيز
-            if ydl_opts.get('cookiefile') and is_youtube_url and _is_youtube_cookie_issue(dl_err):
+            elif ydl_opts.get('cookiefile') and is_youtube_url and _is_youtube_cookie_issue(dl_err):
                 logger.warning("⚠️ فشل تحميل يوتيوب مع الكوكيز، إعادة المحاولة بدون كوكيز...")
                 try:
                     info, file_path = await loop.run_in_executor(None, lambda: download(False))
                 except Exception as e2:
-                    if 'requested format is not available' in str(e2).lower() or 'no video formats' in str(e2).lower():
-                        logger.warning("⚠️ الصيغة غير متوفرة، إعادة المحاولة بأفضل صيغة متاحة (بلا كوكيز)")
-                        info, file_path = await loop.run_in_executor(None, lambda: download(False, fallback_fmt))
-                    else:
-                        raise
+                    # يشمل 403 الذي قد لا يظهر إلا في المحاولة الثانية بلا كوكيز.
+                    info, file_path = await execute_youtube_retries(
+                        download_async, e2, fallback_fmt,
+                        on_attempt=log_youtube_attempt)
             # يوتيوب: خطأ 403 عند تنزيل بيانات الفيديو = روابط صيغ محظورة/منتهية
             # لعميل المشغّل الحالي → أعد الاستخراج بعملاء بدلاء (روابط جديدة) وبلا كوكيز
-            elif is_youtube_url and _is_http_403_error(dl_err):
-                logger.warning("⚠️ فشل تحميل يوتيوب بخطأ 403، إعادة المحاولة بعملاء مشغّل بدلاء...")
-                try:
-                    info, file_path = await loop.run_in_executor(
-                        None, lambda: download(False, yt_clients=YT_403_FALLBACK_CLIENTS))
-                except Exception:
-                    logger.warning("⚠️ استمرار فشل يوتيوب 403، إعادة المحاولة بأفضل صيغة متاحة")
-                    info, file_path = await loop.run_in_executor(
-                        None, lambda: download(False, fallback_fmt,
-                                               yt_clients=YT_403_FALLBACK_CLIENTS))
-            # فيسبوك بكوكيز فاسدة قد يكسر تحميل المحتوى العام → أعد المحاولة بدون كوكيز
-            elif ydl_opts.get('cookiefile') and is_facebook_url and _is_facebook_cookie_issue(dl_err):
-                logger.warning("⚠️ فشل تحميل فيسبوك مع الكوكيز (Cannot parse data)، إعادة المحاولة بدون كوكيز...")
-                info, file_path = await loop.run_in_executor(None, lambda: download(False))
+            elif is_youtube_url and (
+                    _is_http_403_error(dl_err)
+                    or _is_format_unavailable_error(dl_err)):
+                info, file_path = await execute_youtube_retries(
+                    download_async, dl_err, fallback_fmt,
+                    on_attempt=log_youtube_attempt)
             # ملف كوكيز تالف (صيغة غير صحيحة) يفشل لأي منصة → أعد المحاولة بدون كوكيز
             elif ydl_opts.get('cookiefile') and _is_cookie_file_issue(dl_err):
                 logger.warning(f"⚠️ ملف الكوكيز تالف/غير صالح ({ydl_opts.get('cookiefile')})، إعادة المحاولة بدون كوكيز...")
@@ -5619,7 +5658,7 @@ def _error_category(msg: str):
     """يصنّف رسالة الخطأ إلى نوع مختصر + تلميح للسبب الجذري (أو None)."""
     low = (msg or '').lower()
     if 'cannot parse data' in low:
-        return 'Cannot parse data', 'ثبّت curl_cffi وحدّث كوكيز فيسبوك'
+        return 'Cannot parse data', 'خلل استخراج معروف من فيسبوك؛ أعد المحاولة لاحقاً'
     if 'no video formats' in low or 'failed to extract video info' in low:
         return 'لا صيغة فيديو / فشل الاستخراج', 'قد يكون منشور صور أو خاص أو منصة غير مدعومة'
     if any(k in low for k in ('sign in', 'log in', 'login required', 'private', 'rate-limit', 'rate limit', 'cookies')):
@@ -6541,6 +6580,22 @@ async def handle_url(client, message):
         await message.reply_text(t('invalid_url', lang))
         return
 
+    # 📢 افحص الصلاحية وحدّ التكرار قبل أي resolver شبكي. بعض روابط المشاركة
+    # تحتاج عدة تحويلات خارجية؛ تنفيذها أولاً يسمح للمستخدم المرفوض أو المكرر
+    # باستهلاك اتصالات الـexecutor دون أن يصل أصلًا إلى مرحلة التحميل.
+    if await enforce_forced_subscription(client, message, user_id, lang):
+        return
+
+    is_limited, seconds_remaining = queue_manager.is_rate_limited(user_id)
+    if is_limited:
+        await message.reply_text(
+            t('queue_rate_limit', lang, seconds=int(seconds_remaining) + 1)
+        )
+        return
+
+    # احجز نافذة الطلب قبل حل الرابط كي تغطي كلفة التحويل/الاستخراج الأولي.
+    queue_manager.mark_request(user_id)
+
     # 📘 فيسبوك: زرّ المشاركة يعطي «/share/<code>/» ولا مستخرِج له في yt-dlp،
     #    وفيسبوك كثيراً ما يلفّ الوجهة بصفحة الدخول فيصل yt-dlp إلى login.php
     #    ويردّ «Unsupported URL». نوسّع الرابط ونفكّ الغلاف ليصل الرابط الأساسي.
@@ -6598,21 +6653,6 @@ async def handle_url(client, message):
         await _mmsg.delete()
         url = _yt
 
-    # 📢 الاشتراك الإجباري بالقنوات قبل أي تحميل (تحقق حقيقي)
-    if await enforce_forced_subscription(client, message, user_id, lang):
-        return
-
-    # Check rate limiting
-    is_limited, seconds_remaining = queue_manager.is_rate_limited(user_id)
-    if is_limited:
-        await message.reply_text(
-            t('queue_rate_limit', lang, seconds=int(seconds_remaining) + 1)
-        )
-        return
-    
-    # Mark request time immediately for rate limiting (even during quality selection)
-    queue_manager.mark_request(user_id)
-    
     # Check if user already has downloads in queue
     queue_size = queue_manager.get_queue_size(user_id)
     is_processing = queue_manager.is_processing(user_id)
