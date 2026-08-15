@@ -973,6 +973,199 @@ def get_download_stats():
     }
 
 
+def get_admin_telemetry_summary(recent_limit=12, top_limit=8, review_limit=20):
+    """Return the real read-only dashboard aggregates in grouped SQL queries.
+
+    The query intentionally never selects ``download_history.url`` or Telegram
+    file identifiers.  Referral counts are grouped once for all referrers, so
+    building the dashboard cannot degrade into one query per member.
+    """
+    recent_limit = max(1, min(int(recent_limit), 50))
+    top_limit = max(1, min(int(top_limit), 25))
+    review_limit = max(1, min(int(review_limit), 50))
+    with db_cursor() as cursor:
+        cursor.execute('''
+            SELECT
+                (SELECT COUNT(*) FROM users),
+                (SELECT COUNT(*) FROM users
+                 WHERE is_subscribed = 1
+                   AND (subscription_end IS NULL OR subscription_end > NOW())),
+                (SELECT COUNT(*) FROM download_history),
+                (SELECT COUNT(*) FROM download_history
+                 WHERE created_at >= CURRENT_DATE),
+                (SELECT COUNT(*) FROM download_history
+                 WHERE created_at >= NOW() - INTERVAL '24 hours'),
+                (SELECT COUNT(*) FROM media_cache),
+                (SELECT COALESCE(SUM(hits), 0) FROM media_cache),
+                (SELECT COUNT(*) FROM download_history
+                 WHERE created_at >= CURRENT_DATE AND from_cache IS TRUE),
+                (SELECT COALESCE(SUM(file_size_mb), 0) FROM download_history
+                 WHERE created_at >= CURRENT_DATE AND from_cache IS TRUE),
+                (SELECT COUNT(*) FROM payments WHERE status = 'pending'),
+                (SELECT COUNT(*) FROM referrals)
+        ''')
+        totals = cursor.fetchone() or (0,) * 11
+
+        cursor.execute('''
+            SELECT h.id, h.user_id, u.first_name, u.username, h.title,
+                   h.quality, h.kind, h.platform, h.file_size_mb,
+                   h.from_cache, h.created_at
+            FROM download_history h
+            LEFT JOIN users u ON u.user_id = h.user_id
+            ORDER BY h.created_at DESC, h.id DESC
+            LIMIT %s
+        ''', (recent_limit,))
+        recent_rows = cursor.fetchall()
+
+        cursor.execute('''
+            SELECT r.referrer_user_id, u.first_name, u.username,
+                   COUNT(*) AS invites_total,
+                   COUNT(invited.user_id) AS invites_current
+            FROM referrals r
+            LEFT JOIN users u ON u.user_id = r.referrer_user_id
+            LEFT JOIN users invited ON invited.user_id = r.referred_user_id
+            GROUP BY r.referrer_user_id, u.first_name, u.username
+            ORDER BY invites_total DESC, r.referrer_user_id
+            LIMIT %s
+        ''', (top_limit,))
+        referrer_rows = cursor.fetchall()
+
+        # Review signal requested by the admin: the same member downloaded
+        # audio, then later video, from the same source today.  The source URL
+        # is used only as an in-database grouping key and is never selected or
+        # returned to telemetry.
+        cursor.execute('''
+            SELECT h.user_id, u.first_name, u.username,
+                   MIN(h.created_at) FILTER (WHERE h.kind = 'audio') AS audio_at,
+                   MAX(h.created_at) FILTER (WHERE h.kind = 'video') AS video_at,
+                   COUNT(*) AS occurrences
+            FROM download_history h
+            LEFT JOIN users u ON u.user_id = h.user_id
+            WHERE h.created_at >= CURRENT_DATE
+              AND h.url IS NOT NULL
+              AND h.kind IN ('audio', 'video')
+            GROUP BY h.user_id, h.url, u.first_name, u.username
+            HAVING MIN(h.created_at) FILTER (WHERE h.kind = 'audio') IS NOT NULL
+               AND MAX(h.created_at) FILTER (WHERE h.kind = 'video')
+                   > MIN(h.created_at) FILTER (WHERE h.kind = 'audio')
+            ORDER BY video_at DESC
+            LIMIT %s
+        ''', (review_limit,))
+        review_rows = cursor.fetchall()
+
+    recent = [{
+        'id': row[0],
+        'userId': row[1],
+        'firstName': row[2],
+        'username': row[3],
+        'title': row[4],
+        'quality': row[5],
+        'kind': row[6],
+        'platform': row[7],
+        'sizeMb': row[8],
+        'fromCache': bool(row[9]),
+        'createdAt': row[10],
+    } for row in recent_rows]
+    top_referrers = [{
+        'userId': row[0],
+        'firstName': row[1],
+        'username': row[2],
+        'invitesTotal': row[3],
+        'invitesCurrent': row[4],
+        'invitesIncomplete': max(0, row[3] - row[4]),
+    } for row in referrer_rows]
+    review_items = [{
+        'userId': row[0],
+        'firstName': row[1],
+        'username': row[2],
+        'audioAt': row[3],
+        'videoAt': row[4],
+        'occurrences': row[5],
+    } for row in review_rows]
+
+    return {
+        'membersTotal': totals[0],
+        'subscribers': totals[1],
+        'downloadsTotal': totals[2],
+        'downloadsToday': totals[3],
+        'downloadsLast24h': totals[4],
+        'cacheItems': totals[5],
+        'cacheHits': totals[6],
+        'cacheHitsToday': totals[7],
+        # This is an estimate: a cache hit avoids re-downloading roughly the
+        # recorded delivered file size.  The UI must label it accordingly.
+        'savedMbTodayEstimate': float(totals[8] or 0),
+        'pendingPayments': totals[9],
+        'referralsTotal': totals[10],
+        'recentDownloads': recent,
+        'topReferrers': top_referrers,
+        'reviewItems': review_items,
+    }
+
+
+def get_admin_telemetry_members(limit=100, offset=0):
+    """Return one normalized member batch with grouped referral statistics.
+
+    This is a single query per batch, regardless of how many members it
+    returns.  It contains dashboard profile fields only—no links, answers,
+    payment proof identifiers, cache references, or download titles.
+    """
+    limit = max(1, min(int(limit), 100))
+    offset = max(0, int(offset))
+    with db_cursor() as cursor:
+        cursor.execute('''
+            WITH referral_stats AS (
+                SELECT r.referrer_user_id,
+                       COUNT(*) AS invites_total,
+                       COUNT(invited.user_id) AS invites_current
+                FROM referrals r
+                LEFT JOIN users invited
+                       ON invited.user_id = r.referred_user_id
+                GROUP BY r.referrer_user_id
+            ), today AS (
+                SELECT user_id, download_count
+                FROM daily_downloads
+                WHERE download_date = CURRENT_DATE
+            )
+            SELECT u.user_id, u.username, u.first_name,
+                   COALESCE(u.language, 'ar'), survey.gender,
+                   CASE WHEN u.is_subscribed = 1
+                              AND (u.subscription_end IS NULL
+                                   OR u.subscription_end > NOW())
+                        THEN TRUE ELSE FALSE END,
+                   u.subscription_end,
+                   COALESCE(ref.invites_total, 0),
+                   COALESCE(ref.invites_current, 0),
+                   COALESCE(ref.invites_total - ref.invites_current, 0),
+                   COALESCE(today.download_count, 0),
+                   COALESCE(u.total_downloads, 0),
+                   u.created_at
+            FROM users u
+            LEFT JOIN member_survey survey ON survey.user_id = u.user_id
+            LEFT JOIN referral_stats ref ON ref.referrer_user_id = u.user_id
+            LEFT JOIN today ON today.user_id = u.user_id
+            ORDER BY u.user_id
+            LIMIT %s OFFSET %s
+        ''', (limit, offset))
+        rows = cursor.fetchall()
+
+    return [{
+        'userId': row[0],
+        'username': row[1],
+        'firstName': row[2],
+        'language': row[3],
+        'gender': row[4],
+        'isSubscribed': bool(row[5]),
+        'subscriptionEnd': row[6],
+        'invitesTotal': row[7],
+        'invitesCurrent': row[8],
+        'invitesIncomplete': row[9],
+        'downloadsToday': row[10],
+        'totalDownloads': row[11],
+        'joinedAt': row[12],
+    } for row in rows]
+
+
 def cleanup_expired_privacy_data(history_days=30, cache_days=30):
     """Delete old download links/history and media-cache references.
 

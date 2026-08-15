@@ -60,6 +60,15 @@ class FakeKeyboardButton:
         self.web_app = web_app
 
 
+class FakeInlineKeyboardButton(FakeKeyboardButton):
+    pass
+
+
+class FakeInlineKeyboardMarkup:
+    def __init__(self, inline_keyboard):
+        self.inline_keyboard = inline_keyboard
+
+
 def _load_row_helper(*, admin=True, url="https://example.com/control"):
     tree = ast.parse(BOT_PATH.read_text(encoding="utf-8"), filename=str(BOT_PATH))
     function = next(
@@ -77,13 +86,40 @@ def _load_row_helper(*, admin=True, url="https://example.com/control"):
     return namespace["_admin_webapp_row"]
 
 
+def _load_inline_helper(*, admin=True, url="https://example.com/control"):
+    tree = ast.parse(BOT_PATH.read_text(encoding="utf-8"), filename=str(BOT_PATH))
+    function = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_admin_webapp_inline_markup"
+    )
+    namespace = {
+        "InlineKeyboardButton": FakeInlineKeyboardButton,
+        "InlineKeyboardMarkup": FakeInlineKeyboardMarkup,
+        "WebAppInfo": FakeWebAppInfo,
+        "admin_webapp_url": lambda: url,
+        "is_admin": lambda _user_id: admin,
+        "t": lambda key, lang: t(key, lang),
+    }
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(BOT_PATH), "exec"), namespace)
+    return namespace["_admin_webapp_inline_markup"]
+
+
 def test_admin_webapp_row_builds_translated_button_for_admin_private_chat():
     row = _load_row_helper()(123, "ar", private_chat=True)
 
     assert len(row) == 1
     assert len(row[0]) == 1
     assert row[0][0].text == "🎛 مركز التحكم"
-    assert row[0][0].web_app.url == "https://example.com/control"
+    assert row[0][0].web_app is None
+
+
+def test_admin_webapp_inline_button_carries_safe_url_and_translation():
+    markup = _load_inline_helper()(123, "ar", private_chat=True)
+
+    button = markup.inline_keyboard[0][0]
+    assert button.text == "فتح مركز التحكم"
+    assert button.web_app.url == "https://example.com/control"
 
 
 @pytest.mark.parametrize(
@@ -98,6 +134,20 @@ def test_admin_webapp_row_fails_closed(admin, private_chat, url):
     helper = _load_row_helper(admin=admin, url=url)
 
     assert helper(123, "ar", private_chat=private_chat) == []
+
+
+@pytest.mark.parametrize(
+    ("admin", "private_chat", "url"),
+    [
+        (False, True, "https://example.com/control"),
+        (True, False, "https://example.com/control"),
+        (True, True, None),
+    ],
+)
+def test_admin_webapp_inline_fails_closed(admin, private_chat, url):
+    helper = _load_inline_helper(admin=admin, url=url)
+
+    assert helper(123, "ar", private_chat=private_chat) is None
 
 
 def test_both_admin_menu_paths_include_optional_webapp_row():
@@ -128,3 +178,23 @@ def test_both_admin_menu_paths_include_optional_webapp_row():
 def test_admin_webapp_translation_exists_in_both_languages():
     assert t("btn_admin_webapp", "ar") == "🎛 مركز التحكم"
     assert t("btn_admin_webapp", "en") == "🎛 Control Center"
+    assert t("btn_admin_webapp_open", "ar") == "فتح مركز التحكم"
+    assert t("btn_admin_webapp_open", "en") == "Open Control Center"
+    assert "البيانات الحقيقية" in t("admin_webapp_prompt", "ar")
+    assert "authenticated live data" in t("admin_webapp_prompt", "en")
+
+
+def test_quick_button_handler_uses_inline_launcher():
+    tree = ast.parse(BOT_PATH.read_text(encoding="utf-8"), filename=str(BOT_PATH))
+    handler = next(
+        node for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "handle_quick_buttons"
+    )
+    calls = [
+        node for node in ast.walk(handler)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_admin_webapp_inline_markup"
+    ]
+    assert len(calls) == 1

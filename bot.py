@@ -45,6 +45,7 @@ from translations import t
 from queue_manager import DownloadQueueManager, DownloadTask
 import pg_backup
 from admin_webapp import admin_webapp_url
+import admin_telemetry as telemetry
 
 from url_utils import (
     PLATFORM_URL_MARKERS, is_safe_url, cache_key_for_url,
@@ -257,18 +258,30 @@ def is_admin(user_id) -> bool:
 
 
 def _admin_webapp_row(user_id, lang, *, private_chat):
-    """Build the optional admin-only Mini App row, failing closed.
+    """Build the optional admin-only Mini App launcher row, failing closed.
 
-    Telegram Web App keyboard buttons are supported only in private chats.
-    An empty or invalid ADMIN_WEBAPP_URL leaves the current menu unchanged.
+    This reply-keyboard button is deliberately plain text.  When the admin
+    taps it, the bot responds with an *inline* Web App button; Telegram then
+    supplies signed ``initData`` to the Mini App.  Reply-keyboard Web App
+    launches do not reliably provide that authentication context.
     """
     url = admin_webapp_url()
     if not private_chat or not is_admin(user_id) or not url:
         return []
-    return [[KeyboardButton(
-        t('btn_admin_webapp', lang),
-        web_app=WebAppInfo(url=url),
-    )]]
+    return [[KeyboardButton(t('btn_admin_webapp', lang))]]
+
+
+def _admin_webapp_inline_markup(user_id, lang, *, private_chat):
+    """Return the authenticated inline Mini App launcher for the admin."""
+    url = admin_webapp_url()
+    if not private_chat or not is_admin(user_id) or not url:
+        return None
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            t('btn_admin_webapp_open', lang),
+            web_app=WebAppInfo(url=url),
+        )
+    ]])
 
 
 def download_type_keyboard(user_id, lang):
@@ -1895,10 +1908,11 @@ async def upload_media_with_progress(client, chat_id, file_path, caption, status
         raise
 # Upload progress tracking
 class UploadProgress:
-    def __init__(self, status_msg, user_id, event_loop):
+    def __init__(self, status_msg, user_id, event_loop, telemetry_job_id=None):
         self.status_msg = status_msg
         self.user_id = user_id
         self.event_loop = event_loop  # Store the event loop
+        self.telemetry_job_id = telemetry_job_id
         self.last_edit = 0
         self.last_current = 0
         self.last_time = time.time()
@@ -1923,6 +1937,8 @@ class UploadProgress:
             self.last_edit = now
             
             # Calculate progress
+            if not total:
+                return
             percentage = (current / total) * 100
             current_mb = current / (1024 * 1024)
             total_mb = total / (1024 * 1024)
@@ -1931,6 +1947,15 @@ class UploadProgress:
             progress_bar = '▰' * filled + '▱' * (10 - filled)
             remaining_bytes = total - current
             eta = int(remaining_bytes / self.speed) if self.speed > 0 else 0
+
+            telemetry.update_job(
+                self.telemetry_job_id,
+                phase='uploading',
+                progress=percentage,
+                eta_seconds=eta,
+                speed_mbps=speed_mb,
+                size_mb=total_mb,
+            )
             
             # Get user language
             lang = subdb.get_user_language(self.user_id)
@@ -3607,11 +3632,26 @@ async def download_and_upload(client, message, url, quality, callback_query=None
     is_audio = (quality == 'audio')
     ckey = cache_key_for_url(url)
 
+    telemetry_job_id = telemetry.begin_download(
+        user_id=user_id,
+        first_name=user_name,
+        username=user_username,
+        platform=_platform_of(url),
+        kind='audio' if is_audio else 'video',
+        quality=quality,
+    )
+    telemetry_outcome = 'cancelled'
+
     # ⚡ كاش: إن كان نفس الرابط+الجودة محمّلاً سابقاً، أعِد إرساله فوراً من
     # معرّف الملف (file_id) بلا أي تحميل (الفيديو محفوظ على خوادم تيليجرام).
-    if await _try_send_from_cache(client, message, status_msg, ckey, quality,
-                                  user_id, user_name, user_username, url, lang):
-        return
+    try:
+        if await _try_send_from_cache(client, message, status_msg, ckey, quality,
+                                      user_id, user_name, user_username, url, lang):
+            telemetry.finish_job(telemetry_job_id, 'success')
+            return
+    except Exception:
+        telemetry.finish_job(telemetry_job_id, 'failed')
+        raise
 
     # مجلد تحميل مؤقت فريد لكل عملية: يمنع تضارب الأسماء وحذف ملفات تحميلات
     # متزامنة لمستخدمين آخرين (كان الحذف سابقاً يمسح كل الملفات في المجلد).
@@ -3648,6 +3688,15 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                         speed = d.get('speed', 0) or 0
                         speed_mb = speed / (1024 * 1024)
                         eta = d.get('eta', 0) or 0
+
+                        telemetry.update_job(
+                            telemetry_job_id,
+                            phase='downloading',
+                            progress=percentage,
+                            eta_seconds=eta,
+                            speed_mbps=speed_mb,
+                            size_mb=total_mb,
+                        )
                         
                         filled = int(percentage // 10)
                         progress_bar = '▰' * filled + '▱' * (10 - filled)
@@ -3685,6 +3734,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                 if status == 'started':
                     postprocessor = d.get('postprocessor', 'Unknown')
                     logger.info(f"🔧 بدء المعالجة: {postprocessor}")
+                    telemetry.update_job(telemetry_job_id, phase='processing')
                     # تم إزالة رسالة المعالجة - المستخدم لا يريدها
                         
                 elif status == 'finished':
@@ -3758,6 +3808,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         
         
         # التحميل - استخدام نظام الترجمة
+        telemetry.update_job(telemetry_job_id, phase='downloading', progress=0)
         await status_msg.edit_text(t('start_downloading', lang))
         
         is_youtube_url = any(m in url.lower() for m in PLATFORM_URL_MARKERS['youtube'])
@@ -3896,6 +3947,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         # التحميل وأي مسار)، حتى لو فات الفحص الأول. لا نرفعه ولا نخزّنه في الكاش.
         if (adult_filter_enabled() and is_adult_info(info)) or is_blocked_account(info):
             logger.info("🚫 Blocked content rejected at download stage")
+            telemetry_outcome = 'blocked'
             ban_text, ban_kb = await _apply_adult_ban(client, user_id, lang)
             await status_msg.edit_text(ban_text, reply_markup=ban_kb)
             return
@@ -3930,9 +3982,11 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                     file_path = latest_file
                 else:
                     logger.error("❌ لم يتم العثور على أي ملفات صوتية")
+                    telemetry_outcome = 'failed'
                     await status_msg.edit_text(t('download_failed', lang))
                     return
             else:
+                telemetry_outcome = 'failed'
                 await status_msg.edit_text(t('download_failed', lang))
                 return
         
@@ -3956,6 +4010,12 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             if _threads_meta.get('uploader') and not info.get('uploader'):
                 info['uploader'] = _threads_meta['uploader']
         title = _clean_media_title(info.get('title'), url).replace('`', "'")[:300]
+        telemetry.update_job(
+            telemetry_job_id,
+            phase='processing',
+            title=title,
+            size_mb=file_size_mb,
+        )
         
         logger.info(f"📊 حجم الملف النهائي: {file_size_mb:.2f} MB")
 
@@ -3980,6 +4040,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
 
         # التحقق من الحجم (السقف صلب: بايروجرام يرفض ما فوقه قبل بدء الرفع)
         if not fits_upload_limit(file_size_mb):
+            telemetry_outcome = 'blocked'
             await status_msg.edit_text(t('file_too_large', lang,
                                          size=f"{file_size_mb:.1f}",
                                          max=upload_limit_mb()))
@@ -3995,6 +4056,12 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                            speed_mb='0.0',
                            eta=0,
                            progress_bar='▱▱▱▱▱▱▱▱▱▱')
+        telemetry.update_job(
+            telemetry_job_id,
+            phase='uploading',
+            progress=0,
+            size_mb=file_size_mb,
+        )
         await status_msg.edit_text(initial_progress)
         
         # 🔒 حدّ المدة المجاني — الحارس الثاني (بعد التحميل، قبل الرفع)
@@ -4020,6 +4087,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                 and not is_admin(user_id)):
             _max_min = _user_max_duration_minutes(user_id)
             if duration > _max_min * 60:
+                telemetry_outcome = 'blocked'
                 logger.info(f"⛔ تجاوز حدّ المدة بعد التحميل "
                             f"({int(duration)}ث > {_max_min * 60}ث) — لم يُرفع")
                 await show_subscription_screen(
@@ -4039,7 +4107,8 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             audio_duration = int(duration) if duration and duration > 0 else None
             
             # Create upload progress tracker instance with event loop
-            upload_progress_tracker = UploadProgress(status_msg, user_id, loop)
+            upload_progress_tracker = UploadProgress(
+                status_msg, user_id, loop, telemetry_job_id)
             
             # إرسال كملف صوتي عادي (Audio) - يدعم ملفات كبيرة حتى 2GB
             logger.info(f"📤 إرسال كملف صوتي (Audio): {file_size_mb:.1f}MB, duration={audio_duration}s")
@@ -4091,7 +4160,8 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             support_keyboard = _binance_support_keyboard(binance_id, lang)
             
             # Create upload progress tracker instance with event loop
-            upload_progress_tracker = UploadProgress(status_msg, user_id, loop)
+            upload_progress_tracker = UploadProgress(
+                status_msg, user_id, loop, telemetry_job_id)
             
             try:
                 sent_msg = await client.send_video(
@@ -4126,6 +4196,8 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                         pass
             cache_kind, cache_dur, cache_w, cache_h = 'video', video_duration, video_width, video_height
 
+        telemetry_outcome = 'success'
+        telemetry.update_job(telemetry_job_id, phase='finalizing', progress=100)
         await status_msg.delete()
         logger.info(f"✅ نجح رفع {file_size_mb:.1f}MB للمستخدم {user_id}")
         
@@ -4189,6 +4261,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         
         # إذا كان الخطأ to_bytes، يعني الفيديو نجح لكن مشكلة metadata
         if 'to_bytes' in str(e):
+            telemetry_outcome = 'success'
             # الفيديو تم رفعه بنجاح، فقط نحذف الرسالة والملفات
             try:
                 await status_msg.delete()
@@ -4196,6 +4269,8 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             except Exception:
                 pass
         else:
+            if telemetry_outcome != 'success':
+                telemetry_outcome = 'failed'
             # خطأ حقيقي - إرسال تنبيه للأدمن
             # ملاحظة: user_name مضبوط صحيحاً في بداية الدالة (من callback_query
             # أو message)؛ لا نعيد ضبطه من message.from_user لأنها قد تكون رسالة
@@ -4233,6 +4308,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
     finally:
         # ضمان حذف مجلد التحميل المؤقت في كل الحالات (نجاح أو فشل)
         cleanup_download_dir(dl_dir)
+        telemetry.finish_job(telemetry_job_id, telemetry_outcome)
 
 
 
@@ -5401,7 +5477,7 @@ async def cmd_uncache(client, message):
 
 
 # معالج الأزرار السريعة
-@app.on_message(filters.text & filters.regex(r'^(🍪 Cookies|📊 التقرير اليومي|📊 Daily Report|🩺 فحص الصحّة|🩺 Health Check|💎 إعدادات الاشتراك|💎 Subscription Settings|📁 نسخ احتياطي|🔄 تحديث yt-dlp|🔄 Update yt-dlp)$'))
+@app.on_message(filters.text & filters.regex(r'^(🎛 مركز التحكم|🎛 Control Center|🍪 Cookies|📊 التقرير اليومي|📊 Daily Report|🩺 فحص الصحّة|🩺 Health Check|💎 إعدادات الاشتراك|💎 Subscription Settings|📁 نسخ احتياطي|🔄 تحديث yt-dlp|🔄 Update yt-dlp)$'))
 async def handle_quick_buttons(client, message):
     """معالج الأزرار السريعة"""
     if not message.from_user:
@@ -5412,7 +5488,19 @@ async def handle_quick_buttons(client, message):
         return
 
     txt = message.text
-    if txt == "🍪 Cookies":
+    if txt in ("🎛 مركز التحكم", "🎛 Control Center"):
+        lang = subdb.get_user_language(user_id)
+        markup = _admin_webapp_inline_markup(
+            user_id,
+            lang,
+            private_chat=message.chat.type == enums.ChatType.PRIVATE,
+        )
+        if markup:
+            await message.reply_text(
+                t('admin_webapp_prompt', lang),
+                reply_markup=markup,
+            )
+    elif txt == "🍪 Cookies":
         await cookies_panel(client, message)
     elif txt in ("📊 التقرير اليومي", "📊 Daily Report"):
         await send_daily_report(client, message.from_user.id)
@@ -9740,6 +9828,8 @@ def main():
     loop.create_task(_auto_backup_loop(app))  # نسخ احتياطي تلقائي لقناة النسخ
     loop.create_task(_mirror_watch_loop(app))  # تنبيه الأدمن عند سقوط مرآة
     loop.create_task(_register_bot_commands(app))  # قائمة أوامر / في تلجرام
+    if telemetry.is_configured():
+        loop.create_task(telemetry.telemetry_reporter_loop(queue_manager))
     
     try:
         app.run()
