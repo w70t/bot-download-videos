@@ -33,7 +33,7 @@ TRANSLATIONS = {
 
         # Download
         'processing': '⏳ **جاري المعالجة…**',
-        'start_downloading': '📥 **جاري التحميل…**',
+        'start_downloading': '🔗 **جاري الاتصال بالمصدر…**\n\n📥 سيظهر العداد عند بدء وصول البيانات.',
         'upload_started': '📤 **جاري الرفع…**',
         'download_failed': '⚠️ **تعذّر التحميل**',
         'downloading_images': '🖼️ **جاري تحميل الصور…**',
@@ -57,6 +57,11 @@ TRANSLATIONS = {
                              '👤 @{owner} · 📎 {count} عنصراً{promo}'),
         'highlight_capped': ('\n\n_عُرض أول {shown} من {total} عنصراً (حدّ البوت)._'),
         'downloading': '📥 **جاري التحميل** · {percent}%\n\n{progress_bar}\n\n💾 {current_mb} / {total_mb} MB\n🚀 {speed_mb} MB/s · ⏳ {eta}s',
+        'downloading_unknown': '📥 **جاري التحميل…**\n\n💾 تم استلام {current_mb} MB\n🚀 {speed_mb} MB/s\n⏳ الحجم الكلي غير معروف بعد',
+        'retrying_source': '🔄 **جاري تجربة مصدر بديل…**\n\n📥 سيُستأنف العداد عند وصول البيانات.',
+        'download_complete': '✅ **اكتمل التحميل · 100%**\n\n⚙️ جاري تجهيز الملف للإرسال…',
+        'upload_complete': '✅ **اكتمل الرفع · 100%**',
+        'retrying_upload': '🔄 **جاري إعادة محاولة الإرسال…**',
         'uploading': '📤 **جاري الرفع** · {percent}%\n\n{progress_bar}\n\n💾 {current_mb} / {total_mb} MB\n🚀 {speed_mb} MB/s · ⏳ {eta}s',
         'choose_quality': '📥 **اختر نوع التحميل**\n\n🎬 {title}\n🕒 {duration}',
         'link_preview': '🎬 **{title}**\n\n{details}\n\n─────────────────────\n📥 **اختر نوع التحميل**',
@@ -235,7 +240,7 @@ TRANSLATIONS = {
 
         # Download
         'processing': '⏳ **Processing…**',
-        'start_downloading': '📥 **Downloading…**',
+        'start_downloading': '🔗 **Connecting to the source…**\n\n📥 Progress will appear when data starts arriving.',
         'upload_started': '📤 **Uploading…**',
         'download_failed': '⚠️ **Download failed**',
         'downloading_images': '🖼️ **Downloading images…**',
@@ -259,6 +264,11 @@ TRANSLATIONS = {
                              '👤 @{owner} · 📎 {count} items{promo}'),
         'highlight_capped': ('\n\n_Showing first {shown} of {total} items (bot limit)._'),
         'downloading': '📥 **Downloading** · {percent}%\n\n{progress_bar}\n\n💾 {current_mb} / {total_mb} MB\n🚀 {speed_mb} MB/s · ⏳ {eta}s',
+        'downloading_unknown': '📥 **Downloading…**\n\n💾 Received {current_mb} MB\n🚀 {speed_mb} MB/s\n⏳ Total size is not known yet',
+        'retrying_source': '🔄 **Trying an alternate source…**\n\n📥 Progress will resume when data arrives.',
+        'download_complete': '✅ **Download complete · 100%**\n\n⚙️ Preparing the file for delivery…',
+        'upload_complete': '✅ **Upload complete · 100%**',
+        'retrying_upload': '🔄 **Retrying delivery…**',
         'uploading': '📤 **Uploading** · {percent}%\n\n{progress_bar}\n\n💾 {current_mb} / {total_mb} MB\n🚀 {speed_mb} MB/s · ⏳ {eta}s',
         'choose_quality': '📥 **Choose download type**\n\n🎬 {title}\n🕒 {duration}',
         'link_preview': '🎬 **{title}**\n\n{details}\n\n─────────────────────\n📥 **Choose download type**',

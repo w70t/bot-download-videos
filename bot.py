@@ -109,6 +109,9 @@ from ytdlp_compat import (
     chrome_impersonation_target, youtube_download_network_options,
     youtube_js_runtime_options,
 )
+from telegram_progress import (
+    CoalescingMessageEditor, DownloadProgressState, progress_values,
+)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1903,9 +1906,9 @@ def _ensure_video_has_audio(file_path):
 
 async def upload_media_with_progress(client, chat_id, file_path, caption, status_msg, user_id, is_video=True):
     """Upload media with progress tracking"""
+    upload_progress = UploadProgress(
+        status_msg, user_id, asyncio.get_running_loop())
     try:
-        upload_progress = UploadProgress(status_msg, user_id, asyncio.get_event_loop())
-        
         if is_video:
             message = await client.send_video(
                 chat_id=chat_id,
@@ -1920,52 +1923,70 @@ async def upload_media_with_progress(client, chat_id, file_path, caption, status
                 caption=caption,
                 progress=upload_progress
             )
-        
+        await upload_progress.finish()
         return message
     except Exception as e:
         logger.error(f"خطأ في رفع الوسائط: {e}")
         raise
+    finally:
+        await upload_progress.close()
+
+
 # Upload progress tracking
 class UploadProgress:
-    def __init__(self, status_msg, user_id, event_loop, telemetry_job_id=None):
+    def __init__(self, status_msg, user_id, event_loop, telemetry_job_id=None,
+                 initial_text=None):
         self.status_msg = status_msg
         self.user_id = user_id
-        self.event_loop = event_loop  # Store the event loop
         self.telemetry_job_id = telemetry_job_id
-        self.last_edit = 0
         self.last_current = 0
-        self.last_time = time.time()
+        self.last_time = time.monotonic()
         self.speed = 0
+        self.total = 0
+        self.editor = CoalescingMessageEditor(
+            status_msg.edit_text,
+            event_loop,
+            min_interval=1.0,
+            finish_timeout=3.0,
+            on_error=lambda error: logger.warning(
+                "⚠️ تعذر تحديث عداد الرفع في Telegram (%s)",
+                type(error).__name__,
+            ),
+        )
+        if initial_text is not None:
+            self.editor.note_external_edit(initial_text)
     
     def __call__(self, current, total):
-        """Sync callback for Pyrogram - creates async task for updates"""
+        """Sync callback for Pyrogram؛ يحتفظ بأحدث قيمة فقط."""
         try:
-            now = time.time()
-            
+            now = time.monotonic()
+            current = max(0, current or 0)
+            total = max(0, total or 0)
+            self.total = max(self.total, total)
+
             # Update speed calculation
             time_diff = now - self.last_time
-            if time_diff >= 1:  # Update speed every second
-                bytes_diff = current - self.last_current
+            if current < self.last_current:
+                self.last_current = 0
+                self.last_time = now
+                self.speed = 0
+                time_diff = 0
+            if time_diff >= 0.5:
+                bytes_diff = max(0, current - self.last_current)
                 self.speed = bytes_diff / time_diff
                 self.last_time = now
                 self.last_current = current
-            
-            if now - self.last_edit < 1: # Update message every second
-                return
-            
-            self.last_edit = now
-            
-            # Calculate progress
+
             if not total:
                 return
-            percentage = (current / total) * 100
-            current_mb = current / (1024 * 1024)
-            total_mb = total / (1024 * 1024)
-            speed_mb = self.speed / (1024 * 1024) if self.speed > 0 else 0
+            values = progress_values(current, total, self.speed)
+            percentage = values['percentage']
+            current_mb = values['current_bytes'] / (1024 * 1024)
+            total_mb = values['total_bytes'] / (1024 * 1024)
+            speed_mb = values['speed_bps'] / (1024 * 1024)
             filled = int(percentage // 10)
             progress_bar = '▰' * filled + '▱' * (10 - filled)
-            remaining_bytes = total - current
-            eta = int(remaining_bytes / self.speed) if self.speed > 0 else 0
+            eta = values['eta_seconds'] or 0
 
             telemetry.update_job(
                 self.telemetry_job_id,
@@ -1986,21 +2007,22 @@ class UploadProgress:
                           speed_mb=f'{speed_mb:.1f}',
                           eta=eta,
                           progress_bar=progress_bar)
-            
-            # Use run_coroutine_threadsafe to schedule in the correct event loop
-            asyncio.run_coroutine_threadsafe(
-                self._update_message(upload_msg),
-                self.event_loop
-            )
+            self.editor.publish(upload_msg)
         except Exception as e:
-            logger.error(f"❌ Upload progress error: {e}")
-    
-    async def _update_message(self, text):
-        """Async helper to update Telegram message"""
-        try:
-            await self.status_msg.edit_text(text)
-        except Exception as e:
-            logger.error(f"❌ Message edit error: {e}")
+            logger.warning(
+                "⚠️ تعذر حساب عداد الرفع (%s)", type(e).__name__)
+
+    async def finish(self):
+        lang = subdb.get_user_language(self.user_id)
+        telemetry.update_job(
+            self.telemetry_job_id, phase='uploading', progress=100)
+        return await self.editor.finish(t('upload_complete', lang))
+
+    def publish_status(self, text):
+        return self.editor.publish(text)
+
+    async def close(self):
+        await self.editor.close()
 
 
 async def forward_to_log_channel(client, message, sent_message, user_id, user_name, username, url, 
@@ -3675,6 +3697,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
     # مجلد تحميل مؤقت فريد لكل عملية: يمنع تضارب الأسماء وحذف ملفات تحميلات
     # متزامنة لمستخدمين آخرين (كان الحذف سابقاً يمسح كل الملفات في المجلد).
     dl_dir = os.path.join('videos', uuid.uuid4().hex)
+    download_progress = None
 
     try:
         os.makedirs(dl_dir, exist_ok=True)
@@ -3682,31 +3705,42 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         is_audio = (quality == 'audio')
 
         # الحصول على event loop مبكراً
-        loop = asyncio.get_event_loop()
-        
-        # دالة تتبع تقدم التحميل
-        last_edit_time = 0
-        
-        def download_progress_hook(d):
-            nonlocal last_edit_time
-            if d['status'] == 'downloading':
+        loop = asyncio.get_running_loop()
+        download_progress = CoalescingMessageEditor(
+            status_msg.edit_text,
+            loop,
+            min_interval=1.0,
+            finish_timeout=3.0,
+            on_error=lambda error: logger.warning(
+                "⚠️ تعذر تحديث عداد التحميل في Telegram (%s)",
+                type(error).__name__,
+            ),
+        )
+        download_progress_state = DownloadProgressState()
+
+        # دالة تتبع تقدم التحميل: callback متزامن يعمل غالباً في yt-dlp thread.
+        # الناقل يحتفظ بأحدث نص فقط، لذلك لا تتراكم edits قديمة في event loop.
+        def download_progress_hook(d, attempt_generation):
+            if d.get('status') == 'downloading':
                 try:
-                    now = time.time()
-                    if now - last_edit_time < 2:  # تحديث كل 2 ثانية
-                        return
-                        
-                    last_edit_time = now
-                    
                     total_bytes = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
-                    downloaded_bytes = d.get('downloaded_bytes', 0)
-                    
+                    values = download_progress_state.update(
+                        d, attempt_generation)
+                    if values is None:  # callback متأخر من محاولة مصدر قديمة
+                        return
+                    current_mb = values['current_bytes'] / (1024 * 1024)
+                    speed_mb = values['speed_bps'] / (1024 * 1024)
+
                     if total_bytes > 0:
-                        percentage = (downloaded_bytes / total_bytes) * 100
-                        current_mb = downloaded_bytes / (1024 * 1024)
-                        total_mb = total_bytes / (1024 * 1024)
-                        speed = d.get('speed', 0) or 0
-                        speed_mb = speed / (1024 * 1024)
-                        eta = d.get('eta', 0) or 0
+                        percentage = values['percentage']
+                        total_mb = values['total_bytes'] / (1024 * 1024)
+                        eta = d.get('eta')
+                        if eta is None:
+                            eta = values['eta_seconds']
+                        try:
+                            eta = max(0, int(eta or 0))
+                        except (TypeError, ValueError):
+                            eta = values['eta_seconds'] or 0
 
                         telemetry.update_job(
                             telemetry_job_id,
@@ -3719,10 +3753,6 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                         
                         filled = int(percentage // 10)
                         progress_bar = '▰' * filled + '▱' * (10 - filled)
-                        
-                        # DEBUG: Log the language being used
-                        logger.info(f"📥 Download progress for user {user_id}, lang={lang}")
-                        
                         msg_text = t('downloading', lang, 
                                     percent=f'{percentage:.1f}',
                                     current_mb=f'{current_mb:.1f}',
@@ -3730,22 +3760,26 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                                     speed_mb=f'{speed_mb:.1f}',
                                     eta=eta,
                                     progress_bar=progress_bar)
-                        
-                        # تحديث الرسالة من thread منفصل
-                        try:
-                            future = asyncio.run_coroutine_threadsafe(
-                                status_msg.edit_text(msg_text),
-                                loop
-                            )
-                            # لا ننتظر النتيجة لتجنب الحظر
-                        except Exception:
-                            pass
-                            
+                    else:
+                        telemetry.update_job(
+                            telemetry_job_id,
+                            phase='downloading',
+                            speed_mbps=speed_mb,
+                        )
+                        msg_text = t(
+                            'downloading_unknown', lang,
+                            current_mb=f'{current_mb:.1f}',
+                            speed_mb=f'{speed_mb:.1f}',
+                        )
+                    download_progress.publish(
+                        msg_text, generation=attempt_generation)
                 except Exception as e:
-                    logger.error(f"خطأ في progress hook: {e}")
+                    logger.warning(
+                        "⚠️ تعذر حساب عداد التحميل (%s)",
+                        type(e).__name__)
         
         # دالة تتبع مرحلة المعالجة (post-processing)
-        def postprocessor_hook(d):
+        def postprocessor_hook(d, attempt_generation):
             try:
                 status = d.get('status')
                 logger.info(f"🔄 Post-processor status: {status}")
@@ -3754,7 +3788,9 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                     postprocessor = d.get('postprocessor', 'Unknown')
                     logger.info(f"🔧 بدء المعالجة: {postprocessor}")
                     telemetry.update_job(telemetry_job_id, phase='processing')
-                    # تم إزالة رسالة المعالجة - المستخدم لا يريدها
+                    download_progress.publish(
+                        t('download_complete', lang),
+                        generation=attempt_generation)
                         
                 elif status == 'finished':
                     logger.info(f"✅ اكتملت المعالجة")
@@ -3783,8 +3819,6 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             'outtmpl': os.path.join(dl_dir, '%(title).120B [%(id).50B].%(ext)s'),
             # أمان شامل: حدّ أقصى لطول اسم الملف مهما طال العنوان/المعرّف
             'trim_file_name': 200,
-            'progress_hooks': [download_progress_hook],
-            'postprocessor_hooks': [postprocessor_hook],  # تتبع مرحلة المعالجة
             'quiet': True,
             'no_warnings': True,
             'merge_output_format': 'mp4',
@@ -3842,7 +3876,9 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         
         # التحميل - استخدام نظام الترجمة
         telemetry.update_job(telemetry_job_id, phase='downloading', progress=0)
-        await status_msg.edit_text(t('start_downloading', lang))
+        connecting_text = t('start_downloading', lang)
+        await status_msg.edit_text(connecting_text)
+        download_progress.note_external_edit(connecting_text)
         
         is_instagram_url = _platform_of(url) == 'instagram'
         is_tiktok_url = _platform_of(url) == 'tiktok'
@@ -3855,6 +3891,20 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                      impersonate=None, network_retries=None,
                      socket_timeout=None, continuedl=None):
             o = dict(ydl_opts)
+            attempt_generation = download_progress.new_generation()
+            if attempt_generation is not None:
+                o['progress_hooks'] = [
+                    lambda data, generation=attempt_generation:
+                    download_progress_hook(data, generation)
+                ]
+                o['postprocessor_hooks'] = [
+                    lambda data, generation=attempt_generation:
+                    postprocessor_hook(data, generation)
+                ]
+                if attempt_generation > 1:
+                    download_progress.publish(
+                        t('retrying_source', lang),
+                        generation=attempt_generation)
             if fmt:
                 o['format'] = fmt
             if not use_cookies:
@@ -4018,6 +4068,11 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             else:
                 raise
 
+        # extract_info عاد بنجاح بعد كل streams والمعالجة التابعة لـyt-dlp.
+        # افرض 100% وانتظر edit واحداً فقط قبل أي شاشة لاحقة، ثم أغلق العداد
+        # حتى لا تكتب callback قديمة فوق مرحلة تجهيز/رفع الملف.
+        await download_progress.finish(t('download_complete', lang))
+
         # 🔞 شبكة أمان: امنع المحتوى الحساس/المحظور قبل الرفع (يغطي القوائم وإعادة
         # التحميل وأي مسار)، حتى لو فات الفحص الأول. لا نرفعه ولا نخزّنه في الكاش.
         if (adult_filter_enabled() and is_adult_info(info)) or is_blocked_account(info):
@@ -4123,21 +4178,26 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             return
         # Upload
         lang = subdb.get_user_language(user_id)
-        # Initial upload message with progress bar at 0%
-        initial_progress = t('uploading', lang,
-                           percent='0.0',
-                           current_mb='0.0',
-                           total_mb=f'{file_size_mb:.1f}',
-                           speed_mb='0.0',
-                           eta=0,
-                           progress_bar='▱▱▱▱▱▱▱▱▱▱')
-        telemetry.update_job(
-            telemetry_job_id,
-            phase='uploading',
-            progress=0,
-            size_mb=file_size_mb,
-        )
-        await status_msg.edit_text(initial_progress)
+
+        async def begin_upload_progress():
+            """اعرض 0% عند بدء إرسال bytes فعلياً، لا أثناء تجهيز الفيديو."""
+            initial_progress = t(
+                'uploading', lang,
+                percent='0.0',
+                current_mb='0.0',
+                total_mb=f'{file_size_mb:.1f}',
+                speed_mb='0.0',
+                eta=0,
+                progress_bar='▱▱▱▱▱▱▱▱▱▱',
+            )
+            telemetry.update_job(
+                telemetry_job_id,
+                phase='uploading',
+                progress=0,
+                size_mb=file_size_mb,
+            )
+            await status_msg.edit_text(initial_progress)
+            return initial_progress
         
         # 🔒 حدّ المدة المجاني — الحارس الثاني (بعد التحميل، قبل الرفع)
         #    الفحص قبل التحميل شرطه «duration and duration > الحد»، فالمدّة
@@ -4181,20 +4241,23 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             # التأكد من duration صحيح
             audio_duration = int(duration) if duration and duration > 0 else None
             
-            # Create upload progress tracker instance with event loop
+            initial_upload_text = await begin_upload_progress()
             upload_progress_tracker = UploadProgress(
-                status_msg, user_id, loop, telemetry_job_id)
-            
-            # إرسال كملف صوتي عادي (Audio) - يدعم ملفات كبيرة حتى 2GB
-            logger.info(f"📤 إرسال كملف صوتي (Audio): {file_size_mb:.1f}MB, duration={audio_duration}s")
-            
-            sent_msg = await client.send_audio(
-                chat_id=message.chat.id,
-                audio=file_path,
-                caption=caption,
-                duration=audio_duration,
-                progress=upload_progress_tracker
-            )
+                status_msg, user_id, loop, telemetry_job_id,
+                initial_text=initial_upload_text)
+            try:
+                # إرسال كملف صوتي عادي (Audio) - يدعم ملفات كبيرة حتى 2GB
+                logger.info(f"📤 إرسال كملف صوتي (Audio): {file_size_mb:.1f}MB, duration={audio_duration}s")
+                sent_msg = await client.send_audio(
+                    chat_id=message.chat.id,
+                    audio=file_path,
+                    caption=caption,
+                    duration=audio_duration,
+                    progress=upload_progress_tracker
+                )
+                await upload_progress_tracker.finish()
+            finally:
+                await upload_progress_tracker.close()
             logger.info(f"✅ نجح إرسال الملف الصوتي: {file_size_mb:.1f}MB")
             cache_kind, cache_dur, cache_w, cache_h = 'audio', audio_duration, None, None
 
@@ -4234,9 +4297,10 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             lang = subdb.get_user_language(user_id)
             support_keyboard = _binance_support_keyboard(binance_id, lang)
             
-            # Create upload progress tracker instance with event loop
+            initial_upload_text = await begin_upload_progress()
             upload_progress_tracker = UploadProgress(
-                status_msg, user_id, loop, telemetry_job_id)
+                status_msg, user_id, loop, telemetry_job_id,
+                initial_text=initial_upload_text)
             
             try:
                 sent_msg = await client.send_video(
@@ -4252,17 +4316,31 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                     progress=upload_progress_tracker
                 )
             except Exception as send_error:
+                await upload_progress_tracker.close()
                 logger.error(f"❌ خطأ في send_video: {send_error}")
                 # محاولة بدون أي معاملات إضافية
                 logger.info("🔄 Retrying with minimal parameters...")
-                sent_msg = await client.send_video(
-                    chat_id=message.chat.id,
-                    video=file_path,
-                    caption=caption,
-                    thumb=thumb_path,
-                    supports_streaming=True
-                )
+                fallback_upload_tracker = UploadProgress(
+                    status_msg, user_id, loop, telemetry_job_id,
+                    initial_text=initial_upload_text)
+                fallback_upload_tracker.publish_status(
+                    t('retrying_upload', lang))
+                try:
+                    sent_msg = await client.send_video(
+                        chat_id=message.chat.id,
+                        video=file_path,
+                        caption=caption,
+                        thumb=thumb_path,
+                        supports_streaming=True
+                    )
+                    await fallback_upload_tracker.finish()
+                finally:
+                    await fallback_upload_tracker.close()
+            else:
+                # فشل واجهة العداد لا يعيد إرسال الفيديو مرة ثانية.
+                await upload_progress_tracker.finish()
             finally:
+                await upload_progress_tracker.close()
                 # حذف ملف المصغّر المؤقت بعد الرفع
                 if thumb_path and os.path.exists(thumb_path):
                     try:
@@ -4332,6 +4410,8 @@ async def download_and_upload(client, message, url, quality, callback_query=None
 
         
     except Exception as e:
+        if download_progress is not None:
+            await download_progress.close()
         logger.error(f"❌ خطأ: {e}")
         
         # إذا كان الخطأ to_bytes، يعني الفيديو نجح لكن مشكلة metadata
@@ -4381,6 +4461,8 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                 await status_msg.edit_text(t('generic_error', lang, error=short_error))
 
     finally:
+        if download_progress is not None:
+            await download_progress.close()
         # ضمان حذف مجلد التحميل المؤقت في كل الحالات (نجاح أو فشل)
         cleanup_download_dir(dl_dir)
         telemetry.finish_job(telemetry_job_id, telemetry_outcome)
