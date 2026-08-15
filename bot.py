@@ -102,8 +102,9 @@ from download_errors import (
 from download_retries import (
     ensure_facebook_identity, facebook_identity_match_filter,
     run_facebook_retries, run_youtube_retries as execute_youtube_retries,
+    youtube_extractor_args,
 )
-from ytdlp_compat import chrome_impersonation_target
+from ytdlp_compat import chrome_impersonation_target, youtube_js_runtime_options
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -766,14 +767,12 @@ cookies_expiry = {}  # {platform: {'uploaded': timestamp, 'expires': timestamp, 
 # ═══════════════════════════════════════════════════════════════
 
 
-# عملاء يوتيوب: android_vr لا يتطلب PO token؛ نتجنّب 'tv' لأنه يبلّغ DRM زوراً بدون كوكيز
-# و'web_embedded' يسبب خطأ إعداد. formats=missing_pot يسمح باستخدام الصيغ المحجوبة بلا توكن.
-# عملاء يوتيوب: قابلة للضبط عبر .env (YT_PLAYER_CLIENTS) لموازنة السرعة/النجاح.
-# تقليل العدد يسرّع ظهور أزرار الجودة (كل عميل = طلب شبكة)، لكن قد يقلّل النجاح
-# لبعض الفيديوهات. الافتراضي عملاء قليلون وسريعون نسبياً.
+# اترك yt-dlp يختار عميله الافتراضي للصيغ العادية. جمع عدة عملاء يخلط الصيغ
+# وقد يختار رابطاً يحتاج PO Token؛ عند الفشل توجد محاولة android_vr منفردة.
+# يبقى الضبط عبر .env متاحاً لحالة تشغيلية مدروسة.
 _yt_clients_env = os.getenv("YT_PLAYER_CLIENTS", "").strip()
 YT_PLAYER_CLIENTS = [c.strip() for c in _yt_clients_env.split(',') if c.strip()] \
-    or ['default', 'android_vr', 'web_safari', 'mweb']
+    or ['default']
 
 # عدد أجزاء التحميل المتوازية (يسرّع تحميل يوتيوب/الأجزاء). قيمة معتدلة تتفادى
 # الحظر من المنصة (>16 من نفس الـIP قد يُحظر).
@@ -781,7 +780,7 @@ YTDLP_CONCURRENT_FRAGMENTS = max(1, int(os.getenv("YTDLP_CONCURRENT_FRAGMENTS", 
 
 
 def _youtube_extractor_args():
-    return {'youtube': {'player_client': list(YT_PLAYER_CLIENTS), 'formats': ['missing_pot']}}
+    return youtube_extractor_args(YT_PLAYER_CLIENTS)
 
 
 # سبب فشل آخر استخراج ضمن نفس المهمة (task) — يُقرأ فور رجوع get_video_info.
@@ -1375,9 +1374,11 @@ async def get_video_info(url: str):
             ydl_opts['cookiefile'] = cookie_file
             logger.info(f"🍪 Using cookies for video info extraction: {cookie_file}")
 
-        # ليوتيوب: جرّب عملاء متعددين + السماح بالصيغ المحجوبة لتفادي حجب الصيغ (PO token)
+        # ليوتيوب: لا نُظهر الصيغ التي يستبعدها yt-dlp بسبب غياب PO Token.
+        # Node 22+ يحل تحديات JavaScript، إن كان متاحاً على الجهاز.
         if is_youtube:
             ydl_opts['extractor_args'] = _youtube_extractor_args()
+            ydl_opts.update(youtube_js_runtime_options())
         if facebook_expected_id:
             # yt-dlp يطبق المرشح قبل تنزيل الوسائط؛ هنا يفيد أيضاً في مسار
             # المعاينة ويمنع قبول فيديو feed/إعلان حقنته جلسة Facebook.
@@ -3762,6 +3763,8 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         logger.info("🚀 Using optimized download settings for better performance")
         is_facebook_url = any(
             marker in url.lower() for marker in PLATFORM_URL_MARKERS['facebook'])
+        is_youtube_url = any(
+            marker in url.lower() for marker in PLATFORM_URL_MARKERS['youtube'])
         facebook_expected_id = (
             facebook_video_id(url) if is_facebook_url else None)
         
@@ -3809,9 +3812,10 @@ async def download_and_upload(client, message, url, quality, callback_query=None
             ydl_opts['cookiefile'] = cookie_file
             logger.info(f"🍪 استخدام cookies للتحميل: {cookie_file}")
 
-        # ليوتيوب: جرّب عملاء متعددين + السماح بالصيغ المحجوبة لتفادي حجب الصيغ (PO token)
-        if any(m in url.lower() for m in PLATFORM_URL_MARKERS['youtube']):
+        # يوتيوب: استخدم الصيغ السليمة فقط وفعّل محلّل JavaScript المحلي.
+        if is_youtube_url:
             ydl_opts['extractor_args'] = _youtube_extractor_args()
+            ydl_opts.update(youtube_js_runtime_options())
         if facebook_expected_id:
             ydl_opts['match_filter'] = facebook_identity_match_filter(
                 facebook_expected_id)
@@ -3833,7 +3837,6 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         telemetry.update_job(telemetry_job_id, phase='downloading', progress=0)
         await status_msg.edit_text(t('start_downloading', lang))
         
-        is_youtube_url = any(m in url.lower() for m in PLATFORM_URL_MARKERS['youtube'])
         is_instagram_url = _platform_of(url) == 'instagram'
         is_tiktok_url = _platform_of(url) == 'tiktok'
         is_pinterest_url = _platform_of(url) == 'pinterest'
@@ -3850,10 +3853,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
                 o.pop('cookiefile', None)
             # فرض مجموعة عملاء مشغّل بديلة ليوتيوب (لإعادة الاستخراج بروابط جديدة)
             if yt_clients and is_youtube_url:
-                o['extractor_args'] = {
-                    'youtube': {'player_client': list(yt_clients),
-                                'formats': ['missing_pot']}
-                }
+                o['extractor_args'] = youtube_extractor_args(yt_clients)
             if impersonate is not None:
                 o['impersonate'] = impersonate
                 o.pop('http_headers', None)
@@ -3873,7 +3873,7 @@ async def download_and_upload(client, message, url, quality, callback_query=None
         def log_youtube_attempt(options):
             if options.get('yt_clients') and options.get('fmt'):
                 logger.warning(
-                    "⚠️ استمرار فشل يوتيوب 403، إعادة المحاولة بأفضل صيغة متاحة")
+                    "⚠️ إعادة محاولة يوتيوب بعميل نظيف وأفضل صيغة متاحة")
             elif options.get('yt_clients'):
                 logger.warning(
                     "⚠️ فشل تحميل يوتيوب بخطأ 403، إعادة المحاولة "

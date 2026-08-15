@@ -9,19 +9,15 @@ from download_errors import YOUTUBE_403_FALLBACK_CLIENTS
 from download_retries import (
     FACEBOOK_IDENTITY_MISMATCH, ensure_facebook_identity,
     facebook_identity_match_filter, run_facebook_retries,
-    run_youtube_retries,
+    run_youtube_retries, youtube_extractor_args,
 )
 
 
-def test_youtube_reclassifies_403_from_second_attempt():
+def test_youtube_format_error_uses_clean_android_vr_once():
     calls = []
 
     async def fake_download(**options):
         calls.append(options)
-        if len(calls) == 1:
-            # الخطأ الأول كان غياب الصيغة؛ 403 لا يظهر إلا في المحاولة التالية.
-            raise RuntimeError(
-                'Unable to download video data: HTTP Error 403: Forbidden')
         return 'ok'
 
     result = asyncio.run(run_youtube_retries(
@@ -31,14 +27,32 @@ def test_youtube_reclassifies_403_from_second_attempt():
     ))
 
     assert result == 'ok'
-    assert calls[0] == {
+    assert calls == [{
         'use_cookies': False,
         'fmt': 'bv*+ba/b/best',
-    }
-    assert calls[1] == {
-        'use_cookies': False,
         'yt_clients': YOUTUBE_403_FALLBACK_CLIENTS,
-    }
+    }]
+
+
+def test_youtube_403_uses_clean_android_vr_once():
+    calls = []
+
+    async def fake_download(**options):
+        calls.append(options)
+        return 'ok'
+
+    result = asyncio.run(run_youtube_retries(
+        fake_download,
+        RuntimeError('Unable to download video data: HTTP Error 403: Forbidden'),
+        'bestaudio/best',
+    ))
+
+    assert result == 'ok'
+    assert calls == [{
+        'use_cookies': False,
+        'fmt': 'bestaudio/best',
+        'yt_clients': YOUTUBE_403_FALLBACK_CLIENTS,
+    }]
 
 
 def test_youtube_visited_options_prevent_403_retry_loop():
@@ -58,14 +72,17 @@ def test_youtube_visited_options_prevent_403_retry_loop():
     assert calls == [
         {
             'use_cookies': False,
-            'yt_clients': YOUTUBE_403_FALLBACK_CLIENTS,
-        },
-        {
-            'use_cookies': False,
             'fmt': 'bestaudio/best',
             'yt_clients': YOUTUBE_403_FALLBACK_CLIENTS,
         },
     ]
+
+
+def test_youtube_extractor_args_never_exposes_missing_pot_formats():
+    args = youtube_extractor_args(('android_vr',))
+
+    assert args == {'youtube': {'player_client': ['android_vr']}}
+    assert 'formats' not in args['youtube']
 
 
 def test_facebook_uses_only_public_modes_even_when_cookiefile_exists():

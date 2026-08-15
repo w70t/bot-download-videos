@@ -94,7 +94,10 @@ if [ "$CURL_CFFI_REPORTED" = "0" ]; then
 fi
 INSTALL_ARGS=()
 for package in "${PKG_ARGS[@]}"; do
-    if [ "$package" = "curl_cffi" ] || [ "$package" = "curl-cffi" ]; then
+    if [ "$package" = "yt-dlp" ]; then
+        # extra الافتراضي يجلب yt-dlp-ejs المطابق لتحديات YouTube JavaScript.
+        INSTALL_ARGS+=("yt-dlp[default]")
+    elif [ "$package" = "curl_cffi" ] || [ "$package" = "curl-cffi" ]; then
         INSTALL_ARGS+=("$CURL_CFFI_REQUIREMENT")
     else
         INSTALL_ARGS+=("$package")
