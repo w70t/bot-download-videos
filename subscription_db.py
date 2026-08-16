@@ -1392,6 +1392,59 @@ def get_admin_telemetry_members(limit=100, offset=0):
     } for row in rows]
 
 
+def get_admin_telemetry_download_upper_id(observed_at):
+    """Freeze the newest retained history id visible to one full sync."""
+    with db_cursor() as cursor:
+        cursor.execute('''
+            SELECT COALESCE(MAX(id), 0)
+            FROM download_history
+            WHERE created_at >= %s - INTERVAL '30 days'
+              AND created_at <= %s
+        ''', (observed_at, observed_at))
+        row = cursor.fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+def get_admin_telemetry_downloads(limit=40, after_id=0, upper_id=0,
+                                  observed_at=None):
+    """Return one stable history page with an explicit privacy allowlist.
+
+    One query returns the whole page (no per-member lookup).  Keyset pagination
+    stays stable while downloads continue, and the same observed timestamp is
+    supplied by the publisher for every page.  Source URL, Telegram file id,
+    local paths and credentials are neither selected nor returned.
+    """
+    limit = max(1, min(int(limit), 40))
+    after_id = max(0, int(after_id))
+    upper_id = max(0, int(upper_id))
+    observed_at = observed_at or datetime.now()
+    with db_cursor() as cursor:
+        cursor.execute('''
+            SELECT id, user_id, title, platform, kind, quality,
+                   file_size_mb, from_cache, created_at
+            FROM download_history
+            WHERE id > %s
+              AND id <= %s
+              AND created_at >= %s - INTERVAL '30 days'
+              AND created_at <= %s
+            ORDER BY id
+            LIMIT %s
+        ''', (after_id, upper_id, observed_at, observed_at, limit))
+        rows = cursor.fetchall()
+
+    return [{
+        'id': row[0],
+        'userId': row[1],
+        'title': row[2],
+        'platform': row[3],
+        'kind': row[4],
+        'quality': row[5],
+        'sizeMb': row[6],
+        'fromCache': bool(row[7]),
+        'createdAt': row[8],
+    } for row in rows]
+
+
 def cleanup_expired_privacy_data(history_days=30, cache_days=30,
                                  departure_days=90):
     """Delete expired history/cache and anonymous departure aggregates.
