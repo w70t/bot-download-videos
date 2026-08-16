@@ -35,10 +35,16 @@ def test_config_is_explicitly_feature_flagged_and_fails_closed():
 
 
 def test_config_accepts_dedicated_32_byte_secret_and_bounds_intervals():
+    defaults = telemetry.telemetry_config(_env())
+    assert defaults.download_sync_seconds == 21600
+    assert defaults.download_batch_size == 40
+
     config = telemetry.telemetry_config(_env(
         ADMIN_TELEMETRY_INTERVAL_SECONDS='1',
         ADMIN_TELEMETRY_MEMBER_SYNC_SECONDS='999999',
         ADMIN_TELEMETRY_MEMBER_BATCH_SIZE='999',
+        ADMIN_TELEMETRY_DOWNLOAD_SYNC_SECONDS='1',
+        ADMIN_TELEMETRY_DOWNLOAD_BATCH_SIZE='999',
     ))
 
     assert config.endpoint == 'https://example.com/api/ingest'
@@ -46,6 +52,8 @@ def test_config_accepts_dedicated_32_byte_secret_and_bounds_intervals():
     assert config.interval_seconds == 10
     assert config.member_sync_seconds == 86400
     assert config.member_batch_size == 40
+    assert config.download_sync_seconds == 3600
+    assert config.download_batch_size == 40
 
 
 def test_payload_signature_covers_timestamp_dot_exact_raw_body():

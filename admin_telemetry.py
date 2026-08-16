@@ -44,6 +44,11 @@ MAX_BODY_BYTES = 256 * 1024
 _PROCESS_STARTED_AT_MS = int(time.time() * 1000)
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 _TOKEN_RE = re.compile(r"(?<!\w)\d{6,12}:[A-Za-z0-9_-]{20,}(?!\w)")
+_PATH_RE = re.compile(
+    r"(?<!\w)(?:[A-Za-z]:[\\/][^\s]+|/"
+    r"(?:home|tmp|var|opt|srv|mnt|media|root|Users?)/[^\s]*)",
+    re.IGNORECASE,
+)
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]+")
 
 
@@ -54,6 +59,8 @@ class TelemetryConfig:
     interval_seconds: int = 20
     member_sync_seconds: int = 3600
     member_batch_size: int = 40
+    download_sync_seconds: int = 21600
+    download_batch_size: int = 40
     timeout_seconds: float = 5.0
 
 
@@ -102,6 +109,11 @@ def telemetry_config(environ=None):
             env.get('ADMIN_TELEMETRY_MEMBER_SYNC_SECONDS'), 3600, 300, 86400),
         member_batch_size=_bounded_int(
             env.get('ADMIN_TELEMETRY_MEMBER_BATCH_SIZE'), 40, 1, 40),
+        download_sync_seconds=_bounded_int(
+            env.get('ADMIN_TELEMETRY_DOWNLOAD_SYNC_SECONDS'),
+            21600, 3600, 86400),
+        download_batch_size=_bounded_int(
+            env.get('ADMIN_TELEMETRY_DOWNLOAD_BATCH_SIZE'), 40, 1, 40),
         timeout_seconds=float(_bounded_int(
             env.get('ADMIN_TELEMETRY_TIMEOUT_SECONDS'), 5, 2, 15)),
     )
@@ -117,6 +129,7 @@ def _safe_text(value, limit=160):
     text = _CONTROL_RE.sub(' ', str(value))
     text = _URL_RE.sub('[link]', text)
     text = _TOKEN_RE.sub('[token]', text)
+    text = _PATH_RE.sub('[path]', text)
     text = ' '.join(text.split()).strip()
     return text[:limit] or None
 
@@ -663,6 +676,27 @@ def _normalise_recent(row):
     }
 
 
+def _normalise_download(row):
+    """Return the complete allowlisted download-history wire record.
+
+    Keep this separate from ``_normalise_recent``: full history does not need
+    member profile data, and an explicit allowlist prevents a future database
+    field (especially a source URL or Telegram file id) leaking by accident.
+    """
+    size_mb = _safe_number(row.get('sizeMb'), maximum=1024.0 * 1024.0)
+    return {
+        'id': str(row.get('id')),
+        'userId': str(row.get('userId')),
+        'title': _safe_text(row.get('title'), 160),
+        'platform': _safe_text(row.get('platform'), 32),
+        'kind': _safe_text(row.get('kind'), 16),
+        'quality': _safe_text(row.get('quality'), 24),
+        'sizeMb': round(size_mb, 2) if size_mb is not None else None,
+        'fromCache': bool(row.get('fromCache')),
+        'createdAt': _epoch_ms(row.get('createdAt')),
+    }
+
+
 def _normalise_referrer(row):
     return {
         'userId': str(row.get('userId')),
@@ -896,6 +930,63 @@ async def _push_member_sync(config):
                 raise
 
 
+async def _push_download_sync_once(config):
+    """Push one stable, privacy-limited 30-day history snapshot.
+
+    PostgreSQL is read with keyset pagination bounded by the id visible at the
+    beginning of the sync.  New successful downloads therefore stay in the
+    live ``recentDownloads`` snapshot and join the next full sync without
+    shifting or duplicating an in-flight page.
+    """
+    sync_id = uuid.uuid4().hex
+    observed_datetime = datetime.now()
+    observed_at = _epoch_ms(observed_datetime)
+    upper_id = await asyncio.to_thread(
+        subdb.get_admin_telemetry_download_upper_id,
+        observed_datetime,
+    )
+    after_id = 0
+    batch_index = 0
+    while True:
+        rows = await asyncio.to_thread(
+            subdb.get_admin_telemetry_downloads,
+            config.download_batch_size,
+            after_id,
+            upper_id,
+            observed_datetime,
+        )
+        downloads = [_normalise_download(row) for row in rows]
+        final = len(rows) < config.download_batch_size
+        payload = {
+            'type': 'downloads',
+            'schemaVersion': SCHEMA_VERSION,
+            'observedAt': observed_at,
+            'syncId': sync_id,
+            'batchIndex': batch_index,
+            'final': final,
+            'downloads': downloads,
+        }
+        await asyncio.to_thread(_post_json, config, payload)
+        if final:
+            return
+
+        next_after_id = int(rows[-1]['id'])
+        if next_after_id <= after_id:
+            raise RuntimeError('invalid-download-page')
+        after_id = next_after_id
+        batch_index += 1
+
+
+async def _push_download_sync(config):
+    """Push downloads and restart once if the receiver lost batch state."""
+    for attempt in range(2):
+        try:
+            return await _push_download_sync_once(config)
+        except MissingBatchError:
+            if attempt:
+                raise
+
+
 async def telemetry_reporter_loop(queue_manager, config=None):
     """Continuously push live state; failures never escape into the bot."""
     config = config or telemetry_config()
@@ -904,6 +995,7 @@ async def telemetry_reporter_loop(queue_manager, config=None):
 
     logger.info('Admin telemetry publisher enabled (outbound HTTPS only)')
     next_member_sync = 0.0
+    next_download_sync = 0.0
     while True:
         cycle_started = time.monotonic()
         try:
@@ -931,6 +1023,24 @@ async def telemetry_reporter_loop(queue_manager, config=None):
                 next_member_sync = time.monotonic() + (
                     config.member_sync_seconds
                     if member_sync_succeeded else retry_seconds
+                )
+
+        now = time.monotonic()
+        if now >= next_download_sync:
+            download_sync_succeeded = False
+            try:
+                await _push_download_sync(config)
+                download_sync_succeeded = True
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning('Admin telemetry download sync failed (%s)',
+                               type(exc).__name__)
+            finally:
+                retry_seconds = min(60, max(10, config.interval_seconds * 3))
+                next_download_sync = time.monotonic() + (
+                    config.download_sync_seconds
+                    if download_sync_succeeded else retry_seconds
                 )
 
         elapsed = time.monotonic() - cycle_started
