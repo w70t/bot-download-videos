@@ -105,9 +105,23 @@ def test_registry_tracks_only_sanitized_operational_fields():
 def test_build_snapshot_uses_real_grouped_data_without_source_links(monkeypatch):
     sample = {
         'membersTotal': 624,
+        'membersActive24h': 7,
+        'membersActive7d': 31,
+        'membersActive30d': 100,
+        'membersInactive30d': 524,
         'subscribers': 5,
         'downloadsTotal': 1196,
         'downloadsToday': 4,
+        'departuresToday': 2,
+        'departures7d': 5,
+        'departures30d': 8,
+        'departureReasons30d': [
+            {'reason': 'blocked', 'count': 3},
+            {'reason': 'deactivated', 'count': 4},
+            {'reason': 'unreachable', 'count': 1},
+        ],
+        '_databaseSizeBytes': 10 * 1024 * 1024,
+        'lastReachabilityCheckAt': datetime(2026, 8, 15, 9, 0, 0),
         'recentDownloads': [{
             'id': 9,
             'userId': 42,
@@ -155,11 +169,29 @@ def test_build_snapshot_uses_real_grouped_data_without_source_links(monkeypatch)
     encoded = json.dumps(snapshot)
 
     assert snapshot['summary']['membersTotal'] == 624
+    assert snapshot['summary']['membersActive24h'] == 7
+    assert snapshot['summary']['lastReachabilityCheckAt'] is not None
+    assert snapshot['system']['databaseSizeMb'] == 10.0
+    assert snapshot['system']['databaseLatencyMs'] >= 0
+    assert '_databaseSizeBytes' not in snapshot['summary']
     assert snapshot['recentDownloads'][0]['title'] == 'A title'
     assert snapshot['topReferrers'][0]['invitesTotal'] == 26
     assert snapshot['reviewItems'][0]['type'] == 'audio_then_video'
     assert 'must-not-leak' not in encoded
     assert 'url' not in snapshot['recentDownloads'][0]
+
+
+def test_member_normalisation_includes_activity_timestamp_only():
+    activity = datetime(2026, 8, 15, 12, 30, 0)
+    member = telemetry._normalise_member({
+        'userId': 42,
+        'firstName': 'Ali',
+        'lastActivityAt': activity,
+    })
+
+    assert member['lastActivityAt'] == int(activity.timestamp() * 1000)
+    assert 'activityState' not in member
+    assert 'reachabilityCheckedAt' not in member
 
 
 def test_member_batches_are_sequential_and_final_only_after_prior_success(monkeypatch):

@@ -30,13 +30,13 @@ from pyrogram.types import (
     ReplyKeyboardMarkup, KeyboardButton, WebAppInfo,
 )
 from pyrogram.errors import (
-    UserIsBlocked, InputUserDeactivated, PeerIdInvalid,
+    UserIsBlocked, InputUserDeactivated,
     UserDeactivated, UserDeactivatedBan, FloodWait, UserNotParticipant
 )
 
 # أخطاء تعني أن المستخدم لم يعد متاحاً (حظر البوت أو حُذف حسابه) فنحذفه
 GONE_USER_ERRORS = (
-    UserIsBlocked, InputUserDeactivated, PeerIdInvalid,
+    UserIsBlocked, InputUserDeactivated,
     UserDeactivated, UserDeactivatedBan,
 )
 from dotenv import load_dotenv
@@ -247,6 +247,31 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
+
+@app.on_message(filters.private, group=-100)
+async def _track_member_message_activity(_client, message):
+    """Record real private interactions without changing registration flow."""
+    user = getattr(message, 'from_user', None)
+    if not user or getattr(user, 'is_bot', False):
+        return
+    try:
+        await asyncio.to_thread(subdb.touch_user_activity, user.id)
+    except Exception as exc:
+        # Observability is fail-open: a telemetry write never blocks bot logic.
+        logger.warning('Member activity touch failed (%s)', type(exc).__name__)
+
+
+@app.on_callback_query(group=-100)
+async def _track_member_callback_activity(_client, callback_query):
+    """Record button interactions; the database helper debounces duplicates."""
+    user = getattr(callback_query, 'from_user', None)
+    if not user or getattr(user, 'is_bot', False):
+        return
+    try:
+        await asyncio.to_thread(subdb.touch_user_activity, user.id)
+    except Exception as exc:
+        logger.warning('Member activity touch failed (%s)', type(exc).__name__)
+
 # ═══════════════════════════════════════════════════════════════
 # مساعدات الصلاحيات والأمان - Auth & security helpers
 # ═══════════════════════════════════════════════════════════════
@@ -260,6 +285,16 @@ def is_admin(user_id) -> bool:
     """نقطة تحقق واحدة من صلاحية الأدمن. تفشل بأمان إذا لم يُضبط ADMIN_ID."""
     admin_id = os.getenv("ADMIN_ID")
     return bool(admin_id) and str(user_id) == str(admin_id)
+
+
+def _departure_reason(error) -> str:
+    """Map Telegram reachability failures to coarse, identity-free reasons."""
+    if isinstance(error, UserIsBlocked):
+        return 'blocked'
+    if isinstance(error, (InputUserDeactivated, UserDeactivated,
+                          UserDeactivatedBan)):
+        return 'deactivated'
+    return 'unreachable'
 
 
 def _admin_webapp_row(user_id, lang, *, private_chat):
@@ -2600,7 +2635,7 @@ async def _edit_send_progress(msg, title, done, total, sent, fail, removed):
             f"📊 التقدّم: **{done}/{total}**\n"
             f"✅ وصلت: **{sent}**\n"
             f"❌ فشلت: **{fail}**\n"
-            f"🗑️ حُذفوا (غادروا): **{removed}**"
+            f"🗑️ غير متاحين (حظر/تعطيل): **{removed}**"
         )
     except Exception:
         pass
@@ -2609,7 +2644,7 @@ async def _edit_send_progress(msg, title, done, total, sent, fail, removed):
 async def _send_reminder_batch(client, progress_msg, targets):
     """يرسل رسالة التذكير لقائمة (user_id, language, last_reminder_msg_id): يحذف
     التذكير السابق لكل عضو ثم يرسل الأحدث بلغته، مع عدّاد حيّ ومعالجة الأخطاء
-    (FloodWait، ومن غادر يُحذف). يعيد (وصلت، فشلت، حُذفوا). مشترك بين إرسال
+    (FloodWait، والحظر/تعطيل الحساب يُحذف). يعيد (وصلت، فشلت، حُذفوا). مشترك بين إرسال
     التذكير للخاملين وللجميع."""
     total = len(targets)
     sent_n = fail_n = removed_n = 0
@@ -2628,9 +2663,9 @@ async def _send_reminder_batch(client, progress_msg, targets):
         except FloodWait as e:
             await asyncio.sleep(getattr(e, 'value', 5))
             fail_n += 1
-        except GONE_USER_ERRORS:
+        except GONE_USER_ERRORS as gone_error:
             try:
-                subdb.delete_user(uid)
+                subdb.delete_user(uid, _departure_reason(gone_error))
                 removed_n += 1
             except Exception:
                 pass
@@ -4497,9 +4532,9 @@ async def _process_referral_start(client, message, new_user_id):
         referrer_id = int(str(parts[1])[4:])
     except (ValueError, TypeError):
         return
-    if not subdb.record_referral(new_user_id, referrer_id):
-        return  # دعوة مكررة أو دعوة النفس
-    subdb.add_bonus_downloads(referrer_id, REFERRAL_BONUS)
+    if not subdb.record_referral_and_reward(
+            new_user_id, referrer_id, REFERRAL_BONUS):
+        return  # دعوة مكررة/ذاتية، أو معرّف داعٍ غير موجود
     # الحد اليومي الجديد للداعي = الأساس + مجموع دعواته
     base = subdb.get_daily_limit()
     new_limit = (base + subdb.get_bonus_downloads(referrer_id)) if base != -1 else '∞'
@@ -5270,7 +5305,7 @@ async def run_realusers_check(client, message):
                 "🔍 **جارٍ فحص الأعضاء…**\n\n"
                 f"⏳ التقدّم: **{done}/{total}** ({pct}%)\n"
                 f"✅ موجودون: **{alive}**\n"
-                f"🔴 خرجوا/حظروا: **{removed}**"
+                f"🔴 غير متاحين (حظر/تعطيل): **{removed}**"
             )
         except Exception:
             pass
@@ -5283,7 +5318,7 @@ async def run_realusers_check(client, message):
         await status.edit_text(
             "📊 **فحص فوري للأعضاء (اكتمل)**\n\n"
             f"🟢 دخلوا اليوم (آخر 24 ساعة): **{joined}**\n"
-            f"🔴 خرجوا/حظروا (حُذفوا الآن): **{removed}**\n"
+            f"🔴 غير متاحين (حظر/تعطيل، حُذفوا الآن): **{removed}**\n"
             f"⚖️ صافي التغيّر: **{net_txt}**\n\n"
             "──────────────────\n"
             f"👥 قبل الفحص: **{total_before}**\n"
@@ -5916,10 +5951,11 @@ async def daily_report_task():
 
 
 async def probe_and_cleanup_users(client, progress_cb=None):
-    """فحص صامت لكل الأعضاء لمعرفة من بقي ومن غادر، وحذف الغائبين.
+    """فحص صامت لكل الأعضاء لمعرفة من يمكن للبوت الوصول إليه.
 
     يستخدم send_chat_action (مؤشر "يكتب…") وهو فحص صامت تماماً لا يرى العضو
-    أي رسالة. إن نجح فالعضو موجود، وإن فشل بخطأ "غادر" نحذفه من قاعدة البيانات.
+    أي رسالة. حذف المحادثة وحده لا يُعد مغادرة ولا يمكن كشفه؛ الحذف من القاعدة
+    يحدث فقط عند خطأ Telegram حاسم مثل حظر البوت أو تعطيل الحساب.
     يُعيد (alive, removed, removed_ids).
 
     progress_cb (اختياري): دالة async تُستدعى دورياً بـ (done, total, alive,
@@ -5942,10 +5978,10 @@ async def probe_and_cleanup_users(client, progress_cb=None):
             # انتظر المدة المطلوبة ثم اعتبره موجوداً
             await asyncio.sleep(getattr(e, 'value', 5))
             alive += 1
-        except GONE_USER_ERRORS:
+        except GONE_USER_ERRORS as gone_error:
             # العضو حظر البوت أو حُذف حسابه → احذفه
             try:
-                subdb.delete_user(uid)
+                subdb.delete_user(uid, _departure_reason(gone_error))
                 removed += 1
                 removed_ids.append(uid)
             except Exception as del_err:
@@ -5965,7 +6001,7 @@ async def probe_and_cleanup_users(client, progress_cb=None):
 
 
 async def daily_cleanup_task():
-    """مهمة يومية الساعة 3 فجراً: فحص الأعضاء وحذف الغائبين وإبلاغ الأدمن"""
+    """مهمة يومية: فحص الوصول وحذف الحظر/الحساب المعطّل وإبلاغ الأدمن."""
     from datetime import timedelta
 
     while True:
@@ -5982,9 +6018,10 @@ async def daily_cleanup_task():
                 MEDIA_CACHE_RETENTION_DAYS,
             )
             logger.info(
-                "🧹 انتهى تنظيف الخصوصية: سجل=%d، كاش=%d",
+                "🧹 انتهى تنظيف الخصوصية: سجل=%d، كاش=%d، مغادرات مجهولة=%d",
                 privacy_cleanup['download_history'],
                 privacy_cleanup['media_cache'],
+                privacy_cleanup['member_departures'],
             )
         except Exception as cleanup_error:
             logger.error(f"❌ خطأ في تنظيف بيانات الخصوصية اليومي: {cleanup_error}")
@@ -6010,13 +6047,15 @@ async def daily_cleanup_task():
                 admin_id,
                 "📊 **التقرير اليومي للأعضاء (3 فجراً)**\n\n"
                 f"🟢 دخلوا اليوم (آخر 24 ساعة): **{joined}**\n"
-                f"🔴 خرجوا/حظروا: **{removed}**\n"
+                f"🔴 غير متاحين (حظر/تعطيل): **{removed}**\n"
                 f"⚖️ صافي التغيّر: **{net_txt}**\n\n"
                 "──────────────────\n"
                 f"👥 قبل الفحص: **{total_before}**\n"
                 f"✅ العدد الحقيقي الآن: **{alive}**"
             )
-            logger.info(f"🧹 انتهى الفحص: دخل {joined}، خرج {removed}، الحقيقي {alive}")
+            logger.info(
+                f"🧹 انتهى الفحص: دخل {joined}، غير متاح {removed}، الحقيقي {alive}"
+            )
         except Exception as e:
             logger.error(f"❌ خطأ في الفحص اليومي: {e}")
 
@@ -7609,7 +7648,9 @@ def _record_realcheck(alive=None):
 
     alive: عدد الأعضاء الذين ردّوا على الفحص الصامت (العدد الحقيقي الفعلي)."""
     try:
-        subdb.set_setting('last_realcheck_at', datetime.now().strftime('%Y-%m-%d %H:%M'))
+        checked_at = datetime.now().astimezone()
+        subdb.set_setting('last_realcheck_at', checked_at.strftime('%Y-%m-%d %H:%M'))
+        subdb.set_setting('last_reachability_check_at', checked_at.isoformat())
         if alive is not None:
             subdb.set_setting('last_realcheck_alive', str(alive))
     except Exception:
@@ -8367,7 +8408,8 @@ async def handle_subscription_settings(client, callback_query):
         sent_n, fail_n, removed_n = await _send_reminder_batch(client, progress, targets)
         await progress.edit_text(
             f"✅ **اكتمل إرسال التذكير {scope}**\n\n"
-            f"✅ وصلت: {sent_n}\n❌ فشلت: {fail_n}\n🗑️ حُذفوا (غادروا): {removed_n}"
+            f"✅ وصلت: {sent_n}\n❌ فشلت: {fail_n}\n"
+            f"🗑️ غير متاحين (حظر/تعطيل): {removed_n}"
         )
         await callback_query.answer()
         return
@@ -9567,10 +9609,10 @@ async def handle_admin_input(client, message):
                 except FloodWait as e:
                     await asyncio.sleep(getattr(e, 'value', 5))
                     fail_count += 1
-                except GONE_USER_ERRORS:
-                    # العضو غادر/حظر البوت → احذفه من قاعدة البيانات
+                except GONE_USER_ERRORS as gone_error:
+                    # حظر البوت أو تعطيل الحساب → احذفه من قاعدة البيانات
                     try:
-                        subdb.delete_user(uid)
+                        subdb.delete_user(uid, _departure_reason(gone_error))
                         removed_count += 1
                     except Exception:
                         pass
@@ -9602,7 +9644,7 @@ async def handle_admin_input(client, message):
                     f"✅ **اكتمل الإرسال!**\n\n"
                     f"✅ وصلت إلى: {success_count}\n"
                     f"❌ فشلت: {fail_count}\n"
-                    f"🗑️ حُذف (غادروا البوت): {removed_count}"
+                    f"🗑️ غير متاحين (حظر/تعطيل): {removed_count}"
                 )
             except Exception:
                 pass
@@ -9971,9 +10013,10 @@ def main():
             MEDIA_CACHE_RETENTION_DAYS,
         )
         logger.info(
-            "🧹 طُبّقت مهلة الاحتفاظ: سجل=%d، كاش=%d",
+            "🧹 طُبّقت مهلة الاحتفاظ: سجل=%d، كاش=%d، مغادرات مجهولة=%d",
             privacy_cleanup['download_history'],
             privacy_cleanup['media_cache'],
+            privacy_cleanup['member_departures'],
         )
     except Exception as cleanup_error:
         logger.error(f"❌ تعذّر تنظيف بيانات الخصوصية عند الإقلاع: {cleanup_error}")

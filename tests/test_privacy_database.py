@@ -35,13 +35,17 @@ def _fake_db(cursor, commit_calls):
 
 def test_cleanup_expired_privacy_data_deletes_only_expired_history_and_cache(
         monkeypatch):
-    cursor = _RecordingCursor(rowcounts=[8, 3])
+    cursor = _RecordingCursor(rowcounts=[8, 3, 2])
     commit_calls = []
     monkeypatch.setattr(subdb, 'db_cursor', _fake_db(cursor, commit_calls))
 
     result = subdb.cleanup_expired_privacy_data(history_days=14, cache_days=7)
 
-    assert result == {'download_history': 8, 'media_cache': 3}
+    assert result == {
+        'download_history': 8,
+        'media_cache': 3,
+        'member_departures': 2,
+    }
     assert commit_calls == [True]
     assert cursor.executions == [
         (
@@ -54,25 +58,36 @@ def test_cleanup_expired_privacy_data_deletes_only_expired_history_and_cache(
             "(%s * INTERVAL '1 day')",
             (7,),
         ),
+        (
+            "DELETE FROM member_departures WHERE occurred_at < NOW() - "
+            "(%s * INTERVAL '1 day')",
+            (90,),
+        ),
     ]
 
 
 def test_cleanup_expired_privacy_data_clamps_non_positive_periods(monkeypatch):
-    cursor = _RecordingCursor(rowcounts=[0, 0])
+    cursor = _RecordingCursor(rowcounts=[0, 0, 0])
     commit_calls = []
     monkeypatch.setattr(subdb, 'db_cursor', _fake_db(cursor, commit_calls))
 
     result = subdb.cleanup_expired_privacy_data(history_days=0, cache_days=-5)
 
-    assert result == {'download_history': 0, 'media_cache': 0}
-    assert [params for _, params in cursor.executions] == [(1,), (1,)]
+    assert result == {
+        'download_history': 0,
+        'media_cache': 0,
+        'member_departures': 0,
+    }
+    assert [params for _, params in cursor.executions] == [
+        (1,), (1,), (90,),
+    ]
 
 
 def test_delete_user_removes_private_rows_but_preserves_audit_and_enforcement(
         monkeypatch):
     user_id = 771234567
     other_user_id = 889876543
-    cursor = _RecordingCursor()
+    cursor = _RecordingCursor(rowcounts=[0] * 8 + [1, 1])
     commit_calls = []
     setting_updates = []
     monkeypatch.setattr(subdb, 'db_cursor', _fake_db(cursor, commit_calls))
@@ -87,7 +102,7 @@ def test_delete_user_removes_private_rows_but_preserves_audit_and_enforcement(
     monkeypatch.setitem(subdb._lang_cache, user_id, ('en', 1.0))
     monkeypatch.setitem(subdb._lang_cache, other_user_id, ('ar', 2.0))
 
-    subdb.delete_user(user_id)
+    subdb.delete_user(user_id, 'blocked')
 
     assert commit_calls == [True]
     assert cursor.executions == [
@@ -104,16 +119,32 @@ def test_delete_user_removes_private_rows_but_preserves_audit_and_enforcement(
         ('DELETE FROM fsub_user_passed WHERE user_id = %s', (user_id,)),
         ('UPDATE payments SET user_id = NULL WHERE user_id = %s', (user_id,)),
         ('DELETE FROM users WHERE user_id = %s', (user_id,)),
+        ('INSERT INTO member_departures (reason) VALUES (%s)', ('blocked',)),
     ]
     executed_sql = ' '.join(sql for sql, _ in cursor.executions)
     assert 'moderation' not in executed_sql
     assert 'DELETE FROM payments' not in executed_sql
     assert 'referrals' not in executed_sql
+    departure_sql, departure_params = cursor.executions[-1]
+    assert 'user_id' not in departure_sql.lower()
+    assert user_id not in departure_params
     assert setting_updates == [
         ('exempt_user_ids', f'42,{other_user_id}'),
     ]
     assert user_id not in subdb._lang_cache
     assert subdb._lang_cache[other_user_id] == ('ar', 2.0)
+
+
+def test_delete_user_does_not_record_departure_when_member_was_already_absent(
+        monkeypatch):
+    cursor = _RecordingCursor(rowcounts=[0] * 9)
+    monkeypatch.setattr(subdb, 'db_cursor', _fake_db(cursor, []))
+    monkeypatch.setattr(subdb, 'get_setting', lambda *_args: '')
+
+    subdb.delete_user(42, 'deactivated')
+
+    assert all('INSERT INTO member_departures' not in sql
+               for sql, _params in cursor.executions)
 
 
 def test_approve_payment_rejects_detached_audit_row(monkeypatch):
