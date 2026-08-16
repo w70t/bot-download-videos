@@ -19,8 +19,10 @@ import json
 import logging
 import math
 import os
+import platform
 import re
 import shutil
+import subprocess
 import threading
 import time
 from urllib.error import HTTPError
@@ -263,6 +265,16 @@ def finish_job(job_id, outcome='cancelled'):
 
 _CPU_LOCK = threading.Lock()
 _CPU_PREVIOUS = None
+_NETWORK_LOCK = threading.Lock()
+_NETWORK_PREVIOUS = None
+_STATIC_SYSTEM_LOCK = threading.Lock()
+_STATIC_SYSTEM_CACHE = None
+_TOOL_STATUS_LOCK = threading.Lock()
+_TOOL_STATUS_CACHE = None
+_TOOL_STATUS_TTL_SECONDS = 6 * 60 * 60
+_TEMP_STATUS_LOCK = threading.Lock()
+_TEMP_STATUS_CACHE = None
+_TEMP_STATUS_TTL_SECONDS = 60
 
 
 def _read_key_value_file(path):
@@ -309,21 +321,250 @@ def _cpu_percent():
                               (total_delta - idle_delta) * 100.0 / total_delta)), 1)
 
 
+def _network_metrics():
+    """Read the default route's counters and calculate one interval rate.
+
+    Docker/veth/bridge counters are intentionally excluded.  The interface
+    name itself is used only locally to detect a route change and is never
+    returned in telemetry.
+    """
+    global _NETWORK_PREVIOUS
+    interface = None
+    try:
+        routes = []
+        with open('/proc/net/route', 'r', encoding='ascii') as handle:
+            for line in handle.readlines()[1:]:
+                fields = line.split()
+                if len(fields) >= 4 and fields[1] == '00000000':
+                    flags = int(fields[3], 16)
+                    if flags & 0x1:
+                        metric = int(fields[6]) if len(fields) > 6 else 0
+                        routes.append((metric, fields[0]))
+        physical_prefixes = ('en', 'eth', 'wl', 'wlan', 'ww', 'rmnet', 'ppp')
+        physical_routes = [
+            route for route in routes
+            if route[1].lower().startswith(physical_prefixes)
+        ]
+        if physical_routes:
+            interface = min(physical_routes)[1]
+        if not interface or interface == 'lo':
+            raise OSError('no-default-route')
+
+        rx_bytes = tx_bytes = None
+        with open('/proc/net/dev', 'r', encoding='ascii') as handle:
+            lines = handle.readlines()[2:]
+        for line in lines:
+            if ':' not in line:
+                continue
+            raw_name, raw_values = line.split(':', 1)
+            name = raw_name.strip()
+            if name != interface:
+                continue
+            values = raw_values.split()
+            if len(values) >= 9:
+                rx_bytes = int(values[0])
+                tx_bytes = int(values[8])
+            break
+        if rx_bytes is None or tx_bytes is None:
+            raise OSError('default-route-counters-unavailable')
+    except (OSError, ValueError):
+        return {
+            'networkRxMb': None,
+            'networkTxMb': None,
+            'networkRxMbps': None,
+            'networkTxMbps': None,
+            'networkInterfaceType': None,
+        }
+
+    now = time.monotonic()
+    with _NETWORK_LOCK:
+        previous = _NETWORK_PREVIOUS
+        _NETWORK_PREVIOUS = (interface, now, rx_bytes, tx_bytes)
+    rx_rate = tx_rate = None
+    if previous and previous[0] == interface and now > previous[1]:
+        elapsed = now - previous[1]
+        # Counter resets (interface reconnect/reboot) should not emit a spike.
+        if rx_bytes >= previous[2]:
+            rx_rate = (rx_bytes - previous[2]) * 8.0 / elapsed / 1_000_000.0
+        if tx_bytes >= previous[3]:
+            tx_rate = (tx_bytes - previous[3]) * 8.0 / elapsed / 1_000_000.0
+    lowered = interface.lower()
+    if lowered.startswith(('wl', 'wlan')):
+        interface_type = 'wifi'
+    elif lowered.startswith(('ww', 'rmnet', 'ppp')):
+        interface_type = 'cellular'
+    elif lowered.startswith(('en', 'eth')):
+        interface_type = 'ethernet'
+    else:
+        interface_type = 'other'
+    return {
+        'networkRxMb': round(rx_bytes / (1024.0 ** 2), 2),
+        'networkTxMb': round(tx_bytes / (1024.0 ** 2), 2),
+        'networkRxMbps': round(rx_rate, 3) if rx_rate is not None else None,
+        'networkTxMbps': round(tx_rate, 3) if tx_rate is not None else None,
+        # Deliberately classify only; interface names/MAC/IP are never sent.
+        'networkInterfaceType': interface_type,
+    }
+
+
+def _read_first_text(path, limit=160):
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as handle:
+            value = handle.read(limit + 1).replace('\x00', '').strip()
+    except OSError:
+        return None
+    return _safe_text(value, limit)
+
+
+def _os_label():
+    try:
+        with open('/etc/os-release', 'r', encoding='utf-8',
+                  errors='replace') as handle:
+            for line in handle:
+                if line.startswith('PRETTY_NAME='):
+                    return _safe_text(
+                        line.split('=', 1)[1].strip().strip('"\''), 120)
+    except OSError:
+        pass
+    return _safe_text(platform.system(), 120)
+
+
+def _static_system_metrics():
+    """Cache immutable, non-identifying device facts for the process lifetime."""
+    global _STATIC_SYSTEM_CACHE
+    with _STATIC_SYSTEM_LOCK:
+        if _STATIC_SYSTEM_CACHE is None:
+            _STATIC_SYSTEM_CACHE = {
+                'cpuCores': os.cpu_count(),
+                'deviceModel': _read_first_text('/proc/device-tree/model', 120),
+                'architecture': _safe_text(platform.machine(), 64),
+                'kernelVersion': _safe_text(platform.release(), 120),
+                'osLabel': _os_label(),
+            }
+        return dict(_STATIC_SYSTEM_CACHE)
+
+
+def _binary_version(binary):
+    executable = shutil.which(binary)
+    if not executable:
+        return False, None
+    try:
+        result = subprocess.run(
+            [executable, '-version'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        first_line = (result.stdout or '').splitlines()[0]
+        match = re.search(r'(?i)\bversion\s+([^\s]+)', first_line)
+        version = _safe_text(match.group(1), 64) if match else None
+        return result.returncode == 0, version
+    except (OSError, subprocess.SubprocessError, IndexError):
+        return False, None
+
+
+def _tool_metrics():
+    """Cache tool versions for six hours; never spawn commands per snapshot."""
+    global _TOOL_STATUS_CACHE
+    now = time.monotonic()
+    with _TOOL_STATUS_LOCK:
+        if (_TOOL_STATUS_CACHE is not None
+                and now - _TOOL_STATUS_CACHE[0] < _TOOL_STATUS_TTL_SECONDS):
+            return dict(_TOOL_STATUS_CACHE[1])
+        try:
+            from yt_dlp.version import __version__ as yt_dlp_version
+        except (ImportError, AttributeError):
+            yt_dlp_version = None
+        ffmpeg_available, ffmpeg_version = _binary_version('ffmpeg')
+        ffprobe_available, ffprobe_version = _binary_version('ffprobe')
+        metrics = {
+            'ytDlpVersion': _safe_text(yt_dlp_version, 64),
+            'ffmpegAvailable': ffmpeg_available,
+            'ffmpegVersion': ffmpeg_version,
+            'ffprobeAvailable': ffprobe_available,
+            'ffprobeVersion': ffprobe_version,
+        }
+        _TOOL_STATUS_CACHE = (now, metrics)
+        return dict(metrics)
+
+
+def _temporary_metrics(base_path='videos'):
+    """Bounded, cached count of temporary jobs/files without exposing paths."""
+    global _TEMP_STATUS_CACHE
+    now = time.monotonic()
+    with _TEMP_STATUS_LOCK:
+        if (_TEMP_STATUS_CACHE is not None
+                and now - _TEMP_STATUS_CACHE[0] < _TEMP_STATUS_TTL_SECONDS):
+            return dict(_TEMP_STATUS_CACHE[1])
+
+        job_count = file_count = total_bytes = visited = 0
+        try:
+            with os.scandir(base_path) as entries:
+                roots = []
+                for entry in entries:
+                    roots.append(entry)
+                    if len(roots) >= 5000:
+                        break
+            job_count = sum(entry.is_dir(follow_symlinks=False) for entry in roots)
+            for root in roots:
+                if visited >= 5000:
+                    break
+                if root.is_file(follow_symlinks=False):
+                    visited += 1
+                    file_count += 1
+                    try:
+                        total_bytes += root.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        pass
+                    continue
+                if not root.is_dir(follow_symlinks=False):
+                    continue
+                for _dirpath, _dirnames, filenames in os.walk(root.path):
+                    for filename in filenames:
+                        if visited >= 5000:
+                            break
+                        visited += 1
+                        file_count += 1
+                        try:
+                            total_bytes += os.path.getsize(
+                                os.path.join(_dirpath, filename))
+                        except OSError:
+                            pass
+                    if visited >= 5000:
+                        break
+        except OSError:
+            pass
+        metrics = {
+            'temporaryJobCount': job_count,
+            'temporaryFileCount': file_count,
+            'temporaryBytesMb': round(total_bytes / (1024.0 ** 2), 2),
+        }
+        _TEMP_STATUS_CACHE = (now, metrics)
+        return dict(metrics)
+
+
 def collect_system_metrics():
     """Collect small Linux/Pi health metrics without third-party packages."""
     mem = _read_key_value_file('/proc/meminfo')
     total_mb = mem.get('MemTotal', 0.0) / 1024.0
     available_mb = mem.get('MemAvailable', mem.get('MemFree', 0.0)) / 1024.0
     used_mb = max(0.0, total_mb - available_mb)
+    swap_total_mb = mem.get('SwapTotal', 0.0) / 1024.0
+    swap_free_mb = mem.get('SwapFree', 0.0) / 1024.0
+    swap_used_mb = max(0.0, swap_total_mb - swap_free_mb)
 
+    disk_total_gb = disk_used_gb = disk_free_gb = None
     try:
         disk = shutil.disk_usage('/')
         disk_total = float(disk.total)
         disk_used_percent = (disk.used * 100.0 / disk_total) if disk_total else 0.0
+        disk_total_gb = disk.total / (1024.0 ** 3)
+        disk_used_gb = disk.used / (1024.0 ** 3)
         disk_free_gb = disk.free / (1024.0 ** 3)
     except OSError:
         disk_used_percent = None
-        disk_free_gb = None
 
     temperature = None
     try:
@@ -340,27 +581,51 @@ def collect_system_metrics():
         pass
 
     process = _read_key_value_file('/proc/self/status')
+    process_fds = None
+    try:
+        with os.scandir('/proc/self/fd') as entries:
+            process_fds = sum(1 for _entry in entries)
+    except OSError:
+        pass
     try:
         load1, load5, load15 = os.getloadavg()
     except (AttributeError, OSError):
         load1 = load5 = load15 = None
 
-    return {
+    metrics = {
         'cpuPercent': _cpu_percent(),
+        'cpuCores': os.cpu_count(),
         'memoryUsedMb': round(used_mb, 1) if total_mb else None,
         'memoryTotalMb': round(total_mb, 1) if total_mb else None,
+        'memoryAvailableMb': round(available_mb, 1) if total_mb else None,
         'memoryPercent': round(used_mb * 100.0 / total_mb, 1) if total_mb else None,
+        'swapUsedMb': round(swap_used_mb, 1) if swap_total_mb else 0.0,
+        'swapTotalMb': round(swap_total_mb, 1) if mem else None,
         'diskUsedPercent': round(disk_used_percent, 1)
         if disk_used_percent is not None else None,
+        'diskUsedGb': round(disk_used_gb, 2)
+        if disk_used_gb is not None else None,
+        'diskTotalGb': round(disk_total_gb, 2)
+        if disk_total_gb is not None else None,
         'diskFreeGb': round(disk_free_gb, 2) if disk_free_gb is not None else None,
         'temperatureC': round(temperature, 1) if temperature is not None else None,
         'uptimeSeconds': int(uptime) if uptime is not None else None,
+        'botUptimeSeconds': max(
+            0, int(time.time() - (_PROCESS_STARTED_AT_MS / 1000.0))),
         'processMemoryMb': round(process.get('VmRSS', 0.0) / 1024.0, 1)
         if process.get('VmRSS') is not None else None,
+        'processThreads': int(process['Threads'])
+        if process.get('Threads') is not None else None,
+        'processFds': process_fds,
         'load1': round(load1, 2) if load1 is not None else None,
         'load5': round(load5, 2) if load5 is not None else None,
         'load15': round(load15, 2) if load15 is not None else None,
     }
+    metrics.update(_static_system_metrics())
+    metrics.update(_network_metrics())
+    metrics.update(_tool_metrics())
+    metrics.update(_temporary_metrics())
+    return metrics
 
 
 def _epoch_ms(value):
@@ -441,7 +706,12 @@ def _queue_metrics(queue_manager):
 def build_snapshot(queue_manager):
     """Build one JSON-ready snapshot from grouped DB and in-memory state."""
     observed_at = int(time.time() * 1000)
+    database_started = time.perf_counter()
     aggregate = subdb.get_admin_telemetry_summary()
+    database_latency_ms = (time.perf_counter() - database_started) * 1000.0
+    database_size_bytes = aggregate.pop('_databaseSizeBytes', None)
+    aggregate['lastReachabilityCheckAt'] = _epoch_ms(
+        aggregate.get('lastReachabilityCheckAt'))
     recent = [_normalise_recent(row)
               for row in aggregate.pop('recentDownloads', [])]
     top_referrers = [_normalise_referrer(row)
@@ -454,6 +724,12 @@ def build_snapshot(queue_manager):
         str(operation['userId']) for operation in operations
         if operation.get('userId') is not None
     }
+    system = collect_system_metrics()
+    system['databaseSizeMb'] = (
+        round(float(database_size_bytes) / (1024.0 ** 2), 2)
+        if database_size_bytes is not None else None
+    )
+    system['databaseLatencyMs'] = round(database_latency_ms, 2)
 
     return {
         'type': 'snapshot',
@@ -467,7 +743,7 @@ def build_snapshot(queue_manager):
             'queuedCount': queued,
         },
         'summary': aggregate,
-        'system': collect_system_metrics(),
+        'system': system,
         'operations': operations,
         'recentDownloads': recent,
         'topReferrers': top_referrers,
@@ -493,6 +769,7 @@ def _normalise_member(row):
         'downloadsToday': int(row.get('downloadsToday') or 0),
         'totalDownloads': int(row.get('totalDownloads') or 0),
         'joinedAt': _epoch_ms(row.get('joinedAt')),
+        'lastActivityAt': _epoch_ms(row.get('lastActivityAt')),
     }
 
 

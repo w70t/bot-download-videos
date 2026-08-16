@@ -36,10 +36,26 @@ def create_tables():
             subscription_end TIMESTAMP,
             payment_method VARCHAR(100),
             language VARCHAR(10) DEFAULT 'ar',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_activity_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    cursor.execute(
+        'ALTER TABLE users ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMPTZ'
+    )
     print("✅ جدول users")
+
+    # سجل إجمالي محدود الخصوصية: لا يحتوي معرف عضو أو اسماً أو رابطاً.
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS member_departures (
+            id BIGSERIAL PRIMARY KEY,
+            reason VARCHAR(32) NOT NULL,
+            occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT member_departures_reason_check
+                CHECK (reason IN ('blocked', 'deactivated', 'unreachable'))
+        )
+    ''')
+    print("✅ جدول member_departures")
     
     # جدول الإعدادات
     cursor.execute('''
@@ -108,7 +124,15 @@ def create_tables():
     # إنشاء indexes للأداء
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_language ON users(language)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_users_subscribed ON users(is_subscribed)')
+    cursor.execute(
+        'CREATE INDEX IF NOT EXISTS idx_users_last_activity_at '
+        'ON users(last_activity_at DESC)'
+    )
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)')
+    cursor.execute(
+        'CREATE INDEX IF NOT EXISTS idx_member_departures_occurred_at '
+        'ON member_departures(occurred_at DESC)'
+    )
     print("✅ Indexes")
     
     conn.commit()

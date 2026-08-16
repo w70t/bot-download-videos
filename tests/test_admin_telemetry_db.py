@@ -35,7 +35,8 @@ def _fake_db(cursor):
 def test_summary_uses_grouped_queries_and_never_selects_url():
     now = datetime(2026, 8, 15, 12, 0, 0)
     cursor = FakeCursor([
-        (624, 5, 1196, 4, 21, 1164, 34, 1, 13.79, 0, 29),
+        (624, 5, 7, 31, 100, 524, 1196, 4, 21, 1164, 34, 1,
+         13.79, 0, 29, 2, 5, 8, 3, 4, 1, 10 * 1024 * 1024, now),
         [(9, 42, 'Ali', 'ali', 'Title', '1080', 'video',
           'youtube', 12.5, False, now)],
         [(42, 'Ali', 'ali', 26, 24)],
@@ -47,11 +48,25 @@ def test_summary_uses_grouped_queries_and_never_selects_url():
 
     assert len(cursor.queries) == 4
     assert 'h.url' not in cursor.queries[1][0].lower()
+    assert 'WITH user_counts AS' in cursor.queries[0][0]
+    assert 'FILTER' in cursor.queries[0][0]
     assert 'GROUP BY' in cursor.queries[2][0]
     # The alert groups by URL inside PostgreSQL but never SELECTs/returns it.
     assert cursor.queries[3][0].split('FROM download_history')[0].lower().find('h.url') == -1
     assert 'GROUP BY h.user_id, h.url' in cursor.queries[3][0]
     assert result['membersTotal'] == 624
+    assert result['membersActive24h'] == 7
+    assert result['membersActive7d'] == 31
+    assert result['membersActive30d'] == 100
+    assert result['membersInactive30d'] == 524
+    assert result['departures30d'] == 8
+    assert result['departureReasons30d'] == [
+        {'reason': 'blocked', 'count': 3},
+        {'reason': 'deactivated', 'count': 4},
+        {'reason': 'unreachable', 'count': 1},
+    ]
+    assert result['_databaseSizeBytes'] == 10 * 1024 * 1024
+    assert result['lastReachabilityCheckAt'] == now
     assert result['recentDownloads'][0]['title'] == 'Title'
     assert result['topReferrers'][0]['invitesIncomplete'] == 2
     assert result['reviewItems'][0]['userId'] == 42
@@ -61,9 +76,9 @@ def test_member_batch_is_one_query_with_grouped_referrals():
     now = datetime(2026, 8, 15, 12, 0, 0)
     cursor = FakeCursor([[
         (42, 'ali', 'Ali', 'ar', 'male', True, None,
-         26, 24, 2, 3, 100, now),
+         26, 24, 2, 3, 100, now, now),
         (43, None, 'Sara', 'en', 'female', False, None,
-         0, 0, 0, 1, 5, now),
+         0, 0, 0, 1, 5, now, None),
     ]])
 
     with patch.object(subdb, 'db_cursor', _fake_db(cursor)):
@@ -76,3 +91,5 @@ def test_member_batch_is_one_query_with_grouped_referrals():
     assert len(result) == 2
     assert result[0]['invitesTotal'] == 26
     assert result[1]['downloadsToday'] == 1
+    assert result[0]['lastActivityAt'] == now
+    assert result[1]['lastActivityAt'] is None

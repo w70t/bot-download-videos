@@ -85,6 +85,7 @@ def init_db():
     _ensure_fsub_passed_table()
     _ensure_media_cache_table()
     _ensure_history_table()
+    _ensure_member_activity_schema()
     _ensure_referrals_table()
     _ensure_bonus_column()
     _ensure_total_downloads_column()
@@ -138,17 +139,103 @@ def is_user_subscribed(user_id: int) -> bool:
 
     return True
 
+
+try:
+    _ACTIVITY_TOUCH_SECONDS = max(
+        30, int(os.getenv('MEMBER_ACTIVITY_TOUCH_SECONDS', '300'))
+    )
+except (TypeError, ValueError):
+    _ACTIVITY_TOUCH_SECONDS = 300
+_ACTIVITY_TOUCH_CACHE_MAX = 4096
+_activity_touch_cache = {}
+_activity_touch_lock = threading.Lock()
+
+
 def add_or_update_user(user_id: int, username: str = None, first_name: str = None):
     """إضافة أو تحديث معلومات المستخدم"""
     # استخدام INSERT ON CONFLICT للحفاظ على بيانات الاشتراك
     with db_cursor(commit=True) as cursor:
         cursor.execute('''
-            INSERT INTO users (user_id, username, first_name)
-            VALUES (%s, %s, %s)
+            INSERT INTO users (user_id, username, first_name, last_activity_at)
+            VALUES (%s, %s, %s, NOW())
             ON CONFLICT (user_id) DO UPDATE SET
                 username = excluded.username,
-                first_name = excluded.first_name
+                first_name = excluded.first_name,
+                last_activity_at = excluded.last_activity_at
         ''', (user_id, username, first_name))
+    try:
+        cache_user_id = int(user_id)
+    except (TypeError, ValueError):
+        cache_user_id = user_id
+    with _activity_touch_lock:
+        if (cache_user_id not in _activity_touch_cache
+                and len(_activity_touch_cache) >= _ACTIVITY_TOUCH_CACHE_MAX):
+            oldest_id = min(_activity_touch_cache,
+                            key=_activity_touch_cache.get)
+            _activity_touch_cache.pop(oldest_id, None)
+        _activity_touch_cache[cache_user_id] = time.monotonic()
+
+
+def touch_user_activity(user_id: int, minimum_interval=None) -> bool:
+    """Refresh an existing member's activity timestamp with bounded writes.
+
+    Telegram can emit several updates for one interaction.  The process-local
+    debounce limits PostgreSQL to one write per member per configurable window
+    (five minutes by default) while keeping the dashboard's day/week/month
+    figures truthful.  This deliberately uses ``UPDATE`` rather than an upsert:
+    a raw ``/start`` from a
+    new member must not pre-empt the existing referral/language registration
+    flow.
+
+    Returns ``True`` only when a database row was refreshed.
+    """
+    try:
+        user_id = int(user_id)
+    except (TypeError, ValueError):
+        return False
+    interval = _ACTIVITY_TOUCH_SECONDS if minimum_interval is None else max(
+        0, float(minimum_interval)
+    )
+    now = time.monotonic()
+    with _activity_touch_lock:
+        previous = _activity_touch_cache.get(user_id)
+        if previous is not None and now - previous < interval:
+            return False
+        if (user_id not in _activity_touch_cache
+                and len(_activity_touch_cache) >= _ACTIVITY_TOUCH_CACHE_MAX):
+            stale_before = now - max(interval, _ACTIVITY_TOUCH_SECONDS)
+            stale_ids = [cached_id for cached_id, touched_at
+                         in _activity_touch_cache.items()
+                         if touched_at < stale_before]
+            for cached_id in stale_ids:
+                _activity_touch_cache.pop(cached_id, None)
+            if len(_activity_touch_cache) >= _ACTIVITY_TOUCH_CACHE_MAX:
+                oldest_id = min(
+                    _activity_touch_cache,
+                    key=_activity_touch_cache.get,
+                )
+                _activity_touch_cache.pop(oldest_id, None)
+        _activity_touch_cache[user_id] = now
+    try:
+        with db_cursor(commit=True) as cursor:
+            cursor.execute(
+                'UPDATE users SET last_activity_at = NOW() WHERE user_id = %s',
+                (user_id,),
+            )
+            refreshed = cursor.rowcount != 0
+    except Exception:
+        # A transient database failure must be retried on the next interaction.
+        with _activity_touch_lock:
+            if _activity_touch_cache.get(user_id) == now:
+                _activity_touch_cache.pop(user_id, None)
+        raise
+    if not refreshed:
+        # The language-selection handler may create this new member immediately
+        # after the generic activity handler; do not suppress that first touch.
+        with _activity_touch_lock:
+            if _activity_touch_cache.get(user_id) == now:
+                _activity_touch_cache.pop(user_id, None)
+    return refreshed
 
 def activate_subscription(user_id: int, duration_days: int = 30, payment_method: str = 'manual'):
     """تفعيل اشتراك المستخدم"""
@@ -172,7 +259,10 @@ def deactivate_subscription(user_id: int):
         ''', (user_id,))
     logger.info(f"❌ تم إلغاء اشتراك المستخدم {user_id}")
 
-def delete_user(user_id: int):
+_DEPARTURE_REASONS = {'blocked', 'deactivated', 'unreachable'}
+
+
+def delete_user(user_id: int, departure_reason: str = 'unreachable'):
     """حذف مستخدم نهائياً من قاعدة البيانات (عند حظره البوت أو حذف حسابه).
 
     يحذف البيانات التشغيلية والخاصة المرتبطة بالعضو، لكنه يُبقي سجلات الحظر
@@ -195,8 +285,23 @@ def delete_user(user_id: int):
         cursor.execute('DELETE FROM fsub_user_passed WHERE user_id = %s', (user_id,))
         cursor.execute('UPDATE payments SET user_id = NULL WHERE user_id = %s', (user_id,))
         cursor.execute('DELETE FROM users WHERE user_id = %s', (user_id,))
+        deleted = cursor.rowcount > 0
+        if deleted:
+            # Aggregate-only event: deliberately no Telegram id, name, username,
+            # URL or foreign key.  It answers "how many and why" without
+            # retaining the departed person's identity.
+            reason = (str(departure_reason).strip().lower()
+                      if departure_reason is not None else 'unreachable')
+            if reason not in _DEPARTURE_REASONS:
+                reason = 'unreachable'
+            cursor.execute(
+                'INSERT INTO member_departures (reason) VALUES (%s)',
+                (reason,),
+            )
     with _cache_lock:
         _lang_cache.pop(user_id, None)   # لا نُبقِ لغة عضو محذوف في الذاكرة
+    with _activity_touch_lock:
+        _activity_touch_cache.pop(user_id, None)
     try:
         raw_exempt = get_setting('exempt_user_ids', '') or ''
         exempt_parts = [part.strip() for part in raw_exempt.split(',') if part.strip()]
@@ -898,6 +1003,51 @@ def _ensure_history_table():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_history_date ON download_history(created_at)')
 
 
+def _ensure_member_activity_schema():
+    """Idempotently add real activity and anonymous departure aggregates."""
+    with db_cursor(commit=True) as cursor:
+        cursor.execute('''
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMPTZ
+        ''')
+        # Existing members get the best real signal already held locally: their
+        # latest successful download, falling back to their registration time.
+        # The update runs only for rows not migrated before.
+        cursor.execute('''
+            UPDATE users u
+            SET last_activity_at = COALESCE(
+                (SELECT MAX(h.created_at) FROM download_history h
+                 WHERE h.user_id = u.user_id),
+                u.created_at,
+                NOW()
+            )
+            WHERE u.last_activity_at IS NULL
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_users_last_activity_at
+            ON users (last_activity_at DESC)
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS member_departures (
+                id BIGSERIAL PRIMARY KEY,
+                reason VARCHAR(32) NOT NULL,
+                occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                CONSTRAINT member_departures_reason_check
+                    CHECK (reason IN ('blocked', 'deactivated', 'unreachable'))
+            )
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_member_departures_occurred_at
+            ON member_departures (occurred_at DESC)
+        ''')
+        # Events are identity-free, nevertheless retain only what the 30-day
+        # dashboard needs (with a small operational margin).
+        cursor.execute('''
+            DELETE FROM member_departures
+            WHERE occurred_at < NOW() - INTERVAL '90 days'
+        ''')
+
+
 def add_download_history(user_id, url, title, quality, kind, platform,
                          file_size_mb=None, from_cache=False):
     """يسجّل عملية تحميل ناجحة في السجل."""
@@ -985,26 +1135,84 @@ def get_admin_telemetry_summary(recent_limit=12, top_limit=8, review_limit=20):
     review_limit = max(1, min(int(review_limit), 50))
     with db_cursor() as cursor:
         cursor.execute('''
-            SELECT
-                (SELECT COUNT(*) FROM users),
-                (SELECT COUNT(*) FROM users
-                 WHERE is_subscribed = 1
-                   AND (subscription_end IS NULL OR subscription_end > NOW())),
-                (SELECT COUNT(*) FROM download_history),
-                (SELECT COUNT(*) FROM download_history
-                 WHERE created_at >= CURRENT_DATE),
-                (SELECT COUNT(*) FROM download_history
-                 WHERE created_at >= NOW() - INTERVAL '24 hours'),
-                (SELECT COUNT(*) FROM media_cache),
-                (SELECT COALESCE(SUM(hits), 0) FROM media_cache),
-                (SELECT COUNT(*) FROM download_history
-                 WHERE created_at >= CURRENT_DATE AND from_cache IS TRUE),
-                (SELECT COALESCE(SUM(file_size_mb), 0) FROM download_history
-                 WHERE created_at >= CURRENT_DATE AND from_cache IS TRUE),
-                (SELECT COUNT(*) FROM payments WHERE status = 'pending'),
-                (SELECT COUNT(*) FROM referrals)
+            WITH user_counts AS (
+                SELECT COUNT(*) AS members_total,
+                       COUNT(*) FILTER (
+                           WHERE is_subscribed = 1
+                             AND (subscription_end IS NULL
+                                  OR subscription_end > NOW())) AS subscribers,
+                       COUNT(*) FILTER (
+                           WHERE last_activity_at >= NOW()
+                               - INTERVAL '24 hours') AS active_24h,
+                       COUNT(*) FILTER (
+                           WHERE last_activity_at >= NOW()
+                               - INTERVAL '7 days') AS active_7d,
+                       COUNT(*) FILTER (
+                           WHERE last_activity_at >= NOW()
+                               - INTERVAL '30 days') AS active_30d,
+                       COUNT(*) FILTER (
+                           WHERE last_activity_at IS NULL
+                              OR last_activity_at < NOW()
+                                  - INTERVAL '30 days') AS inactive_30d
+                FROM users
+            ), download_counts AS (
+                SELECT COUNT(*) AS downloads_total,
+                       COUNT(*) FILTER (
+                           WHERE created_at >= CURRENT_DATE) AS downloads_today,
+                       COUNT(*) FILTER (
+                           WHERE created_at >= NOW()
+                               - INTERVAL '24 hours') AS downloads_24h,
+                       COUNT(*) FILTER (
+                           WHERE created_at >= CURRENT_DATE
+                             AND from_cache IS TRUE) AS cache_hits_today,
+                       COALESCE(SUM(file_size_mb) FILTER (
+                           WHERE created_at >= CURRENT_DATE
+                             AND from_cache IS TRUE), 0) AS saved_mb_today
+                FROM download_history
+            ), cache_counts AS (
+                SELECT COUNT(*) AS cache_items,
+                       COALESCE(SUM(hits), 0) AS cache_hits
+                FROM media_cache
+            ), departure_counts AS (
+                SELECT COUNT(*) FILTER (
+                           WHERE occurred_at >= CURRENT_DATE) AS departures_today,
+                       COUNT(*) FILTER (
+                           WHERE occurred_at >= NOW()
+                               - INTERVAL '7 days') AS departures_7d,
+                       COUNT(*) FILTER (
+                           WHERE occurred_at >= NOW() - INTERVAL '30 days'
+                             AND reason = 'blocked') AS blocked_30d,
+                       COUNT(*) FILTER (
+                           WHERE occurred_at >= NOW() - INTERVAL '30 days'
+                             AND reason = 'deactivated') AS deactivated_30d,
+                       COUNT(*) FILTER (
+                           WHERE occurred_at >= NOW() - INTERVAL '30 days'
+                             AND reason = 'unreachable') AS unreachable_30d
+                FROM member_departures
+            )
+            SELECT users.members_total, users.subscribers,
+                   users.active_24h, users.active_7d, users.active_30d,
+                   users.inactive_30d,
+                   downloads.downloads_total, downloads.downloads_today,
+                   downloads.downloads_24h,
+                   cache.cache_items, cache.cache_hits,
+                   downloads.cache_hits_today, downloads.saved_mb_today,
+                   (SELECT COUNT(*) FROM payments WHERE status = 'pending'),
+                   (SELECT COUNT(*) FROM referrals),
+                   departures.departures_today, departures.departures_7d,
+                   (departures.blocked_30d + departures.deactivated_30d
+                    + departures.unreachable_30d),
+                   departures.blocked_30d, departures.deactivated_30d,
+                   departures.unreachable_30d,
+                   pg_database_size(current_database()),
+                   (SELECT value FROM settings
+                    WHERE key = 'last_reachability_check_at')
+            FROM user_counts users
+            CROSS JOIN download_counts downloads
+            CROSS JOIN cache_counts cache
+            CROSS JOIN departure_counts departures
         ''')
-        totals = cursor.fetchone() or (0,) * 11
+        totals = cursor.fetchone() or (0,) * 23
 
         cursor.execute('''
             SELECT h.id, h.user_id, u.first_name, u.username, h.title,
@@ -1086,17 +1294,33 @@ def get_admin_telemetry_summary(recent_limit=12, top_limit=8, review_limit=20):
     return {
         'membersTotal': totals[0],
         'subscribers': totals[1],
-        'downloadsTotal': totals[2],
-        'downloadsToday': totals[3],
-        'downloadsLast24h': totals[4],
-        'cacheItems': totals[5],
-        'cacheHits': totals[6],
-        'cacheHitsToday': totals[7],
+        'membersActive24h': totals[2],
+        'membersActive7d': totals[3],
+        'membersActive30d': totals[4],
+        'membersInactive30d': totals[5],
+        'downloadsTotal': totals[6],
+        'downloadsToday': totals[7],
+        'downloadsLast24h': totals[8],
+        'cacheItems': totals[9],
+        'cacheHits': totals[10],
+        'cacheHitsToday': totals[11],
         # This is an estimate: a cache hit avoids re-downloading roughly the
         # recorded delivered file size.  The UI must label it accordingly.
-        'savedMbTodayEstimate': float(totals[8] or 0),
-        'pendingPayments': totals[9],
-        'referralsTotal': totals[10],
+        'savedMbTodayEstimate': float(totals[12] or 0),
+        'pendingPayments': totals[13],
+        'referralsTotal': totals[14],
+        'departuresToday': totals[15],
+        'departures7d': totals[16],
+        'departures30d': totals[17],
+        'departureReasons30d': [
+            {'reason': 'blocked', 'count': totals[18]},
+            {'reason': 'deactivated', 'count': totals[19]},
+            {'reason': 'unreachable', 'count': totals[20]},
+        ],
+        # These two private operational values are moved into the system block
+        # by admin_telemetry before the snapshot is sent.
+        '_databaseSizeBytes': totals[21],
+        'lastReachabilityCheckAt': totals[22],
         'recentDownloads': recent,
         'topReferrers': top_referrers,
         'reviewItems': review_items,
@@ -1139,7 +1363,8 @@ def get_admin_telemetry_members(limit=100, offset=0):
                    COALESCE(ref.invites_total - ref.invites_current, 0),
                    COALESCE(today.download_count, 0),
                    COALESCE(u.total_downloads, 0),
-                   u.created_at
+                   u.created_at,
+                   u.last_activity_at
             FROM users u
             LEFT JOIN member_survey survey ON survey.user_id = u.user_id
             LEFT JOIN referral_stats ref ON ref.referrer_user_id = u.user_id
@@ -1163,17 +1388,20 @@ def get_admin_telemetry_members(limit=100, offset=0):
         'downloadsToday': row[10],
         'totalDownloads': row[11],
         'joinedAt': row[12],
+        'lastActivityAt': row[13],
     } for row in rows]
 
 
-def cleanup_expired_privacy_data(history_days=30, cache_days=30):
-    """Delete old download links/history and media-cache references.
+def cleanup_expired_privacy_data(history_days=30, cache_days=30,
+                                 departure_days=90):
+    """Delete expired history/cache and anonymous departure aggregates.
 
     Member profiles and survey/gender data are intentionally not touched.
     Returns the number of deleted rows for operational verification.
     """
     history_days = max(1, int(history_days))
     cache_days = max(1, int(cache_days))
+    departure_days = max(30, int(departure_days))
 
     with db_cursor(commit=True) as cursor:
         cursor.execute(
@@ -1194,9 +1422,19 @@ def cleanup_expired_privacy_data(history_days=30, cache_days=30):
         )
         deleted_cache = cursor.rowcount
 
+        cursor.execute(
+            """
+            DELETE FROM member_departures
+            WHERE occurred_at < NOW() - (%s * INTERVAL '1 day')
+            """,
+            (departure_days,),
+        )
+        deleted_departures = cursor.rowcount
+
     return {
         'download_history': deleted_history,
         'media_cache': deleted_cache,
+        'member_departures': deleted_departures,
     }
 
 
@@ -1328,10 +1566,20 @@ def invite_gate_status(user_id) -> dict:
 
 
 def record_referral(referred_user_id, referrer_user_id) -> bool:
-    """يسجّل دعوة جديدة. يرجع True إذا كانت دعوة جديدة فعلاً (تُمنح المكافأة مرة)."""
+    """يسجّل دعوة بلا مكافأة، مع رفض الداعي غير الموجود.
+
+    المسار التشغيلي يستخدم :func:`record_referral_and_reward` حتى يكون تسجيل
+    الدعوة والمكافأة معاملة ذرّية واحدة. هذه الدالة باقية للتوافق فقط.
+    """
     if int(referred_user_id) == int(referrer_user_id):
         return False  # لا يدعو المستخدم نفسه
     with db_cursor(commit=True) as cursor:
+        cursor.execute(
+            'SELECT user_id FROM users WHERE user_id = %s FOR UPDATE',
+            (referrer_user_id,),
+        )
+        if cursor.fetchone() is None:
+            return False
         cursor.execute('''
             INSERT INTO referrals (referred_user_id, referrer_user_id)
             VALUES (%s, %s)
@@ -1340,6 +1588,54 @@ def record_referral(referred_user_id, referrer_user_id) -> bool:
         ''', (referred_user_id, referrer_user_id))
         inserted = cursor.fetchone() is not None
     return inserted
+
+
+def record_referral_and_reward(referred_user_id, referrer_user_id,
+                               reward_amount) -> bool:
+    """Atomically record one referral and reward an existing referrer.
+
+    The referred member intentionally need not exist yet: Telegram's ``/start``
+    arrives before language selection creates their profile.  The referrer must
+    already exist and is row-locked, preventing both ghost profiles and a race
+    with deletion.  Duplicate/self referrals return ``False`` and never reward.
+    """
+    try:
+        referred_user_id = int(referred_user_id)
+        referrer_user_id = int(referrer_user_id)
+        reward_amount = max(0, int(reward_amount))
+    except (TypeError, ValueError):
+        return False
+    if referred_user_id == referrer_user_id:
+        return False
+
+    with db_cursor(commit=True) as cursor:
+        cursor.execute(
+            'SELECT user_id FROM users WHERE user_id = %s FOR UPDATE',
+            (referrer_user_id,),
+        )
+        if cursor.fetchone() is None:
+            return False
+
+        cursor.execute('''
+            INSERT INTO referrals (referred_user_id, referrer_user_id)
+            VALUES (%s, %s)
+            ON CONFLICT (referred_user_id) DO NOTHING
+            RETURNING referred_user_id
+        ''', (referred_user_id, referrer_user_id))
+        if cursor.fetchone() is None:
+            return False
+
+        cursor.execute('''
+            UPDATE users
+            SET bonus_downloads = COALESCE(bonus_downloads, 0) + %s
+            WHERE user_id = %s
+            RETURNING user_id
+        ''', (reward_amount, referrer_user_id))
+        if cursor.fetchone() is None:
+            # The row lock makes this impossible in normal operation. Raising
+            # is intentional: db_cursor rolls the referral insert back too.
+            raise RuntimeError('referrer disappeared during referral reward')
+    return True
 
 
 def get_referral_count(referrer_user_id) -> int:
@@ -1370,14 +1666,14 @@ def count_referrals_since(referrer_user_id, since_epoch) -> int:
 
 
 def add_bonus_downloads(user_id, amount):
-    """يضيف رصيد تحميلات إضافي للمستخدم (يضمن وجود الصف)."""
+    """يضيف رصيداً لعضو موجود فقط؛ لا ينشئ ملفات أعضاء وهمية."""
     with db_cursor(commit=True) as cursor:
         cursor.execute('''
-            INSERT INTO users (user_id, bonus_downloads)
-            VALUES (%s, %s)
-            ON CONFLICT (user_id) DO UPDATE SET
-                bonus_downloads = COALESCE(users.bonus_downloads, 0) + %s
-        ''', (user_id, amount, amount))
+            UPDATE users
+            SET bonus_downloads = COALESCE(bonus_downloads, 0) + %s
+            WHERE user_id = %s
+        ''', (amount, user_id))
+        return cursor.rowcount > 0
 
 
 def get_bonus_downloads(user_id) -> int:
